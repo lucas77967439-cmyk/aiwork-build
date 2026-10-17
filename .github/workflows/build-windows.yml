@@ -39,7 +39,25 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app (NSIS + MSI)
-        run: npm run tauri build -- --bundles nsis,msi
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run tauri build -- --bundles nsis,msi 2>&1 | tee build.log
+        continue-on-error: true
+
+      # 诊断闭环：构建失败时把完整 build.log 推送回仓库，
+      # 免去「job logs 需 admin token」的限制（403）
+      - name: Persist build log on failure
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add -f build.log
+          git commit -m "ci: build failure log" || echo "nothing to commit"
+          git push origin main || echo "push failed"
+          exit 1
 
       # 审查 M15：CI 缺测试防线——产物未经测试验证即上传。放在 tauri build 之后：
       # generate_context! 宏依赖 frontendDist（../dist，由 beforeBuildCommand 生成）
