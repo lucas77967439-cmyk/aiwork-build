@@ -1415,22 +1415,57 @@ pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, St
 
 /// WB 上游模型目录同步实现（手动命令与调度器 wb-catalog-sync 共用）：
 /// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store），
-/// 取首个含凭证账号拉取并替换目录；空列表时 Err（调度侧据此转静默跳过不计失败）
+/// **遍历账号直到任一成功**：WB 账号的 refresh_token 有生命周期，单个账号失效
+/// （401 登录态失效）不应让整轮目录同步失败——只要池里还有一个凭证有效的账号
+/// 就能拉到目录。全部失败才返回 Err（调度侧据此转静默跳过不计失败）。
+///
+/// 安全性：`fetch_and_replace` 失败时**不触碰本地目录**（静态兜底目录永不因
+/// 网络抖动/单账号失效被清掉），故遍历重试无副作用。
 pub(crate) fn wb_catalog_sync_impl(
     data_dir: &std::path::Path,
     accounts: &[crate::api_server::pool::WbSyncAccount],
 ) -> Result<usize, String> {
-    let acct = accounts
-        .first()
-        .ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
-    crate::api_server::wb_catalog::fetch_and_replace(
-        data_dir,
-        &acct.uid,
-        &acct.token,
-        &acct.domain,
-        &acct.enterprise_id,
-        acct.global_region,
-    )
+    if accounts.is_empty() {
+        return Err("无可用 WB 账号凭证，无法拉取上游目录".to_string());
+    }
+    let mut last_err = String::new();
+    for acct in accounts {
+        match crate::api_server::wb_catalog::fetch_and_replace(
+            data_dir,
+            &acct.uid,
+            &acct.token,
+            &acct.domain,
+            &acct.enterprise_id,
+            acct.global_region,
+        ) {
+            Ok(n) => {
+                if accounts.len() > 1 {
+                    crate::fs_utils::app_log(
+                        data_dir,
+                        &format!("[wb-catalog] 账号 {} 拉取目录成功（{} 个模型）", acct.uid, n),
+                    );
+                }
+                return Ok(n);
+            }
+            Err(e) => {
+                crate::fs_utils::app_log(
+                    data_dir,
+                    &format!(
+                        "[wb-catalog] 账号 {} 目录拉取失败（{}），尝试下一个账号（剩余 {} 个）",
+                        acct.uid,
+                        e,
+                        accounts.len().saturating_sub(1)
+                    ),
+                );
+                last_err = e;
+            }
+        }
+    }
+    Err(format!(
+        "全部 {} 个 WB 账号目录拉取失败；最后错误: {}",
+        accounts.len(),
+        last_err
+    ))
 }
 
 /// 列出 wb_model_catalog.json 中的 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）
