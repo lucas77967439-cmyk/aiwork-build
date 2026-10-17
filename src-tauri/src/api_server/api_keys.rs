@@ -490,6 +490,24 @@ fn registry_save(data_dir: &Path, f: &ApiKeysFile) -> Result<(), String> {
     crate::vault::ns_set(data_dir, VAULT_NS, VAULT_KEY, &v)
 }
 
+/// 从遗留明文存储（SQLite `api_keys` 行表 + kv `api_keys_auth_disabled`）读取 Key
+/// 注册表并写入 vault 权威存储。返回同步的 Key 条数。
+///
+/// 用途（CLI `--task-run api-keys-init` / 手工修复）：vault 记录丢失、为空或需要
+/// 以行表定义为准覆盖时补齐。行表无定义且未显式关闭鉴权时返回 0，不写 vault
+/// （避免把「空」当成有效配置覆盖掉 vault 中已有的 Key）。
+///
+/// 与 `registry_load` 的被动迁移区别：那是「vault 无记录时才读行表」，本函数是
+/// **主动**以行表为准覆盖 vault，供外部工具/脚本在无法操作 GUI 时维护 Key。
+pub fn sync_registry_from_legacy(data_dir: &Path) -> Result<usize, String> {
+    let legacy = crate::store::docs::api_keys_load(&crate::store::db(data_dir));
+    if legacy.keys.is_empty() && !legacy.auth_disabled {
+        return Ok(0);
+    }
+    registry_save(data_dir, &legacy)?;
+    Ok(legacy.keys.len())
+}
+
 /// 锁内取条目：缓存未命中时加载（vault 优先 + 遗留迁移）并插入（首读即缓存）
 fn entry_or_load<'a>(
     reg: &'a mut std::collections::HashMap<std::path::PathBuf, KeysEntry>,

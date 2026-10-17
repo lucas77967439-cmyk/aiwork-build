@@ -201,6 +201,15 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted, "days": days })
                 })
         }
+        // API Key 注册表同步（CLI/手工维护入口）：把 SQLite `api_keys` 行表定义的 Key
+        // 写入 vault 权威存储。用于无法操作 GUI 的场景（批量脚本/外部工具维护 Key），
+        // 或 vault 记录丢失后以行表为准恢复。行表无定义时返回 synced_keys=0 且不动 vault。
+        // 注意：鉴权热路径读 vault（registry_load 优先），本任务执行后需重启网关进程
+        // （或等待 GUI 侧 save 触发缓存刷新）才能使新 Key 生效。
+        "api-keys-init" => {
+            let n = crate::api_server::api_keys::sync_registry_from_legacy(&state.data_dir)?;
+            Ok(serde_json::json!({ "ok": true, "synced_keys": n }))
+        }
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));
