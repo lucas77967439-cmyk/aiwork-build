@@ -89,3 +89,17 @@ jobs:
           path: |
             release/windows/*
           if-no-files-found: error
+
+      # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
+      # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
+      - name: Publish to GitHub Release
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }} (${{ github.sha }})
+          draft: false
+          prerelease: true
+          files: |
+            release/windows/*
