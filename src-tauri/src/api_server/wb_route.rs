@@ -17,9 +17,9 @@
 //! 转发并释放账号并发槽（usage 记账取断连前已收到的上游 usage 事件，
 //! 不再为残缺流量保持消费上游到 EOF）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -181,6 +181,109 @@ fn try_parse_dt(b: &[u8], i: usize) -> Option<i64> {
     chrono::NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
         .and_then(|date| date.and_hms_opt(h as u32, mi as u32, s as u32))
         .map(|dt| dt.and_utc().timestamp() - 8 * 3600)
+}
+
+// ==================== 账号级配额冷却（2026-10-19 实测复盘） ====================
+//
+// 背景：WB 6004 限额（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）是**账号级**配额
+// （2026-10-19 日志复盘：132 账号 21:38 触顶 429，顾城/Clease 配额未耗尽却被既有
+// 模型级冷却连坐封锁至恢复时刻，从未被真实尝试）。模型级冷却（T2.7/F-34）的经验
+// 依据来自 Qoder 排队类错误，对 WB 账号限额不成立。
+//
+// 新语义：
+// - 6004 限额类失败 → 记**账号级**冷却（键 `{model}|{uid}`，冷却至精确恢复时刻），
+//   dispatch 取号后跳过冷却中账号换下一候选（uid 已入 tried，全池冷却自然收敛
+//   到轮换耗尽收尾）；
+// - 全池账号均处冷却时升级写模型级冷却（入口快速失败 429 + 跨池回退语义保留）；
+// - 其余失败（Server/空完成/风控等模型级现象）维持既有模型级冷却不变。
+//
+// 表为进程内存态（静态 OnceLock，镜像 qoder_route::QODER_MODEL_COOLDOWNS 先例，
+// 规避 ApiSharedState 构造点扩散），重启即清零；成功请求清除对应账号条目。
+
+static WB_ACCT_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (i64, u32)>>> = OnceLock::new();
+
+fn acct_cooldown_map() -> &'static Mutex<HashMap<String, (i64, u32)>> {
+    WB_ACCT_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 账号级冷却键：`{model}|{uid}`
+fn acct_model_key(model: &str, uid: &str) -> String {
+    format!("{model}|{uid}")
+}
+
+/// 该账号对本模型是否处于配额冷却中
+pub fn account_model_cooling(model: &str, uid: &str) -> bool {
+    let map = safe_lock(acct_cooldown_map());
+    match map.get(&acct_model_key(model, uid)) {
+        Some((until, _)) => *until > now_ts(),
+        None => false,
+    }
+}
+
+/// 账号级冷却快照（/status 观测用）：[(键, 截止 Unix 秒, 失败次数)]
+pub fn account_cooling_snapshot() -> Vec<(String, i64, u32)> {
+    safe_lock(acct_cooldown_map())
+        .iter()
+        .map(|(k, (until, fails))| (k.clone(), *until, *fails))
+        .collect()
+}
+
+/// 记录一次账号级配额冷却（until = 恢复时刻 Unix 秒）
+fn note_acct_cooldown(model: &str, uid: &str, until: i64) {
+    let key = acct_model_key(model, uid);
+    let mut map = safe_lock(acct_cooldown_map());
+    let fails = map.get(&key).map(|(_, f)| f + 1).unwrap_or(1);
+    // 取较大者：并发请求不可把恢复时刻提前
+    let until = map.get(&key).map(|(u, _)| *u).unwrap_or(0).max(until);
+    map.insert(key, (until, fails));
+}
+
+/// 成功后清除该账号对本模型的冷却条目
+pub fn clear_account_model_failure(model: &str, uid: &str) {
+    safe_lock(acct_cooldown_map()).remove(&acct_model_key(model, uid));
+}
+
+/// WB 失败分流（2026-10-19 复盘）：6004 限额类（消息含可解析恢复时刻）→
+/// 账号级冷却；其余（Server/空完成/风控等模型级现象）→ 既有模型级冷却。
+pub fn note_wb_failure(state: &ApiSharedState, model: &str, uid: Option<&str>, msg: Option<&str>) {
+    match uid {
+        Some(uid) if msg.and_then(parse_quota_reset_at).is_some() => {
+            let until = msg.and_then(parse_quota_reset_at).unwrap_or_else(|| now_ts() + 60);
+            note_acct_cooldown(model, uid, until);
+            escalate_if_pool_exhausted(state, model);
+        }
+        _ => note_model_failure_ex(state, model, msg),
+    }
+}
+
+/// 全池账号均对本模型处冷却 → 升级写模型级冷却（截止取各账号最大值），
+/// 保留 dispatch 入口快速失败 429 + 跨池回退语义（dispatch.rs pool_health）。
+/// disabled/禁用账号无冷却条目会阻止升级——此时 dispatch skip-continue 收敛到
+/// 轮换耗尽收尾（NoHealthy 503），行为仍正确，仅收尾文案不同。
+fn escalate_if_pool_exhausted(state: &ApiSharedState, model: &str) {
+    let uids = state.wb_pool.uids();
+    if uids.is_empty() {
+        return;
+    }
+    let map = safe_lock(acct_cooldown_map());
+    let now = now_ts();
+    let mut all_cooling = true;
+    let mut max_until = 0i64;
+    for uid in &uids {
+        match map.get(&acct_model_key(model, uid)) {
+            Some((until, _)) if *until > now => max_until = max_until.max(*until),
+            _ => {
+                all_cooling = false;
+                break;
+            }
+        }
+    }
+    drop(map);
+    if all_cooling {
+        let mut model_map = safe_lock(&state.model_cooldowns);
+        let prev = model_map.get(model).copied().unwrap_or((0, 0));
+        model_map.insert(model.to_string(), (max_until.max(prev.0), prev.1 + 1));
+    }
 }
 
 /// 从上游 HTTP 错误响应体提取 message（6004 限额文案随 JSON body 下发）；
@@ -618,6 +721,12 @@ fn run_wb_stream(
             },
         };
         tried.insert(picked.uid.clone());
+        // 账号级配额冷却（2026-10-19 复盘）：6004 限额为账号级配额，该账号对本
+        // 模型仍处冷却 → 跳过换下一候选（不计错误；uid 已入 tried，全池冷却时
+        // 自然收敛到轮换耗尽收尾）
+        if account_model_cooling(model, &picked.uid) {
+            continue;
+        }
         // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
         // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
         // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
@@ -750,7 +859,7 @@ fn run_wb_stream(
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(win_uid, kind);
-                                note_model_failure_ex(state, model, Some(&msg));
+                                note_wb_failure(state, model, Some(win_uid), Some(&msg));
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
@@ -784,6 +893,7 @@ fn run_wb_stream(
                             }
                             state.wb_pool.note_success(win_uid);
                             clear_model_failure(state, model);
+                            clear_account_model_failure(model, win_uid);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
                             state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
                             state.wb_sticky.save(&state.data_dir);
@@ -877,7 +987,7 @@ fn run_wb_stream(
                             if kind.unbinds_sticky() {
                                 state.wb_sticky.unbind_uid(&picked.uid);
                             }
-                            note_model_failure_ex(state, model, upstream_msg(&resp_body).as_deref());
+                            note_wb_failure(state, model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
                                 picked.uid,
@@ -1016,6 +1126,10 @@ pub async fn wb_aggregate_chat(
                 },
             };
             tried.insert(picked.uid.clone());
+            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘）
+            if account_model_cooling(&model, &picked.uid) {
+                continue;
+            }
             // F-77 账号级在途计数：取号即绑定。
             // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
             // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
@@ -1117,6 +1231,7 @@ pub async fn wb_aggregate_chat(
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.wb_pool.note_success(win_uid);
                                 clear_model_failure(&state, &model);
+                                clear_account_model_failure(&model, win_uid);
                                 state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
                                 state.wb_sticky.save(&state.data_dir);
                                 state.logger.log_request_ttfb(
@@ -1130,7 +1245,7 @@ pub async fn wb_aggregate_chat(
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
                                     state.wb_pool.note_error(win_uid, kind);
-                                    note_model_failure_ex(&state, &model, Some(&msg));
+                                    note_wb_failure(&state, &model, Some(win_uid), Some(&msg));
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.wb_sticky.unbind_uid(&win_uid);
@@ -1223,7 +1338,7 @@ pub async fn wb_aggregate_chat(
                                 if kind.unbinds_sticky() {
                                     state.wb_sticky.unbind_uid(&picked.uid);
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
+                                note_wb_failure(&state, &model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
@@ -1391,6 +1506,10 @@ pub async fn wb_tool_exec_chat(
                 None => break,
             };
             tried.insert(picked.uid.clone());
+            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘）
+            if account_model_cooling(&model, &picked.uid) {
+                continue;
+            }
             let conv_id = gen_conv_id();
             // F-77 账号级在途计数：取号即绑定。
             // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
@@ -1462,7 +1581,7 @@ pub async fn wb_tool_exec_chat(
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(&picked.uid, kind);
-                                note_model_failure_ex(&state, &model, Some(&msg));
+                                note_wb_failure(&state, &model, Some(&picked.uid), Some(&msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.wb_sticky.unbind_uid(&picked.uid);
@@ -1630,7 +1749,7 @@ pub async fn wb_tool_exec_chat(
                                 if kind.unbinds_sticky() {
                                     state.wb_sticky.unbind_uid(&picked.uid);
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
+                                note_wb_failure(&state, &model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
                             RetryAction::Fatal => {
@@ -1645,6 +1764,7 @@ pub async fn wb_tool_exec_chat(
                 Ok(c) => {
                     state.wb_pool.note_success(&picked.uid);
                     clear_model_failure(&state, &model);
+                    clear_account_model_failure(&model, &picked.uid);
                     success_uid = Some(picked.uid.clone());
                     final_completion = Some(c);
                     break 'accounts;
@@ -2041,5 +2161,41 @@ mod tests {
         assert!(u.get("total_tokens").is_none());
         assert_eq!(u["cache_read_token"], serde_json::json!(0));
         assert_eq!(u["cache_write_token"], serde_json::json!(0));
+    }
+
+    /// 账号级配额冷却（2026-10-19 复盘）：记录/查询/清零生命周期 + 恢复时刻
+    /// 不可被并发写提前 + 过期自然失效。模型名加时间戳隔离并行测试共享静态表。
+    #[test]
+    fn acct_quota_cooldown_lifecycle() {
+        let model = format!("t-acct-{}", now_ts());
+        let uid = "uid_x";
+        assert!(!account_model_cooling(&model, uid));
+        // 未过期 → 冷却中
+        note_acct_cooldown(&model, uid, now_ts() + 3600);
+        assert!(account_model_cooling(&model, uid));
+        // 更早的恢复时刻不得提前既有窗口
+        note_acct_cooldown(&model, uid, now_ts() + 60);
+        assert!(account_model_cooling(&model, uid));
+        // 过期 → 自然失效
+        let expired = format!("{model}-expired");
+        note_acct_cooldown(&expired, uid, now_ts() - 1);
+        assert!(!account_model_cooling(&expired, uid));
+        // 成功清零
+        clear_account_model_failure(&model, uid);
+        assert!(!account_model_cooling(&model, uid));
+    }
+
+    /// 失败分流：6004 限额文案（可解析恢复时刻）→ 账号级冷却；无消息/不可
+    /// 解析 → 模型级冷却（既有语义不变）。分流判定不含状态构造，直接测
+    /// parse 门控口径与 note_acct_cooldown 键隔离（model|uid 互不串扰）。
+    #[test]
+    fn acct_quota_key_isolation() {
+        let model = format!("t-iso-{}", now_ts());
+        note_acct_cooldown(&model, "uid_a", now_ts() + 3600);
+        // 同模型不同账号互不影响
+        assert!(account_model_cooling(&model, "uid_a"));
+        assert!(!account_model_cooling(&model, "uid_b"));
+        // 不同模型同账号互不影响
+        assert!(!account_model_cooling(&format!("{}-other", model), "uid_a"));
     }
 }

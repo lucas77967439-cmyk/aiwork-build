@@ -77,6 +77,12 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
     match status {
         // 429：优先 Retry-After；缺省线性退避 1/2/3s；耗尽后换号
         429 => {
+            // 6004 限额（消息含「将在 … UTC+8 重置」可解析恢复时刻）：账号配额
+            // 耗尽至恢复时刻，同号重试（Retry-After 钳 60s ×3）纯浪费 ~3 分钟
+            // → 直接换号（2026-10-19 实测复盘）
+            if super::wb_route::parse_quota_reset_at(body).is_some() {
+                return RetryAction::SwitchKey;
+            }
             if attempt >= 3 {
                 return RetryAction::SwitchKey;
             }
@@ -156,6 +162,21 @@ mod tests {
         );
         // 3 次耗尽后换号
         assert_eq!(retry_plan(429, "", 3, None), RetryAction::SwitchKey);
+    }
+
+    #[test]
+    fn quota_reset_429_switches_key_immediately() {
+        // 6004 限额文案（恢复时刻取未来 1 小时，满足「未来且 ≤7 天」钳制）：
+        // 账号配额耗尽至恢复时刻，同号重试无意义 → 直接换号
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let body = format!("触发限额，将在 {} UTC+8 重置", reset.format("%Y-%m-%d %H:%M:%S"));
+        assert_eq!(retry_plan(429, &body, 0, Some(61_551)), RetryAction::SwitchKey);
+        // 普通限频 429（无可解析恢复时刻）→ 维持 Retry-After 退避语义
+        assert_eq!(
+            retry_plan(429, "rate limited", 0, Some(7)),
+            RetryAction::RetrySame { delay_ms: 7000 }
+        );
     }
 
     #[test]

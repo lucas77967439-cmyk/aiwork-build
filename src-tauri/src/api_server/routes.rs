@@ -567,6 +567,15 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }))
             .collect()
     };
+    // 账号级配额冷却（2026-10-19 复盘）：6004 限额按 {model}|{uid} 记账，
+    // 与模型级（全池升级）分开暴露，供排障区分「单账号限额」与「全池冷却」
+    let account_model_cooldowns: Vec<Value> = wb_route::account_cooling_snapshot()
+        .into_iter()
+        .filter(|(_, until, _)| *until > now)
+        .map(|(k, until, fails)| json!({
+            "key": k, "until": until, "remaining_s": until - now, "fails": fails,
+        }))
+        .collect();
 
     Json(json!({
         "running": true,
@@ -590,6 +599,7 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "total_accounts": wb_pool.len(),
             "accounts": wb_accounts,
             "model_cooldowns": model_cooldowns,
+            "account_model_cooldowns": account_model_cooldowns,
             "sticky_sessions": state.wb_sticky.len(),
             // 上游健康探针（F-34 ④/§2.2）：-1 未探测 / 0 不可达 / 1 在线
             "probe_ok": state.wb_probe_ok.load(std::sync::atomic::Ordering::Relaxed),

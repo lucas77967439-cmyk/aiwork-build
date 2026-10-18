@@ -799,6 +799,12 @@ impl ApiPool {
             .unwrap_or_default()
     }
 
+    /// 全部账号 uid 列表（含 disabled/冷却中；wb_route 账号级配额冷却的
+    /// 「全池冷却升级模型级」判定用，2026-10-19 复盘新增）
+    pub fn uids(&self) -> Vec<String> {
+        safe_lock(&self.entries).keys().cloned().collect()
+    }
+
     /// F-78 批次 3：refresh_token 判定失效 → 运行时禁用（前端 refresh_jwt 失败联动；
     /// 持久化标记由 record_refresh_failure 写 accounts 文件，重启后经 sync_from_accounts 同步）
     pub fn note_refresh_invalid(&self, uid: &str) {
