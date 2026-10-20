@@ -120,6 +120,37 @@ pub fn builtin() -> Vec<WbModel> {
     ]
 }
 
+/// 免费档补充表（2026-10-21 官方计费流水实证，见 TECHNICAL-NOTES §13.21）：
+/// 上游计费侧存在 `-f` 后缀的免费变体（`hy4-preview-f` 550 次请求扣点全 0，
+/// 三个 Buddy 账号均如此），但该 id 不出现在上游模型列表接口的同步结果里，
+/// 导致 `load()` 拿到同步目录后缺项——网关不认识这个 id，白名单/编排层自然都看不到。
+///
+/// 策略：同步结果优先，仅按 id **缺失时**才补本表条目。刻意不做内置表全量 union
+/// （那会把 2026-09 快照里 gl5/kimi 等过期倍率一并复活）；本表体积极小，
+/// 每一项都需「用量流水实测免单」为依据才准入。
+pub fn free_tier_extras() -> Vec<WbModel> {
+    vec![WbModel {
+        id: "hy4-preview-f".to_string(),
+        display: "Hy4 Preview (免费档)".to_string(),
+        context_length: 960_000,
+        max_tokens: 64_000,
+        supports_image: true,
+        supported_efforts: vec!["high".to_string()],
+        effort_override: None,
+        rate: 0.00,
+    }]
+}
+
+/// 把免费档补充表按 id 缺失补入已解析目录（幂等：已存在不覆盖不重复）
+fn merge_free_tier_extras(mut models: Vec<WbModel>) -> Vec<WbModel> {
+    for extra in free_tier_extras() {
+        if !models.iter().any(|m| m.id == extra.id) {
+            models.push(extra);
+        }
+    }
+    models
+}
+
 /// 目录文件路径（data/wb_model_catalog.json，§3.8）。
 /// 数据文件统一 data/ 子目录（与 api_models/api_keys/api_usage 同层）；
 /// Buddy 侧不保历史（§9.4 #7）：旧根目录位置不迁移，缺失即内置兜底重建
@@ -153,11 +184,12 @@ pub fn load(data_dir: &Path) -> Vec<WbModel> {
             if !file.models.is_empty() {
                 // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
                 if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
-                    return file.models;
+                    // 同步结果缺失的 `-f` 免费变体在此补齐（见 free_tier_extras 注释）
+                    return merge_free_tier_extras(file.models);
                 }
             }
         }
-        let builtin = builtin();
+        let builtin = merge_free_tier_extras(builtin());
         let _ = crate::store::db(data_dir).kv_set(
             "wb_model_catalog",
             &WbCatalogFile {
@@ -573,6 +605,30 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 15);
+    }
+
+    /// 免费档补充表：同步目录缺失 `hy4-preview-f` 时补齐（幂等、不覆盖既有条目）
+    #[test]
+    fn free_tier_extras_merged_when_absent_and_idempotent() {
+        let base = vec![WbModel {
+            id: "hy4-preview".to_string(),
+            display: "Hy4 Preview".to_string(),
+            context_length: 960_000,
+            max_tokens: 64_000,
+            supports_image: true,
+            supported_efforts: vec!["high".to_string()],
+            effort_override: None,
+            rate: 0.29,
+        }];
+        let merged = merge_free_tier_extras(base.clone());
+        assert_eq!(merged.len(), 2, "缺失的 -f 免费变体应补齐");
+        let extra = find(&merged, "hy4-preview-f").expect("-f 变体应存在");
+        assert_eq!(extra.rate, 0.00, "免费档倍率应为 0");
+        // 幂等：已存在时不重复、不覆盖原有倍率
+        let twice = merge_free_tier_extras(merged);
+        assert_eq!(twice.len(), 2);
+        assert_eq!(find(&twice, "hy4-preview-f").unwrap().rate, 0.00);
+        assert_eq!(find(&twice, "hy4-preview").unwrap().rate, 0.29, "既有条目倍率不得被覆盖");
     }
 
     #[test]
