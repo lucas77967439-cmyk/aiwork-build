@@ -182,10 +182,14 @@ pub fn load(data_dir: &Path) -> Vec<WbModel> {
             .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
         {
             if !file.models.is_empty() {
-                // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
-                if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
-                    // 同步结果缺失的 `-f` 免费变体在此补齐（见 free_tier_extras 注释）
+                if file.fetched_at.is_some() {
+                    // 上游同步结果：缺失的 `-f` 免费变体在此补齐（见 free_tier_extras 注释）
                     return merge_free_tier_extras(file.models);
+                }
+                if file.builtin_rev >= BUILTIN_REV {
+                    // 人工维护目录（含测试 fixture）：按其声明原样返回，不擅自追加，
+                    // 便于人工/测试精确掌控目录内容
+                    return file.models;
                 }
             }
         }
