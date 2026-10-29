@@ -120,25 +120,22 @@ pub fn builtin() -> Vec<WbModel> {
     ]
 }
 
-/// 免费档补充表（2026-10-21 官方计费流水实证，见 TECHNICAL-NOTES §13.21）：
-/// 上游计费侧存在 `-f` 后缀的免费变体（`hy4-preview-f` 550 次请求扣点全 0，
-/// 三个 Buddy 账号均如此），但该 id 不出现在上游模型列表接口的同步结果里，
-/// 导致 `load()` 拿到同步目录后缺项——网关不认识这个 id，白名单/编排层自然都看不到。
+/// 免费档补充表（2026-10-21 引入，2026-10-29 清空）。
 ///
-/// 策略：同步结果优先，仅按 id **缺失时**才补本表条目。刻意不做内置表全量 union
-/// （那会把 2026-09 快照里 gl5/kimi 等过期倍率一并复活）；本表体积极小，
-/// 每一项都需「用量流水实测免单」为依据才准入。
+/// 起因：当时官方计费流水里出现 `-f` 后缀变体（`hy4-preview-f`，542 次请求扣点全 0），
+/// 但该 id 不在上游模型列表接口的同步结果里，故按"实测免单"把它按 0.00 注入目录，
+/// 让网关/编排层能识别并推送。
+///
+/// 2026-10-29 清空：上游限时免费活动结束后，该注入条目的 0.00 变成**我们自己的过期
+/// 假设**（上游从未提供过该 id 的倍率），继续保留会导致编排层按"免费"推送一个实际
+/// 收费的模型。10-28/29 已无新 hy4 流量佐证免费（同期 step-5-preview 仍正常扣点，
+/// 说明计费链路正常）。**凡非上游提供的倍率，都不应长期以 0.00 形态存在。**
+///
+/// 保留机制与函数（返回空表 = 关闭），后续若再有"确属免费但目录未收录"的模型，
+/// 需同时满足：① 用量流水实测免单；② 有明确的上游依据或活动期限；③ 在此登记并
+/// 同步在编排层 FORCE_EXCLUDE 的反向白名单里复核。
 pub fn free_tier_extras() -> Vec<WbModel> {
-    vec![WbModel {
-        id: "hy4-preview-f".to_string(),
-        display: "Hy4 Preview (免费档)".to_string(),
-        context_length: 960_000,
-        max_tokens: 64_000,
-        supports_image: true,
-        supported_efforts: vec!["high".to_string()],
-        effort_override: None,
-        rate: 0.00,
-    }]
+    Vec::new()
 }
 
 /// 把免费档补充表按 id 缺失补入已解析目录（幂等：已存在不覆盖不重复）
@@ -611,9 +608,14 @@ mod tests {
         assert_eq!(ids.len(), 15);
     }
 
-    /// 免费档补充表：同步目录缺失 `hy4-preview-f` 时补齐（幂等、不覆盖既有条目）
+    /// 免费档补充表：2026-10-29 起为空表（上游免费活动结束，见 free_tier_extras 注释）。
+    /// 断言合并逻辑为恒等——不再注入任何非上游提供的倍率条目。
     #[test]
-    fn free_tier_extras_merged_when_absent_and_idempotent() {
+    fn free_tier_extras_empty_after_promo_ended() {
+        assert!(
+            free_tier_extras().is_empty(),
+            "免费档补充表应为空：上游未提供的倍率不得以 0.00 形态注入"
+        );
         let base = vec![WbModel {
             id: "hy4-preview".to_string(),
             display: "Hy4 Preview".to_string(),
@@ -625,14 +627,10 @@ mod tests {
             rate: 0.29,
         }];
         let merged = merge_free_tier_extras(base.clone());
-        assert_eq!(merged.len(), 2, "缺失的 -f 免费变体应补齐");
-        let extra = find(&merged, "hy4-preview-f").expect("-f 变体应存在");
-        assert_eq!(extra.rate, 0.00, "免费档倍率应为 0");
-        // 幂等：已存在时不重复、不覆盖原有倍率
-        let twice = merge_free_tier_extras(merged);
-        assert_eq!(twice.len(), 2);
-        assert_eq!(find(&twice, "hy4-preview-f").unwrap().rate, 0.00);
-        assert_eq!(find(&twice, "hy4-preview").unwrap().rate, 0.29, "既有条目倍率不得被覆盖");
+        assert_eq!(merged.len(), 1, "不应注入任何补充条目");
+        assert_eq!(merged[0].id, "hy4-preview");
+        assert_eq!(merged[0].rate, 0.29, "既有条目倍率不得被覆盖");
+        assert!(find(&merged, "hy4-preview-f").is_none(), "-f 免费变体不应再出现在目录里");
     }
 
     #[test]
