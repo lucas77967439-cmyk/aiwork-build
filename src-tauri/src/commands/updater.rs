@@ -2,17 +2,22 @@
 //
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
-//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（仅作手动安装备选；应用内更新不使用，见 pick_asset）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
 //                      latest.json（scripts/rename_release.mjs 生成随 Release 上传）取安装包 SHA256，
 //                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
-//   update_download    下载资产到临时目录（emit update-download-progress），完成后与发布方
-//                      SHA256 比对（不匹配即删除并报错），返回文件路径由前端确认后再安装；
-//   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
+//   update_download    下载资产到临时目录（emit update-download-progress）。完整性三道闸：
+//                      ① 拒绝缺失/非法的发布方 SHA256（None 不放行）；② 下载完成与发布方
+//                      SHA256 比对（不匹配即删除并报错），通过后落 .sha256 sidecar；
+//                      ③ update_run_installer 安装前校验「文件名与资产名绑定 + SHA256 复验」。
+//                      返回文件路径由前端确认后再安装；
+//   update_run_installer 经 cmd /c start 中转以 /P /UPDATE /R 启动 NSIS 安装器（issue #135）：
 //                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
-//                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
+//                      （自定义模板 build-assets/installer.nsi 支持上述标志）；中转启动令安装器在应用
+//                      退出前即脱离本应用进程树，避免安装器 PREINSTALL 的 taskkill 树杀误伤自身，
+//                      随后应用退出。
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -40,7 +45,7 @@ pub struct UpdateCheckResult {
     pub size: u64,
     pub release_page: String,
     /// 发布方提供的安装包 SHA256（优先取发布校验清单 latest.json，回退 release 正文约定行；
-    /// 存量旧 release 两者皆无时为 None，跳过校验）
+    /// 存量旧 release 两者皆无时为 None——update_download 将拒绝下载，fail-closed）
     pub sha256: Option<String>,
 }
 
@@ -158,30 +163,28 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     ))
 }
 
-/// 在 release 资产中挑选安装包：优先 NSIS（x64-setup.exe），退而求其次 MSI。
+/// 在 release 资产中挑选安装包：仅接受 NSIS（x64-setup.exe）。
+/// MSI 不参与挑选（P4，#135 审查收尾）：update_run_installer 统一按 NSIS 参数
+/// （/P /UPDATE /R）启动安装器，msiexec 语义中 /P 是补丁模式——旧「MSI 兜底」
+/// 选出即死路，宁可在此返回 None 走「没有可用的安装包资产」显式报错引导手动下载，
+/// 也不静默选出必然失败的资产。
 fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
-    // [(name, url, size)] 两轮：先 NSIS 后 MSI
-    let mut parsed: Vec<(String, String, u64, bool)> = Vec::new(); // bool=is_nsis
+    let mut parsed: Vec<(String, String, u64)> = Vec::new();
     for a in assets {
         let name = a.get("name")?.as_str()?.to_string();
         let url = a.get("browser_download_url")?.as_str()?.to_string();
         let size = a.get("size")?.as_u64().unwrap_or(0);
-        let is_nsis = name.ends_with("_x64-setup.exe");
-        let is_msi = name.ends_with("_x64_zh-CN.msi");
-        if is_nsis || is_msi {
-            parsed.push((name, url, size, is_nsis));
+        if name.ends_with("_x64-setup.exe") {
+            parsed.push((name, url, size));
         }
     }
-    // NSIS 优先；同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
+    // 同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
     parsed.sort_by(|a, b| {
-        let ka = (a.3, version_from_asset(&a.0).unwrap_or((0, 0, 0)));
-        let kb = (b.3, version_from_asset(&b.0).unwrap_or((0, 0, 0)));
-        kb.cmp(&ka)
+        version_from_asset(&b.0)
+            .unwrap_or((0, 0, 0))
+            .cmp(&version_from_asset(&a.0).unwrap_or((0, 0, 0)))
     });
-    parsed
-        .into_iter()
-        .next()
-        .map(|(name, url, size, _)| (name, url, size))
+    parsed.into_iter().next()
 }
 
 // ---------------- 发布校验清单（latest.json） ----------------
@@ -454,9 +457,30 @@ pub struct UpdateDownloaded {
     pub version: String,
 }
 
+/// 资产文件名白名单（D1，cmd 元字符注入防御）：update_run_installer 将安装包
+/// 路径传入 `cmd /C start` 拼接，且 asset_name 参与临时目录/sidecar 路径 join。
+/// Rust Command 对含空格参数自动加引号，但 `"` 可闭合引导，`&`/`^`/`%`/`!` 等
+/// 在 cmd 解析层存在注入面。白名单仅放行字母数字（Unicode 语义，含既有资产名
+/// 中文）+ 空格 `. _ - ( ) #`——发布流资产名 "AI Work 助手_<ver>_x64-setup.exe"
+/// / "_x64_zh-CN.msi" 全命中，其余一律拒绝。
+fn ensure_safe_asset_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("资产文件名为空，已中止".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '#'))
+    {
+        return Err(format!("资产文件名包含非法字符，已中止: {name}"));
+    }
+    Ok(())
+}
+
 /// 校验下载目标：资产名版本必须与检查结果一致，且大于当前版本。
 /// 同时防御路径注入：资产名只允许安全文件名字符（来自 GitHub API，纵深防御）。
 fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64, u64), String> {
+    // D1（cmd 元字符注入防御，先于路径校验）：文件名将参与 `cmd /C start` 拼接
+    ensure_safe_asset_name(asset_name)?;
     if asset_name.contains(['/', '\\', ':'])
         || asset_name.split(['.', ' ']).any(|seg| seg == "..")
         || asset_name.contains("..")
@@ -490,7 +514,9 @@ pub fn update_download(
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
 
-    // 防御：发布方摘要必须为合法 SHA-256 格式（update_check 已 fail-closed 保证存在，此处双保险）
+    // 审查修复（H4，闸①）：发布方摘要是强制闸门——None（存量旧 release 无清单无正文行）
+    // 与格式非法同样拒绝下载，绝不放行无校验的安装包（原实现 None 直接跳过校验，
+    // 篡改/损坏的安装包可直通安装）
     let expected = match expected_sha256.as_deref() {
         Some(s) => {
             let s = s.trim().to_ascii_lowercase();
@@ -500,9 +526,14 @@ pub fn update_download(
                         .to_string(),
                 );
             }
-            Some(s)
+            s
         }
-        None => None,
+        None => {
+            return Err(
+                "发布方 SHA-256 缺失（旧版发布方式，无校验信息），已中止下载。请手动下载安装"
+                    .to_string(),
+            )
+        }
     };
 
     // 下载目录：%TEMP%\ai-work-assistant-update\
@@ -515,7 +546,9 @@ pub fn update_download(
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if name.as_deref() != Some(asset_name.as_str())
                 && p.is_file()
-                && p.extension().map(|e| e == "exe" || e == "msi").unwrap_or(false)
+                && p.extension()
+                    .map(|e| e == "exe" || e == "msi" || e == "sha256")
+                    .unwrap_or(false)
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -524,6 +557,10 @@ pub fn update_download(
     let dest = dir.join(&asset_name);
     // 清理同名旧文件（可能是不完整下载）
     let _ = std::fs::remove_file(&dest);
+    // 审查修复（H4，闸②）：校验文件 sidecar 路径（<资产名>.sha256，下载校验通过后写入，
+    // 供 update_run_installer 安装前复验）；先清理同名旧 sidecar，避免跨轮次残留误配
+    let sidecar = dir.join(format!("{asset_name}.sha256"));
+    let _ = std::fs::remove_file(&sidecar);
 
     // 逐通道尝试下载（系统代理 → 环境变量代理 → 直连）。
     // 超时策略：连接 10s + 读 60s，不设整体超时（大文件慢速下载不能被整体超时掐断）。
@@ -534,17 +571,21 @@ pub fn update_download(
     {
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
-                // 完整性校验：发布方提供 SHA256 时必须匹配，不匹配删除文件并中止（防供应链篡改）
-                if let Some(expected) = expected.as_deref() {
-                    let actual = file_sha256(&dest).unwrap_or_default();
-                    if actual != expected {
-                        let _ = std::fs::remove_file(&dest);
-                        return Err(format!(
-                            "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
-                             可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
-                        ));
-                    }
+                // 完整性校验（闸②前半）：下载完成立即与发布方 SHA256 比对，不匹配删除文件并中止
+                // （防供应链篡改；expected 已在入口强制非空，无「跳过校验」路径）
+                let actual = file_sha256(&dest).unwrap_or_default();
+                if actual != expected {
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(format!(
+                        "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
+                         可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
+                    ));
                 }
+                // 审查修复（H4，闸②后半）：校验通过后落 .sha256 sidecar（sha256sum 风格：
+                // <hex>  <资产名>），供 update_run_installer 安装前复验，覆盖
+                // 「下载后、安装前」窗口期的文件替换/篡改
+                std::fs::write(&sidecar, format!("{expected}  {asset_name}\n"))
+                    .map_err(|e| format!("写入校验文件失败: {e}"))?;
                 let _ = app.emit(
                     "update-download-progress",
                     DownloadProgress { received, total: received, percent: 100 },
@@ -643,16 +684,84 @@ pub fn update_run_installer(
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
+    // D1（cmd 元字符注入防御）：下方经 `cmd /C start` 拼接启动，asset_name 同时
+    // 参与 sidecar 路径拼接——白名单拒绝 cmd 元字符（受信前端直调也纵深拦截）
+    ensure_safe_asset_name(&asset_name)?;
 
-    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
-    std::process::Command::new(path)
-        .args(["/P", "/UPDATE", "/R"])
-        .spawn()
-        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+    // 审查修复（H4，闸③）：安装前两道校验——
+    // ① 文件名与资产名绑定：拒绝「A 文件路径 + B 资产名」的组合，防止借合法资产名
+    //    通过版本校验后执行任意文件
+    // ② SHA256 复验：读取下载时落盘的 .sha256 sidecar，对磁盘文件重新计算并比对，
+    //    覆盖「下载后、安装前」窗口期的替换/篡改；sidecar 缺失或损坏同样拒绝
+    //    （fail-closed：正常流程必有 sidecar，缺失说明文件不是本次更新流程下载的）
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("非法的安装包路径，已中止：{file_path}"))?;
+    if file_name != asset_name {
+        return Err(format!(
+            "安装包文件名与资产名不一致（{file_name} / {asset_name}），已中止"
+        ));
+    }
+    let sidecar = expected_dir.join(format!("{asset_name}.sha256"));
+    let expected = std::fs::read_to_string(&sidecar).map_err(|_| {
+        "安装包校验文件缺失，已中止安装。请重新走「检查更新 → 下载」流程，或手动下载安装"
+            .to_string()
+    })?;
+    let expected = expected
+        .split_whitespace()
+        .next()
+        .filter(|h| is_sha256_hex(h))
+        .ok_or("安装包校验文件损坏，已中止安装。请重新下载")?
+        .to_ascii_lowercase();
+    let actual = file_sha256(path).unwrap_or_default();
+    if actual != expected {
+        return Err(
+            "安装包完整性校验失败（SHA256 与下载时不一致），文件可能在下载后被改动，已中止安装。请重新下载"
+                .to_string(),
+        );
+    }
+
+    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用。
+    // Windows 经 `cmd /c start` 中转启动（issue #135）：cmd 启动安装器后立即退出，
+    // 安装器随即脱离本应用的进程树——安装器 PREINSTALL 钩子会 taskkill 本产品主程序，
+    // 若安装器仍是本应用的子进程，树杀（/T）会连同安装器一起强杀，安装中途静默中断
+    // 导致升级失败；脱树后 taskkill 只命中应用自身。CREATE_NO_WINDOW 防止 cmd 控制台
+    // 窗口闪现（安装包路径与存在性已在上方校验，start 找不到文件的场景已排除）。
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
+        // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
+        // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
+        // 而不是照常 emit+exit 静默失败（issue #135 加固）
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+        if !status.success() {
+            return Err(format!(
+                "启动安装程序失败（退出码 {}），可手动运行：{file_path}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new(path)
+            .args(["/P", "/UPDATE", "/R"])
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+    }
 
     // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
     // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
     crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
+    // D2：800ms 延迟退出与安装器 PREINSTALL 宽限等待（installer-hooks.nsh：1.2s
+    // 静默 + 存活探测循环）耦合——正常时序本应用先自行退出，安装器宽限仅兜底
+    // 锁占用；两值需同步调整（应用退出耗时应 < 安装器兜底强杀）
     std::thread::sleep(Duration::from_millis(800));
     // 审查修复：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
     // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
@@ -672,6 +781,71 @@ mod tests {
         assert!(!is_sha256_hex(&"a".repeat(63))); // 不足 64 位
         assert!(!is_sha256_hex(&"g".repeat(64))); // 非十六进制字符
         assert!(!is_sha256_hex(""));
+    }
+
+    /// D1：资产文件名白名单——既有发布流资产名全命中，cmd 元字符一律拒绝
+    #[test]
+    fn safe_asset_name_whitelist() {
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64_zh-CN.msi").is_ok());
+        assert!(ensure_safe_asset_name("AI.Work._3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("setup(1).exe").is_ok());
+        // cmd 元字符 / 引号 / 分隔符 / 控制字符一律拒绝
+        for bad in [
+            "x&calc.exe",
+            "x|ver.exe",
+            "x^1.exe",
+            "x%PATH%.exe",
+            "x!U!.exe",
+            "a\"b.exe",
+            "a<b.exe",
+            "a>b.exe",
+            "a;b.exe",
+            "a'b.exe",
+            "a`b.exe",
+            "a\\b.exe",
+            "a/b.exe",
+            "a:b.exe",
+            "a$b.exe",
+            "a=b.exe",
+            "a,cmd.exe",
+            "a@x.exe",
+            "x\t.exe",
+            "x\n.exe",
+        ] {
+            assert!(ensure_safe_asset_name(bad).is_err(), "须拒绝: {bad:?}");
+        }
+        assert!(ensure_safe_asset_name("").is_err(), "空名拒绝");
+    }
+
+    /// P4（#135 审查收尾）：pick_asset 仅接受 NSIS——MSI 兜底是死路
+    /// （update_run_installer 统一按 NSIS 参数启动，msiexec /P 为补丁模式），
+    /// 仅 MSI 的 release 显式报「没有可用的安装包资产」引导手动下载。
+    #[test]
+    fn pick_asset_nsis_only() {
+        let asset = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://example.com/{name}"),
+                "size": 1u64,
+            })
+        };
+        // NSIS 优先：MSI 在场也不影响
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64_zh-CN.msi"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
+        // 仅 MSI → None（旧逻辑会选中并必然失败于 msiexec）
+        assert!(pick_asset(&[asset("AI Work 助手_3.8.2_x64_zh-CN.msi")]).is_none());
+        // 同类多资产取版本最高者
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64-setup.exe"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
     }
 
     #[test]

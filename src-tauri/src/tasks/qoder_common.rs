@@ -367,6 +367,22 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             .cloned()
             .ok_or_else(|| "token_store 内部错误：目标行缺失".to_string())?
     };
+    // 审查修复（M22）：vault 收敛（secure_store_for_save）会把敏感字段明文写入
+    // vault——若此刻 DB 已被其他进程改成不识别的 version，vault 之后的闸门 #2
+    // 才早退会留下「vault 有凭证、DB 无行」的半迁移态孤儿记录。vault 写入前
+    // 重读 DB 复查 version，不识别直接早退（零写入）；vault 之后的 fresh 重载
+    // 与闸门 #2 保留（继续护住 H-1 行级合并的收窄窗口，判定口径与之一致）
+    {
+        let pre = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
+        if pre
+            .as_object()
+            .and_then(|o| o.get("version"))
+            .map(|v| v.as_i64() != Some(1))
+            .unwrap_or(false)
+        {
+            return Err("token_store 版本不识别，拒绝写入".to_string());
+        }
+    }
     // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；故落库不使用上面的
     // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
     // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」
@@ -577,6 +593,19 @@ fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdenti
     }
 }
 
+/// 头值 ASCII 净化（issue #116）：头值仅接受 ASCII 可见字符，计算机名含中文等
+/// 非 ASCII 时 `Cosy-MachineHostname` 会在发包前被 ureq 拒绝（Bad Header →
+/// status=0 网络不可达，请求根本没发出去）。保留 0x21..=0x7E 可见 ASCII，
+/// 过滤非 ASCII/控制字符/空白；净化后为空回退 "PC"（与 env 缺省一致）。
+fn sanitize_header_ascii(s: &str) -> String {
+    let cleaned: String = s.chars().filter(char::is_ascii_graphic).collect();
+    if cleaned.is_empty() {
+        "PC".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// 按客户端 openapi 域实测形态补齐设备描述头（proxy 抓包 2026-10-07 12:35，客户端
 /// 0.4.3 对全部 openapi 请求携带：cosy-version / cosy-machineos / cosy-machinehostname
 /// / cosy-machinecode / cosy-machinetype + 原生 cosy-machinetoken）。
@@ -594,7 +623,9 @@ fn extend_device_headers_with(
     let has = |h: &[(String, String)], k: &str| {
         h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
     };
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    // issue #116：计算机名真值经 ASCII 净化后再入头
+    let hostname =
+        sanitize_header_ascii(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string()));
     for (k, v) in [
         ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
         ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
@@ -753,34 +784,72 @@ pub fn refresh_token_once_ex(
     let Some(body) = body else {
         return (None, RefreshFail::Transient);
     };
-    let acc = s_of(fs_utils::dig(&body, &["accessToken", "access_token", "token"]));
-    if acc.is_empty() {
-        return (None, RefreshFail::Transient);
-    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
+    if !apply_refresh_response(&mut out, &body, now_ms) {
+        return (None, RefreshFail::Transient);
+    }
+    (Some(out), RefreshFail::Transient)
+}
+
+/// 解析刷新响应（deviceToken/refresh 与 jobToken/refresh 两种形态）：
+/// - access token：`accessToken` / `access_token` / `token` / **`device_token` / `deviceToken`**
+///   （2026-10-25 实测 deviceToken/refresh 返回的是 `device_token`，旧实现只认
+///   accessToken → 明明 200 成功却被判「响应结构异常」，手动续期恒失败）；
+/// - 到期：`expiresIn` / `expires_in`（毫秒/秒）或 `expires_at` / `expiresAt`（RFC3339）；
+/// - refresh token：`refreshToken` / `refresh_token`；
+/// - refresh 到期：`refresh_token_expires_in` / `refreshTokenExpiresIn` 或
+///   `refresh_expires_at` / `refreshExpiresAt`（RFC3339）。
+fn apply_refresh_response(out: &mut QoderCreds, body: &serde_json::Value, now_ms: i64) -> bool {
+    let acc = s_of(fs_utils::dig(
+        body,
+        &[
+            "accessToken",
+            "access_token",
+            "token",
+            "device_token",
+            "deviceToken",
+        ],
+    ));
+    if acc.is_empty() {
+        return false;
+    }
     out.access_token = acc;
-    let ref_tok = s_of(fs_utils::dig(&body, &["refreshToken", "refresh_token"]));
+    let ref_tok = s_of(fs_utils::dig(body, &["refreshToken", "refresh_token"]));
     if !ref_tok.is_empty() {
         out.refresh_token = ref_tok;
     }
-    if let Some(e) = i_of(fs_utils::dig(&body, &["expiresIn", "expires_in"])) {
-        out.expires_at_ms = Some(now_ms + normalize_expires_in(e));
-    } else {
-        // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
-        // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
-        // 典型 24h 有效期，宁多刷不误用；clamp_expires_at 仅钳非正/超界畸形值，
-        // now+12h 在合法域内不受影响
-        out.expires_at_ms = Some(now_ms + 12 * 3_600_000);
-    }
+    out.expires_at_ms = Some(
+        i_of(fs_utils::dig(body, &["expiresIn", "expires_in"]))
+            .map(|e| now_ms + normalize_expires_in(e))
+            .or_else(|| {
+                let s = s_of(fs_utils::dig(body, &["expires_at", "expiresAt"]));
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.timestamp_millis())
+            })
+            // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
+            // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
+            // 典型 24h 有效期，宁多刷不误用；clamp_expires_at 仅钳非正/超界畸形值，
+            // now+12h 在合法域内不受影响
+            .unwrap_or(now_ms + 12 * 3_600_000),
+    );
     // 刷新令牌过期时刻随行解析（R-6 实测 refresh_token_expires_in≈48h ms；审查 L-RT）
     if let Some(e) = i_of(fs_utils::dig(
-        &body,
+        body,
         &["refresh_token_expires_in", "refreshTokenExpiresIn"],
     )) {
         out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
+    } else {
+        let s = s_of(fs_utils::dig(
+            body,
+            &["refresh_expires_at", "refreshExpiresAt"],
+        ));
+        if let Ok(d) = chrono::DateTime::parse_from_rfc3339(&s) {
+            out.refresh_expires_at_ms = Some(d.timestamp_millis());
+        }
     }
-    (Some(out), RefreshFail::Transient)
+    true
 }
 
 // ── userinfo（PAT 导入时回填 uid/昵称；失败容错不阻塞导入）──────────────────
@@ -1415,6 +1484,46 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 2026-10-25 实测 deviceToken/refresh 的 200 响应：token 字段叫 `device_token`，
+    /// 到期是 RFC3339 的 `expires_at`。旧解析只认 accessToken/expiresIn → 手动续期恒报
+    /// 「响应结构异常」；本用例锁定修复后的字段兼容。
+    #[test]
+    fn device_token_refresh_response_parses_device_token_and_expires_at() {
+        let body = json!({
+            "created_at": "2026-10-25T04:41:16Z",
+            "device_token": "dt-test",
+            "expires_at": "2026-11-24T04:41:16Z",
+            "refresh_token": "drt-test"
+        });
+        let mut c = QoderCreds::default();
+        assert!(apply_refresh_response(&mut c, &body, 0));
+        assert_eq!(c.access_token, "dt-test");
+        assert_eq!(c.refresh_token, "drt-test");
+        assert_eq!(
+            c.expires_at_ms,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-24T04:41:16Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+    }
+
+    /// 兼容 PAT/jobToken 通道的旧响应形态（accessToken + expiresIn 毫秒）。
+    #[test]
+    fn legacy_refresh_response_still_parses_expires_in() {
+        let body = json!({
+            "accessToken": "jt-test",
+            "expiresIn": 86_400_000_i64,
+            "refreshToken": "jrt-test"
+        });
+        let mut c = QoderCreds::default();
+        assert!(apply_refresh_response(&mut c, &body, 1_000));
+        assert_eq!(c.access_token, "jt-test");
+        assert_eq!(c.refresh_token, "jrt-test");
+        assert_eq!(c.expires_at_ms, Some(1_000 + 86_400_000));
+    }
+
     /// 跨进程锁名可用性回归（2026-10-04）：锁名误用多段路径 `Global\a\b\c` 时，
     /// 内核对象命名空间 `\BaseNamedObjects` 下无中间对象目录 → CreateMutexW 恒
     /// ERROR_PATH_NOT_FOUND(3) → try_acquire 永久返回假 busy（日志误报「另一进程
@@ -1551,6 +1660,18 @@ mod tests {
         let mut h2 = vec![("Cosy-MachineCode".to_string(), "keep".to_string())];
         extend_device_headers_with(&mut h2, &c, None);
         assert!(h2.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "keep"));
+    }
+
+    /// issue #116：计算机名含中文等非 ASCII 时头值必须净化为可见 ASCII
+    ///（否则 ureq 发包前报 Bad Header，请求未发出 → status=0 网络不可达）
+    #[test]
+    fn sanitize_header_ascii_filters_non_ascii_and_falls_back() {
+        assert_eq!(sanitize_header_ascii("DESKTOP-ABC123"), "DESKTOP-ABC123");
+        assert_eq!(sanitize_header_ascii("我的PC-01"), "PC-01");
+        assert_eq!(sanitize_header_ascii("中文机器名"), "PC", "全非 ASCII 回退默认值");
+        assert_eq!(sanitize_header_ascii(""), "PC");
+        // 控制字符与空白同属头值校验拒绝面，一并过滤
+        assert_eq!(sanitize_header_ascii("ab\tc d"), "abcd");
     }
 
     /// runtime-info.exe stdout 解析：容忍 '.' 终止符（客户端桥分段语义）、拒绝空值

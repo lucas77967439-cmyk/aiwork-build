@@ -29,6 +29,7 @@ pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
+pub mod buddy_ai_checkin;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
@@ -65,6 +66,30 @@ pub(crate) fn qoder_sessions_compact_days(state: &AppState) -> i64 {
         .clamp(1, 90)
 }
 
+/// 豆包保活前置检查（issue #147）：返回 Some(跳过原因) 时不应拉起客户端。
+/// ① 账号池为空 → 无可续期的豆包会话；② 六级发现找不到 Doubao.exe →
+/// 启动注定失败（避免每日失败日志与当日首败通知）
+pub fn doubao_keepalive_skip_reason(state: &AppState) -> Option<String> {
+    if crate::commands::doubao::load_pool(state).accounts.is_empty() {
+        return Some("无豆包账号".into());
+    }
+    let args = crate::switcher::RunArgs {
+        action: crate::switcher::Action::KeepAlive,
+        target_app: crate::switcher::TargetApp::Doubao,
+        user_id: None,
+        proxy_port: None,
+        include_indexeddb: false,
+        expected_current_uid: String::new(),
+        machine_id_override: None,
+        data_dir: state.data_dir.clone(),
+    };
+    let mut sess = crate::switcher::Session::new(&args);
+    if crate::switcher::locate::find_exe(&mut sess).is_none() {
+        return Some("未找到豆包客户端（Doubao.exe）".into());
+    }
+    None
+}
+
 /// CLI 任务分发：执行后返回进程退出码。
 /// stdout 末行 JSON（对齐原 python 脚本输出约定，便于排查与双轨对照）；
 /// 成功输出任务结果，失败输出 {"ok":false,"error":...}。
@@ -86,15 +111,24 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     }
     let result = match name {
         "doubao-quota" => doubao_quota::run_batch(state),
-        // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）
-        "wb-checkin" => Ok(wb_checkin::run_checkin_round(
-            state,
-            &wb_checkin::CheckinOpts::daily(),
-            &mut print_progress,
-        )),
+        // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）。
+        // issue #134 方案4：抢完整轮次锁与 GUI 进程互斥——CLI 是独立进程，GUI 进程内
+        // 的 tokio 轮次锁对它无效，必须靠跨进程命名互斥体；GUI 正在跑（UI/调度器/
+        // 启动补签/托盘）时幂等跳过，避免双进程并发落盘踩踏
+        "wb-checkin" => {
+            match crate::commands::workbuddy::try_acquire_wb_round("CLI 签到", &state.data_dir) {
+                Ok(_round) => Ok(wb_checkin::run_checkin_round(
+                    state,
+                    &wb_checkin::CheckinOpts::daily(),
+                    &mut print_progress,
+                )),
+                Err(why) => Ok(serde_json::json!({ "ok": true, "skipped": why, "skipped_busy": true })),
+            }
+        }
         // WorkBuddy 每周兜底续期（对齐 python --renew-only，lazy 24h）
         "wb-renew" => Ok(wb_checkin::run_renew_only(state, 24)),
-        // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）
+        // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）。
+        // issue #134 方案4：抢完整轮次锁同 wb-checkin
         "wb-growth" => {
             let s = crate::commands::workbuddy::load_settings(state);
             let flags = wb_checkin::GrowthOpts {
@@ -102,8 +136,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 lottery: s.growth_lottery,
                 tasks: s.growth_tasks,
             };
-            wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
-            Ok(serde_json::json!({ "ok": true }))
+            match crate::commands::workbuddy::try_acquire_wb_round("CLI 成长", &state.data_dir) {
+                Ok(_round) => {
+                    wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                Err(why) => Ok(serde_json::json!({ "ok": true, "skipped": why, "skipped_busy": true })),
+            }
         }
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
@@ -141,6 +180,48 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-refresh" => qoder_refresh::run_task(state),
         // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
         "qoder-catalog-sync" => qoder_catalog::run_task(state),
+        // Buddy 国际版积分数据同步 / 凭证兜底续期 / 模型目录同步（调度器/CLI 共用；
+        // runtime=None：CLI 独立进程无网关运行态，仅落库不做运行池拨新）
+        "buddy-ai-credits-sync" => crate::commands::workbuddy::buddy_ai_credits_sync_impl(state, None)
+            .map(|v| serde_json::json!({ "ok": true, "accounts": v.len() })),
+        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(state),
+        "buddy-ai-catalog-sync" => crate::commands::workbuddy::buddy_ai_catalog_sync_impl(state)
+            .map(|n| serde_json::json!({ "ok": true, "models": n })),
+        // Buddy 国际版每日活跃打卡（T4 审查修复：调度器有 buddy-ai-checkin 分支，
+        // run_cli_task 却无对应分发——`--task-run buddy-ai-checkin` 落入未知任务
+        // 报错退出）。口径对齐 scheduler.rs 同名分支：抢轮次锁与 UI 路径互斥
+        // （skipped_busy 幂等跳过）；存在失败账号返 Err（退出码可见，NDJSON 事件
+        // 已逐行打印失败明细）。不设 permanent 剔除：buddy-ai 凭证 401 可经续期/
+        // 401 自愈轮换新值重试成功（T7 归一语义），CLI 无冷却重试链、次日调度覆盖
+        "buddy-ai-checkin" => {
+            match crate::commands::workbuddy::try_acquire_buddy_ai_round() {
+                Ok(_round) => {
+                    // runtime=None：CLI 独立进程无网关运行态，打卡到账仅落持久池
+                    let done = buddy_ai_checkin::run_checkin_round(state, None, &mut print_progress);
+                    let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let already = done
+                        .get("already")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let failed = done
+                        .get("failed")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    if failed > 0 {
+                        Err(format!(
+                            "buddy-ai 打卡：{ok} 成功 / {already} 已完成 / {failed} 失败"
+                        ))
+                    } else {
+                        Ok(done)
+                    }
+                }
+                Err(_) => Ok(serde_json::json!({
+                    "ok": true,
+                    "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过",
+                    "skipped_busy": true
+                })),
+            }
+        }
         // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮
@@ -158,21 +239,26 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // 豆包会话保活（schtasks 直调主 exe；原 PS 桥 KeepAlive 已 Rust 化）：
         // 进度 NDJSON 打印到 stdout（任务日志可查），终态 {"ok":bool}
         "doubao-keepalive" => {
-            let sink = crate::switcher::CliSink::new(&state.data_dir);
-            crate::switcher::run_action(
-                crate::switcher::RunArgs {
-                    action: crate::switcher::Action::KeepAlive,
-                    target_app: crate::switcher::TargetApp::Doubao,
-                    user_id: None,
-                    proxy_port: None,
-                    include_indexeddb: false,
-                    expected_current_uid: String::new(),
-                    machine_id_override: None,
-                    data_dir: state.data_dir.clone(),
-                },
-                &sink,
-            )
-            .map(|_| serde_json::json!({ "ok": true }))
+            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过，不拉起客户端
+            if let Some(reason) = doubao_keepalive_skip_reason(state) {
+                Ok(serde_json::json!({ "ok": true, "skipped": reason }))
+            } else {
+                let sink = crate::switcher::CliSink::new(&state.data_dir);
+                crate::switcher::run_action(
+                    crate::switcher::RunArgs {
+                        action: crate::switcher::Action::KeepAlive,
+                        target_app: crate::switcher::TargetApp::Doubao,
+                        user_id: None,
+                        proxy_port: None,
+                        include_indexeddb: false,
+                        expected_current_uid: String::new(),
+                        machine_id_override: None,
+                        data_dir: state.data_dir.clone(),
+                    },
+                    &sink,
+                )
+                .map(|_| serde_json::json!({ "ok": true }))
+            }
         }
         // 刷新全部账号剩余积分：按积分包 CycleStartTime 归日口径重算 credits_daily
         // 快照（今日 earned + API 可见历史修正），无需启动 GUI。
@@ -201,13 +287,6 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     serde_json::json!({ "ok": true, "merged": merged, "deleted": deleted, "days": days })
                 })
         }
-        // API Key 注册表同步（CLI/手工维护入口）：把 SQLite `api_keys` 行表定义的 Key
-        // 写入 vault 权威存储。用于无法操作 GUI 的场景（批量脚本/外部工具维护 Key），
-        // 或 vault 记录丢失后以行表为准恢复。行表无定义时返回 synced_keys=0 且不动 vault。
-        // 注意：鉴权热路径读 vault（registry_load 优先），本任务执行后需重启网关进程
-        // （或等待 GUI 侧 save 触发缓存刷新）才能使新 Key 生效。
-        "api-keys-init" => crate::api_server::api_keys::sync_registry_from_legacy(&state.data_dir)
-            .map(|n| serde_json::json!({ "ok": true, "synced_keys": n })),
         other => {
             eprintln!("未知任务: {other}");
             println!("{}", serde_json::json!({"ok": false, "error": format!("未知任务: {other}")}));

@@ -27,6 +27,23 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
     prof.proc_names.iter().any(|n| base.eq_ignore_ascii_case(n))
 }
 
+/// 审查修复（M5/W5，2026-10-16 双客户端并存实测）：共用映像名 "CodeBuddy" 的
+/// 归属仲裁（ImageArk 布尔等式 is_self = marker.exists() == owner_is_self）。
+/// 返回 false = 本档案在当前安装布局下无权操作该映像（并存布局杀国际会误杀
+/// 国内实例、老单布局杀国内会误杀国际实例），调用方必须跳过该进程。
+/// 仅歧义映像名受仲裁；白名单内其余无歧义名（"CodeBuddy CN" 等）直通。
+/// 四消费点统一接入：list_procs / running_exe_of / pid_alive_matching / kill_pids。
+fn ark_allows(prof: &AppProfile, name: &str) -> bool {
+    let Some(ark) = &prof.image_ark else {
+        return true;
+    };
+    let base = strip_exe_suffix(name);
+    if !ark.ambiguous.iter().any(|a| base.eq_ignore_ascii_case(a)) {
+        return true;
+    }
+    ark.marker.exists() == ark.owner_is_self
+}
+
 /// 剥离映像名尾部的 ".exe"（大小写不敏感；无后缀原样返回）。
 /// 用 get 防多字节字符下标越界（非字符边界时 get 返回 None → 原样返回）。
 fn strip_exe_suffix(name: &str) -> &str {
@@ -46,7 +63,10 @@ pub fn list_procs(prof: &AppProfile) -> Vec<(u32, Option<std::path::PathBuf>)> {
     let sys = snapshot();
     sys.processes()
         .iter()
-        .filter(|(_, p)| name_matches(prof, &p.name().to_string_lossy()))
+        .filter(|(_, p)| {
+            let name = &p.name().to_string_lossy();
+            name_matches(prof, name) && ark_allows(prof, name)
+        })
         .map(|(pid, p)| (pid.as_u32(), p.exe().map(|e| e.to_path_buf())))
         .collect()
 }
@@ -65,7 +85,9 @@ pub fn running_exe_of(prof: &AppProfile) -> Option<std::path::PathBuf> {
         .iter()
         .filter(|(_, p)| {
             let name = p.name().to_string_lossy();
-            prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name))
+            // M5/W5：glob 命中后仍须经映像归属仲裁（"CodeBuddy.exe" glob 在老单
+            // 布局下会命中国内同名映像，国际档案不得取其 exe）
+            prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name)) && ark_allows(prof, &name)
         })
         .find_map(|(_, p)| p.exe().map(|e| e.to_path_buf()))
 }
@@ -178,13 +200,17 @@ pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Strin
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone(&sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
-        // 二级：仍有存活进程 → 强杀
+    // 审查修复（L12）：等待与强杀收窄到 stop 前捕获的 PID 集合——优雅关闭等待
+    // 期间用户新启的实例不属本次关闭目标，不应被映像名全量匹配连带关闭
+    //（对齐 stop_spawned 的 PID 精确语义，含 PID 复用防护）
+    let pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
+    if !wait_gone_pids(&pids, &sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+        // 二级：仍有存活进程 → 强杀（仅限捕获的 PID）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，强制结束进程");
-        kill_all(&sess.prof);
+        kill_pids(&pids, &sess.prof);
     }
     // 三级：等待完全退出 ≤5 秒（强杀后 handle 释放）
-    if !wait_gone(&sess.prof, Duration::from_secs(5)) {
+    if !wait_gone_pids(&pids, &sess.prof, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -241,13 +267,13 @@ pub fn stop_spawned(sess: &mut Session, sink: &dyn ProgressSink, pids: &[u32]) -
             sess.prof.graceful_wait_secs
         ),
     );
-    if !wait_gone_pids(&alive, Duration::from_secs(sess.prof.graceful_wait_secs)) {
+    if !wait_gone_pids(&alive, &sess.prof, Duration::from_secs(sess.prof.graceful_wait_secs)) {
         // 二级：仍有存活 PID → 按 PID 强杀（不使用映像名 kill_all，防误伤）
         sink.step("stop", super::StepStatus::Warn, "优雅关闭超时，按 PID 强制结束");
-        kill_pids(&alive);
+        kill_pids(&alive, &sess.prof);
     }
     // 三级：等待完全退出 ≤5 秒
-    if !wait_gone_pids(&alive, Duration::from_secs(5)) {
+    if !wait_gone_pids(&alive, &sess.prof, Duration::from_secs(5)) {
         sink.step(
             "stop",
             super::StepStatus::Error,
@@ -260,16 +286,22 @@ pub fn stop_spawned(sess: &mut Session, sink: &dyn ProgressSink, pids: &[u32]) -
 /// PID 是否存活且映像名匹配白名单（PID 复用防护：复用后映像名不同 → 视为已退出）
 fn pid_alive_matching(sys: &System, pid: u32, prof: &AppProfile) -> bool {
     sys.process(sysinfo::Pid::from_u32(pid))
-        .map(|p| name_matches(prof, &p.name().to_string_lossy()))
+        .map(|p| {
+            let name = p.name().to_string_lossy();
+            name_matches(prof, &name) && ark_allows(prof, &name)
+        })
         .unwrap_or(false)
 }
 
-/// 在 deadline 内等待给定 PID 全部退出（1s 轮询）
-fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
+/// 在 deadline 内等待给定 PID 全部退出（1s 轮询）。
+/// 审查修复（PID 复用防护，与 stop_spawned 初始 alive 过滤同口径）：
+/// 按「存活 + 映像名匹配」判定——原进程退出后 PID 被无关进程复用时，
+/// 身份不匹配视同已退出，不再无谓等满超时。
+fn wait_gone_pids(pids: &[u32], prof: &AppProfile, timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
         let sys = snapshot();
-        if !pids.iter().any(|pid| sys.process(sysinfo::Pid::from_u32(*pid)).is_some()) {
+        if !pids.iter().any(|pid| pid_alive_matching(&sys, *pid, prof)) {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -279,10 +311,15 @@ fn wait_gone_pids(pids: &[u32], timeout: Duration) -> bool {
     }
 }
 
-/// 按 PID 强杀（sysinfo TerminateProcess；PID 已退出时静默跳过）
-fn kill_pids(pids: &[u32]) {
+/// 按 PID 强杀（sysinfo TerminateProcess）。
+/// 审查修复（PID 复用防护，与 stop_spawned 初始 alive 过滤同口径）：
+/// PID 已退出或身份不匹配（复用为无关进程）时静默跳过，绝不误杀。
+fn kill_pids(pids: &[u32], prof: &AppProfile) {
     let sys = snapshot();
     for pid in pids {
+        if !pid_alive_matching(&sys, *pid, prof) {
+            continue;
+        }
         if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
             let _ = p.kill();
         }
@@ -334,25 +371,17 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
     // 分离启动（对齐 PS Start-Process，不等待）；启动失败 throw → 顶层 catch fatal。
     // 记录 spawn 主进程 PID：Electron 主进程关闭时其子进程（GPU/renderer 等）随之退出，
     // 关闭阶段按此 PID 精确命中本次实例。
-    let child = cmd.spawn().map_err(|e| {
+    // 静默子进程 stdio：客户端（Electron）自身的弃用警告/RequestStore 日志
+    // 不再混入应用控制台（客户端有自己的日志文件，排障不受影响）
+    let child = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
         super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
     })?;
     let pid = child.id();
     Ok(pid)
-}
-
-/// 在 deadline 内等待目标进程全部退出（1s 轮询，对齐 PS Start-Sleep 1s 循环）
-fn wait_gone(prof: &AppProfile, timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if list_procs(prof).is_empty() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
 }
 
 /// 向 pid 的所有顶层窗口投递 WM_CLOSE（PS $proc.CloseMainWindow() 的全窗口版，
@@ -374,16 +403,6 @@ pub fn post_wm_close(pid: u32) {
     unsafe { EnumWindows(Some(cb), pid as isize) };
 }
 
-/// 强杀全部白名单进程（sysinfo TerminateProcess，等价 PS Stop-Process -Force）
-fn kill_all(prof: &AppProfile) {
-    let sys = snapshot();
-    for (_, p) in sys.processes() {
-        if name_matches(prof, &p.name().to_string_lossy()) {
-            let _ = p.kill();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +410,40 @@ mod tests {
 
     fn prof(app: TargetApp) -> AppProfile {
         profile::profile_for(app, std::env::temp_dir().as_path())
+    }
+
+    #[test]
+    fn image_ark_归属仲裁双向() {
+        let _lock = crate::switcher::test_io_lock();
+        let dir = std::env::temp_dir().join(format!("sw-ark-test-{}", std::process::id()));
+        let marker = dir.join("CodeBuddy.exe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 覆盖为测试专用 marker（档案默认 marker 指向本机真实安装路径，
+        // 存在性随环境变化，测试必须确定性）
+        let mk = |owner_is_self: bool| profile::ImageArk {
+            marker: marker.clone(),
+            owner_is_self,
+            ambiguous: &["CodeBuddy"],
+        };
+        let mut intl = prof(TargetApp::CodeBuddyAI);
+        intl.image_ark = Some(mk(true));
+        let mut cn = prof(TargetApp::CodeBuddy);
+        cn.image_ark = Some(mk(false));
+        // 无仲裁档案（image_ark=None）恒允许
+        assert!(ark_allows(&prof(TargetApp::Doubao), "Doubao.exe"));
+        // 布局一：国际 exe 在盘（并存布局）——歧义映像 "CodeBuddy" 归国际版
+        std::fs::write(&marker, b"").unwrap();
+        assert!(ark_allows(&intl, "CodeBuddy.exe"));
+        assert!(ark_allows(&intl, "codebuddy.EXE"));
+        assert!(!ark_allows(&cn, "CodeBuddy"));
+        // 无歧义名（国内 CN 映像）不受仲裁直通——并存时国内端仍可正常关闭
+        assert!(ark_allows(&cn, "CodeBuddy CN.exe"));
+        // 布局二：国际 exe 不在盘（老单布局）——歧义映像 "CodeBuddy" 归国内
+        std::fs::remove_file(&marker).unwrap();
+        assert!(!ark_allows(&intl, "CodeBuddy.exe"));
+        assert!(ark_allows(&cn, "CodeBuddy"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -529,14 +582,29 @@ mod tests {
 
     #[test]
     fn wait_gone_pids_不存在pid立即返回true() {
-        // 第一轮枚举即无命中 → 立即 true，不做 1s 轮询空转
-        assert!(wait_gone_pids(&[u32::MAX - 1, u32::MAX - 2], Duration::from_secs(5)));
+        // 第一轮枚举即无命中（PID 不存在 → 身份匹配 false）→ 立即 true，不做 1s 轮询空转
+        assert!(wait_gone_pids(
+            &[u32::MAX - 1, u32::MAX - 2],
+            &prof(TargetApp::Doubao),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]
     fn wait_gone_pids_存活pid超时返回false() {
-        // 自身进程在等待期间必然存活 → 走满超时返回 false（负路径）
-        assert!(!wait_gone_pids(&[std::process::id()], Duration::from_millis(100)));
+        // 身份匹配口径引入后，「存活」必须同时映像名匹配：白名单临时替换为本测试
+        // 进程映像名（leak 成 'static 适配 &'static [&'static str]，同
+        // pid_alive_matching_白名单命中存活pid返回true），自身 PID 存活且匹配
+        // → 走满超时返回 false（负路径）
+        let stem = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .expect("无法获取测试进程映像名");
+        let leaked: &'static str = Box::leak(stem.into_boxed_str());
+        let whitelist: &'static [&'static str] = Box::leak(vec![leaked].into_boxed_slice());
+        let mut p = prof(TargetApp::Doubao);
+        p.proc_names = whitelist;
+        assert!(!wait_gone_pids(&[std::process::id()], &p, Duration::from_millis(100)));
     }
 
     #[test]

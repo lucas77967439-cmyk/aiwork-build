@@ -827,6 +827,25 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
                     None => continue,
                 }
             }
+            // C4：app_order 元素合法性校验——合法键走 models::is_valid_app_key 单一来源
+            // （与 state.rs 读取侧归一同谓词），任意字符串不得入库；非法元素剔除 +
+            // HashSet 全量去重保序（对齐读取侧，Vec::dedup 只去相邻重复）；
+            // 非数组形态不写入（防破坏 Vec<String> 反序列化）
+            if k == "app_order" {
+                let Some(arr) = v.as_array() else {
+                    continue;
+                };
+                let mut seen = std::collections::HashSet::new();
+                let cleaned: Vec<serde_json::Value> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .filter(|s| crate::models::is_valid_app_key(s))
+                    .filter(|s| seen.insert(*s))
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect();
+                current_obj.insert(k.clone(), serde_json::Value::Array(cleaned));
+                continue;
+            }
             current_obj.insert(k.clone(), v.clone());
         }
     }
@@ -1011,6 +1030,10 @@ pub(crate) fn validate_hhmm(time: &str) -> Result<(), String> {
     Ok(())
 }
 
+// 审查修复（L16）：本函数是全仓唯一允许的 `cmd /c … && schtasks` shell 包装点。
+// 安全红线：args 仅允许调用方以参数数组传入的 schtasks 子命令/任务名/路径等受控
+// 字面量，禁止拼接任何不可信输入；外部来源参数必须先经白名单校验（如 validate_hhmm）
+// 才能进入。新增调用方须遵守本约定，不得绕过本封装直接派生 cmd。
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),

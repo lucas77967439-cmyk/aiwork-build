@@ -14,12 +14,14 @@ import {
   Bot,
   Boxes,
   LayoutGrid,
+  Globe,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { nextTheme } from '../lib/themes';
 import { resolveAppIcon } from '../lib/appIcons';
-import type { ViewKey, AppKey } from '../types';
+import { getPinnedApp, isAppVisible, getOrderedApps } from '../lib/appVisibility';
+import type { AppKey, ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
 
@@ -61,18 +63,30 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'qoder-settings', label: '环境配置', icon: Settings },
 ];
 
-/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中 */
+/** BuddyAI 应用菜单（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy 产品形态） */
+const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'buddyai-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'buddyai-accounts', label: '账号管理', icon: Users },
+  { key: 'buddyai-checkin', label: '活跃打卡', icon: PlayCircle },
+  { key: 'buddyai-credits', label: '积分看板', icon: Coins },
+  { key: 'buddyai-api-service', label: '资源调度', icon: Server },
+  { key: 'buddyai-settings', label: '环境配置', icon: Settings },
+];
+
+/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中；
+ *  buddy-ai = 国际版独立池（默认隐藏，系统设置-应用显示 opt-in） */
 export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
   { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（IDE / Work / CLI）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
+  { key: 'buddy-ai', label: 'BuddyAI', icon: Globe, title: 'Buddy 国际版（buddy-ai 独立池）' },
 ];
 
 /** 全部合法应用 key（settings 脏值兜底用） */
 export const APP_KEYS = APP_TABS.map((t) => t.key);
 
-/** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成 */
+/** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成（应用 Tab 最多 4 列，>4 个折两行） */
 const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'] as const;
 
 export default function Sidebar({
@@ -90,21 +104,30 @@ export default function Sidebar({
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
-  // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤。
-  // pinned 非法/缺失回退 trae（后端 state.rs 已归一，此处对前端旧缓存双保险）
-  const pinnedApp = (APP_KEYS.includes(settings?.pinned_app as AppKey) ? settings?.pinned_app : 'trae') as AppKey;
-  const hiddenApps = settings?.hidden_apps ?? [];
-  const visibleTabs = APP_TABS.filter((t) => t.key === pinnedApp || !hiddenApps.includes(t.key));
+  // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤；
+  // 展示顺序跟随系统设置「应用显示」拖拽排序（app_order），未提及应用按默认顺序补尾。
+  // 口径统一由 lib/appVisibility 提供（pinned 非法/缺失回退 trae；buddy-ai 不参与固定、
+  // 默认隐藏，仅 settings.buddy_ai_visible = true 时显示）
+  const pinnedApp = getPinnedApp(settings);
+  const visibleTabs = getOrderedApps(settings).flatMap((key) => {
+    const tab = APP_TABS.find((t) => t.key === key);
+    return tab && isAppVisible(settings, key) ? [tab] : [];
+  });
+
+  // 应用 Tab 自适应列数：≤4 个单行铺满；>4 个固定 4 列自动折两行（按顺序排列：5→4+1 / 6→4+2 / 7→4+3 / 8→4+4）
+  const tabCols = Math.min(4, Math.max(1, visibleTabs.length));
 
   // 当前激活应用被隐藏（或固定项变更）时自动回落固定应用主页，避免停留在无 Tab 的应用
   useEffect(() => {
     if (!visibleTabs.some((t) => t.key === activeApp)) {
       setActiveApp(pinnedApp);
     }
+    // 审查修复：补 buddy_ai_visible 依赖——停留在 BuddyAI 应用时关闭其可见性，
+    // 回落固定应用须即时触发（否则停留在无 Tab 的应用）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeApp, pinnedApp, settings?.hidden_apps]);
+  }, [activeApp, pinnedApp, settings?.hidden_apps, settings?.buddy_ai_visible]);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）；BuddyAI → 6 页（国际版对齐 Buddy 产品形态）
   const nav =
     activeApp === 'doubao'
       ? DOUBAO_NAV
@@ -112,6 +135,8 @@ export default function Sidebar({
       ? BUDDY_NAV
       : activeApp === 'qoder'
       ? QODER_NAV
+      : activeApp === 'buddy-ai'
+      ? BUDDYAI_NAV
       : NAV;
 
   // 主题轮询：每次点击切换到下一个主题并持久化
@@ -120,7 +145,8 @@ export default function Sidebar({
     if (!settings) return;
     const next = nextTheme(settings.theme);
     try {
-      await saveSettings({ ...settings, theme: next.id });
+      // 审查修复（L34）：saveSettings 即 patch 语义，只提交 theme 字段，不回传整份 settings 快照（patch 纪律）
+      await saveSettings({ theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
     } catch {
       /* toast 已发出 */
@@ -155,7 +181,7 @@ export default function Sidebar({
         <div
           className={cn(
             'grid gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900',
-            GRID_COLS[visibleTabs.length - 1] ?? 'grid-cols-4',
+            GRID_COLS[tabCols - 1] ?? 'grid-cols-4',
           )}
         >
           {visibleTabs.map((tab) => {

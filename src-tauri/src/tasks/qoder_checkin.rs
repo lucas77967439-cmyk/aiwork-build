@@ -201,6 +201,7 @@ const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
 /// 与 [`list_campaigns`] 的区别：不把空列表判为 fail——盲发兜底当轮重学
 ///（issue #105）需要「列表为空 → 学不到 → 放弃重学」而非「列表为空 → 整账号失败」。
 fn fetch_campaigns(
+    state: &AppState,
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &QoderUrls,
@@ -220,10 +221,22 @@ fn fetch_campaigns(
         return Err(("fail".into(), "campaigns 响应非 JSON".into()));
     };
     // 信封穿透（fs_utils::dig 含 data 包裹下钻）
-    Ok(fs_utils::dig(&b, &["campaigns"])
+    let campaigns = fs_utils::dig(&b, &["campaigns"])
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // 空表诊断（2026-10-21 起 CN 侧持续空表，issue #132）：记录 HTTP 状态、
+    // campaigns 键是否存在、响应体头部——用于区分「真空数组」「键缺失/改名」
+    // 「信封错误」。响应体为活动元数据，不含任何凭证。
+    if campaigns.is_empty() {
+        let head: String = raw.chars().take(400).collect();
+        let has_key = fs_utils::dig(&b, &["campaigns"]).is_some();
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] campaigns 空表: http={status} campaigns_key={has_key} body={head}"),
+        );
+    }
+    Ok(campaigns)
 }
 
 /// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
@@ -231,11 +244,12 @@ fn fetch_campaigns(
 /// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
 ///（daily_credits_claimed_in_list），CLAIMABLE 过滤交给调用方（filter_claimable）。
 fn list_campaigns(
+    state: &AppState,
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &QoderUrls,
 ) -> Result<Vec<Value>, (String, String)> {
-    let campaigns = fetch_campaigns(agent, headers, urls)?;
+    let campaigns = fetch_campaigns(state, agent, headers, urls)?;
     // ⚠ campaigns 为空 ≠ 已签：可能活动未开始 / Cosy-ClientType 缺失（本层
     // 恒带）/ 接口结构变更——与「无可领项」显式区分，kind=fail 触发 UI 提示（§5.2）
     if campaigns.is_empty() {
@@ -245,6 +259,61 @@ fn list_campaigns(
         ));
     }
     Ok(campaigns)
+}
+
+/// 拉活动列表（完整头 → 空表则最小头复取一次）。
+///
+/// 上游对 campaigns 列表按**请求形态**分桶投放：完整设备头族形态可能返回
+/// `showCampaign=false` + `campaigns: []`（HTTP 200），而同刻最小头形态可见
+/// 活动条目（2026-10-14、2026-10-21 两次实测，issue #132）。[`list_campaigns`]
+/// 把空数组判为 fail，而最小头补学 `learn_from_min_headers` 写在
+/// `process_account` 的 Ok 分支内——空表走 Err，补学从未执行，故此处兜一层。
+///
+/// 错误口径：复取自身失败（401 / 429 / 5xx / 网络）时**透传其错误**，不伪装成
+/// empty_campaigns——否则 401 进不了凭证刷新自愈，暂态故障还会被调度器按
+/// `failed_empty_campaigns` 排除当日重试。仅当复取同样为空表时才回退到首次的
+/// 空表错误。
+///
+/// 返回值第二项 = 列表是否来自最小头复取：调用方据此跳过 `learn_from_min_headers`
+/// 的重复补学（否则同一 token/头/URL 会立刻再 GET 一次）。
+fn list_campaigns_with_fallback(
+    state: &AppState,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    min_token: &str,
+    urls: &QoderUrls,
+    aid: &str,
+) -> Result<(Vec<Value>, bool), (String, String)> {
+    match list_campaigns(state, agent, headers, urls) {
+        Err((k, m)) if m.starts_with(EMPTY_CAMPAIGNS_TAG) => {
+            match list_campaigns(state, agent, &minimal_auth_headers(min_token), urls) {
+                Ok(c) => {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 完整头空表、最小头复取得 {} 条活动（{aid}）", c.len()),
+                    );
+                    Ok((c, true))
+                }
+                Err((_, m2)) if m2.starts_with(EMPTY_CAMPAIGNS_TAG) => {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 完整头与最小头均返回空活动列表（{aid}）"),
+                    );
+                    Err((k, m))
+                }
+                Err((k2, m2)) => {
+                    // 复取自身故障（401 / 429 / 5xx / 网络）：如实透传，保留
+                    // 刷新自愈与当日重试资格
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 最小头复取失败（{k2}）: {m2}（{aid}）"),
+                    );
+                    Err((k2, m2))
+                }
+            }
+        }
+        other => other.map(|c| (c, false)),
+    }
 }
 
 /// 过滤 claimStatus==CLAIMABLE（大小写宽容，纯函数可单测），双活动自然全覆盖。
@@ -714,7 +783,7 @@ fn learn_from_min_headers(
     now_secs: i64,
 ) -> Vec<(String, String)> {
     let headers = minimal_auth_headers(access_token);
-    match fetch_campaigns(agent, &headers, urls) {
+    match fetch_campaigns(state, agent, &headers, urls) {
         Ok(campaigns) => {
             let learned = learn_daily_campaign_ids(&campaigns, now_secs);
             let view: Vec<String> = campaigns
@@ -819,15 +888,19 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind:
 /// 盲发失败的人类可读原因（known_daily_fallback Failed 分支消息构造）。
 /// 已探针锁定的形态给可操作提示，其余保留 HTTP 码 + 原始响应前缀（截 120
 /// 字符，与旧格式一致）供排障：
-/// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
-///   提示到真实客户端建立设备信任
+/// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误）。
+///   归因是工具盲发携带的每账号指纹未获服务端信任分桶——旧文案「在客户端
+///   登录一次」无效：客户端登录建立的是客户端原生指纹的信任，与工具盲发
+///   指纹不一致（issue #119）。有效路径：先在工具内切换到该账号（切换器会把
+///   该账号指纹同步为本机 machineid/storage.json/state.vscdb），再开客户端
+///   正常使用一次，使服务端为该指纹建立信任，然后回工具重试
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
 ///   （issue #114 修复后 claim 已用最小头形态，此形态下仍 503 说明上游风控再升级）
 /// - 409/CAMPAIGN_NOT_ACTIVE：候选 campaignId 过期（活动批次轮换，issue #66），
 ///   重学习机制（主列表 + 最小头补学）将自动补正
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
     if claimed == Some("BLOCKED") {
-        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
+        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：请在工具内切换到该账号（切换会把该账号指纹同步到本机），再打开 Qoder 客户端正常使用一次建立信任，然后重试".into();
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
         return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试（本请求已用最小头形态，若持续出现说明上游风控再升级，请关注工具更新）".into();
@@ -1063,6 +1136,7 @@ fn blind_round(
 /// issue #114：claim 端点完整头被风控 503 拦截；重学 GET 用最小头视野为完整头
 /// 形态的超集——CLAIMABLE 条目可见，学习可见性只增不减）。
 fn known_daily_fallback(
+    state: &AppState,
     agent: &ureq::Agent,
     access_token: &str,
     urls: &QoderUrls,
@@ -1087,8 +1161,14 @@ fn known_daily_fallback(
     // 当轮重学：重取列表（fetch_campaigns 允许空表——空表 = 学不到 = 放弃重试），
     // 宽松档学习，仅取**未试过**的 id（409 剔除只动 learned/table，tried 防重学撞旧 id）。
     // 重学 GET 用最小头（同上：视野超集，CLAIMABLE 可见，学习更稳）
+    // 审查备案（L20）：宽松档学习不校验活动时间窗，学到的 id 可能含未开放/已过期
+    // 活动，仅作第二轮盲发的候选范围提示（加速收敛）——真值以端点判定为准：
+    // already 只能来自服务端 replayed/CLAIMED 回放确认（classify_blind_step），
+    // 学习值本身不会把未领活动误归 already
     let mut retry: Vec<(String, String)> = Vec::new();
-    if let Ok(campaigns) = fetch_campaigns(agent, &minimal_auth_headers(access_token), urls) {
+    if let Ok(campaigns) =
+        fetch_campaigns(state, agent, &minimal_auth_headers(access_token), urls)
+    {
         merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
     }
     retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
@@ -1131,7 +1211,7 @@ fn fallback_with_relearn(
             attempted.push(cid.clone());
         }
     }
-    let outcome = known_daily_fallback(agent, access_token, urls, learned, table);
+    let outcome = known_daily_fallback(state, agent, access_token, urls, learned, table);
     if let FallbackOutcome::Failed(m, _) = &outcome {
         if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
             let before = learned.len();
@@ -1148,11 +1228,41 @@ fn fallback_with_relearn(
             merge_learned(learned, found);
             // 过滤后 merge 仍增长 = 确有未试过的新 id 才值得重试盲发
             if learned.len() > before {
-                return known_daily_fallback(agent, access_token, urls, learned, table);
+                return known_daily_fallback(state, agent, access_token, urls, learned, table);
             }
         }
     }
     outcome
+}
+
+/// 盲发兜底结果 → (kind, message, reward) 统一映射（4 处调用点共用）。
+/// `fail_ctx = Some((k, m))`：空表路径——Failed 维持原空表分类 `k`（根因仍是
+/// 列表不可见，fail_kind=empty_campaigns 语义不变：调度器当日重试排除 + 推送
+/// 抑制照旧），兜底详情追加在原消息之后而非整体替换（fail_kind 派生与空表
+/// app_log 诊断均按 starts_with 前缀判定，原消息在前不受影响；试领 409/503
+/// 详情透出后，候选池诊断 contains CAMPAIGN_NOT_ACTIVE_TAG 在空表路径恢复
+/// 可见）；`None`：零 CLAIMABLE 路径——Failed 直接归 fail，不掩盖（2026-10-07
+/// 误报「已领（此前已领）」修复点的延续口径）。
+fn run_fallback(
+    state: &AppState,
+    agent: &ureq::Agent,
+    access_token: &str,
+    urls: &QoderUrls,
+    learned: &mut Vec<(String, String)>,
+    table: &mut Vec<(String, String)>,
+    fail_ctx: Option<(&str, &str)>,
+) -> (String, String, Option<f64>) {
+    match fallback_with_relearn(state, agent, access_token, urls, learned, table) {
+        FallbackOutcome::Success(m, r) => ("success".into(), m, r),
+        FallbackOutcome::AlreadyReplayed => {
+            ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
+        }
+        FallbackOutcome::Auth(r) => ("auth".into(), "登录态失效（401）".into(), r),
+        FallbackOutcome::Failed(fm, r) => match fail_ctx {
+            Some((k, m)) => (k.into(), format!("{m}；盲发试领全 miss：{fm}"), r),
+            None => ("fail".into(), fm, r),
+        },
+    }
 }
 
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
@@ -1232,7 +1342,14 @@ fn process_account(
     // 指纹头族被上游风控 503 拦截，最小头通过；401 刷新成功后随新令牌更新）
     let mut min_token = creds.access_token.clone();
 
-    let (mut kind, mut message, mut reward) = match list_campaigns(agent, &headers, &urls) {
+    // 列表请求：完整头（容器派生设备头形态）返回空表时，用最小头复取一次
+    //（issue #132：空表走 Err 分支，原 Ok 分支内的最小头补学从未执行）。
+    // 实证依据见 minimal_auth_headers 注释与 list_campaigns_with_fallback。
+    let list_call = list_campaigns_with_fallback(state, agent, &headers, &min_token, &urls, &aid);
+    // 列表已由最小头复取得到时，不再用同一形态重复补学（见封装注释）
+    let list_from_min = matches!(&list_call, Ok((_, true)));
+    let list_res = list_call.map(|(c, _)| c);
+    let (mut kind, mut message, mut reward) = match list_res {
         Ok(campaigns) => {
             // 健壮性①：从列表反学当日活动 id（列表虽过滤 CLAIMABLE 状态，条目
             // 本身可见），供盲发兜底优先使用；401 重试路径同款
@@ -1241,8 +1358,9 @@ fn process_account(
                 learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
             );
             // 健壮性①+（PR #106 移植）：主列表（容器形态）零可学条目时，用最小头
-            // 形态补学一次（learned 整轮共享，仅每轮首个扑空账号实际发起，后续账号跳过）
-            if learned.is_empty() {
+            // 形态补学一次（learned 整轮共享，仅每轮首个扑空账号实际发起，后续账号
+            // 跳过；列表本身已由最小头复取得到时跳过——同形态再 GET 只是重复请求）
+            if learned.is_empty() && !list_from_min {
                 merge_learned(
                     learned,
                     learn_from_min_headers(
@@ -1267,16 +1385,7 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match fallback_with_relearn(state, agent, &min_token, &urls, learned, table) {
-                        FallbackOutcome::Success(m, r) => ("success".into(), m, r),
-                        FallbackOutcome::AlreadyReplayed => {
-                            ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
-                        }
-                        FallbackOutcome::Auth(r) => {
-                            ("auth".into(), "登录态失效（401）".into(), r)
-                        }
-                        FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
-                    }
+                    run_fallback(state, agent, &min_token, &urls, learned, table, None)
                 }
             } else {
                 let mut kind = String::new();
@@ -1332,7 +1441,18 @@ fn process_account(
                 }
             }
         }
-        Err((k, m)) => (k, m, None),
+        Err((k, m)) => {
+            // 空表盲发兜底（issue #141）：上游按账号分桶投放列表，本账号两种请求
+            // 形态均不可见，但 claim 端点不受列表过滤约束（探针实证）且幂等——
+            // 先盲发试领（多账号轮次 learned 通常已含当日 id，首个账号靠 conf/
+            // 内置表），命中即真实领取/回放确认，与零 CLAIMABLE 路径同款
+            if m.starts_with(EMPTY_CAMPAIGNS_TAG) {
+                // Failed 分支保留原空表分类 + 详情追加的完整语义说明见 run_fallback 文档
+                run_fallback(state, agent, &min_token, &urls, learned, table, Some((k.as_str(), m.as_str())))
+            } else {
+                (k, m, None)
+            }
+        }
     };
 
     // 401：刷新一次仅重试失败分支（禁二次刷新，对齐 wb_checkin F-09）。
@@ -1352,16 +1472,21 @@ fn process_account(
                 // issue #114：重试路径的补学与 claim 均须用新令牌，旧令牌已被
                 // 一次性轮换作废，用旧令牌补学必 401）
                 min_token = new.access_token.clone();
-                let retry = match list_campaigns(agent, &headers, &urls) {
-                    Ok(campaigns) => {
+                // 刷新后同样走「完整头 → 空表则最小头复取」（issue #132）：本次
+                // 修复针对的正是完整头持续空表，只用完整头重试会立刻再次空表并结束
+                let retry = match list_campaigns_with_fallback(
+                    state, agent, &headers, &min_token, &urls, &aid,
+                ) {
+                    Ok((campaigns, from_min)) => {
                         // 重试路径同样重学（新令牌下列表视野可能不同，多学无害）
                         merge_learned(
                             learned,
                             learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
                         );
                         // 重试路径同款最小头补学（learned 仍空时；整轮共享，通常
-                        // 首个账号已补学到位，此处多为空转跳过。用刷新后的新令牌）
-                        if learned.is_empty() {
+                        // 首个账号已补学到位，此处多为空转跳过。用刷新后的新令牌；
+                        // 列表本身已来自最小头复取时不重复请求）
+                        if learned.is_empty() && !from_min {
                             merge_learned(
                                 learned,
                                 learn_from_min_headers(
@@ -1381,20 +1506,7 @@ fn process_account(
                             if daily_credits_claimed_in_list(&campaigns, now) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
-                                match fallback_with_relearn(
-                                    state, agent, &min_token, &urls, learned, table,
-                                ) {
-                                    FallbackOutcome::Success(m, r) => ("success".into(), m, r),
-                                    FallbackOutcome::AlreadyReplayed => (
-                                        "already".into(),
-                                        "每日奖励已领取（盲发回放确认）".into(),
-                                        None,
-                                    ),
-                                    FallbackOutcome::Auth(r) => {
-                                        ("auth".into(), "登录态失效（401）".into(), r)
-                                    }
-                                    FallbackOutcome::Failed(m, r) => ("fail".into(), m, r),
-                                }
+                                run_fallback(state, agent, &min_token, &urls, learned, table, None)
                             }
                         } else {
                             // kind 空串起步（对照首次路径）：全部 claim 失败时应判 fail
@@ -1444,7 +1556,17 @@ fn process_account(
                             (kind, messages.join("；"), reward)
                         }
                     }
-                    Err((k, m)) => (k, m, None),
+                    Err((k, m)) => {
+                        // 重试路径同款空表盲发兜底（issue #141）：刷新后列表仍不可
+                        // 见时，用刷新后的最小头令牌盲发试领，全 miss 才回落原分类
+                        // （兜底详情追加在原消息后，保持空表前缀不变，同首次路径）
+                        if m.starts_with(EMPTY_CAMPAIGNS_TAG) {
+                            // 同首次路径：Failed 保留原空表分类 + 详情追加（见 run_fallback 文档）
+                            run_fallback(state, agent, &min_token, &urls, learned, table, Some((k.as_str(), m.as_str())))
+                        } else {
+                            (k, m, None)
+                        }
+                    }
                 };
                 kind = retry.0;
                 message = retry.1;
@@ -1476,31 +1598,36 @@ fn process_account(
     //   （1~3s）会误判未到账 → 降级 fail 触发整轮重签；改最多 3 次回读，到账
     //  （post > pre）即提前采信，3 轮成功回读均未增长才降级
     // - 回读失败（None）不判负——余额端点故障不应推翻已成功的领取
-    if kind == "success" && pre_balance.is_some() {
-        let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
-        let mut arrived = false;
-        for _attempt in 0..3 {
-            jitter_sleep();
-            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
-                continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
-            };
-            let Some(pre) = pre_balance else { break; };
-            if reward.is_none() && post > pre {
-                reward = Some(post - pre);
+    if kind == "success" {
+        // 审查修复（L18）：原循环内 `let Some(pre) = pre_balance else { break; }` 是
+        // 不可达守卫（外层条件已保证 pre_balance 为 Some），死代码在日后重构外层
+        // 条件时会静默退化——改为安全绑定：不变量破坏时跳过整个到账校验
+        //（不判到账，维持 success），不依赖不可达分支兜底
+        if let Some(pre) = pre_balance {
+            let mut flat_reads: u32 = 0; // 成功回读且未增长的次数
+            let mut arrived = false;
+            for _attempt in 0..3 {
+                jitter_sleep();
+                let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+                    continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
+                };
+                if reward.is_none() && post > pre {
+                    reward = Some(post - pre);
+                }
+                if post > pre {
+                    arrived = true;
+                    break;
+                }
+                flat_reads += 1;
+                if !all_credits {
+                    break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
+                }
             }
-            if post > pre {
-                arrived = true;
-                break;
+            if all_credits && !arrived && flat_reads > 0 {
+                kind = "fail".into();
+                message = format!("{message}；但余额未增长（未到账），保留自动重试");
+                reward = None;
             }
-            flat_reads += 1;
-            if !all_credits {
-                break; // 余额无法归因非 CREDITS 奖励：不判负，无需重读（原口径）
-            }
-        }
-        if all_credits && !arrived && flat_reads > 0 {
-            kind = "fail".into();
-            message = format!("{message}；但余额未增长（未到账），保留自动重试");
-            reward = None;
         }
     }
     // 签到奖励运行期回写（对齐 qoder_credits::run_snapshot_task 的 issue #102 口径）：

@@ -38,6 +38,143 @@ use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 
+// ==================== wb 族执行视图（buddy-ai 阶段 2 分流） ====================
+
+/// wb 族池视图（《Buddy国际版支持落地方案.md》§3.2/§4.2）：
+/// Buddy（CN，现状不动）与 BuddyAI（Intl 独立池）两条档位**共用三条执行路径**
+/// （流式 / 聚合 / toolexec），家族维度资源按视图分流，对话内核（SSE 转发、
+/// 非流式聚合、payload 归一化、换号收尾护栏）参数化复用零复制：
+///
+/// - 池：`route_pool()` → 共享态 wb 池 | buddy-ai 独立池（§3.1 硬约束 1 不混居）
+/// - 粘性：`route_sticky()` → wb 粘性存储（无前缀 ns）| buddy-ai 粘性存储（`g:` ns）；
+///   buddy-ai 档受 `buddy_ai_sticky_enabled` 开关门控（§4.2），wb 档恒开
+/// - 模型冷却：独立实例（同名模型跨区不混轮，§4.2）
+/// - 记账：`usage_bucket()` → `UsageBucket::Wb` | `UsageBucket::BuddyAi`（§3.1 硬约束 5）
+/// - 清洗模板：`wb_template_map` | `buddy_ai_template_map` 独立键（§4.3）
+/// - 池标签：`pool_label()` → `"buddy"` | `"buddy-ai"`（请求日志/Key 约束作用域）
+///
+/// Deref 到 [`ApiSharedState`]：共享字段（logger/data_dir/wb_sanitize/inflight 等）
+/// 经视图零改动访问；对冲竞速（race_first_byte）需要 'static 克隆，故持 Arc。
+#[derive(Clone)]
+pub(crate) struct WbView {
+    pub state: Arc<ApiSharedState>,
+    /// true = buddy-ai（国际版独立池）档
+    pub buddy_ai: bool,
+}
+
+impl WbView {
+    /// CN Buddy 档视图（现状路径，行为与改造前完全一致）
+    pub fn wb(state: Arc<ApiSharedState>) -> Self {
+        Self { state, buddy_ai: false }
+    }
+
+    /// Intl buddy-ai 档视图
+    pub fn intl(state: Arc<ApiSharedState>) -> Self {
+        Self { state, buddy_ai: true }
+    }
+
+    pub fn new(state: Arc<ApiSharedState>, buddy_ai: bool) -> Self {
+        if buddy_ai { Self::intl(state) } else { Self::wb(state) }
+    }
+
+    /// 家族池视图（执行路径取号/记账/冷却全走此池）
+    pub fn route_pool(&self) -> &super::pool::ApiPool {
+        if self.buddy_ai {
+            &self.state.buddy_ai_pool
+        } else {
+            &self.state.wb_pool
+        }
+    }
+
+    /// 家族显式会话粘性存储视图
+    pub fn route_sticky(&self) -> &super::wb_sticky::StickyStore {
+        if self.buddy_ai {
+            &self.state.buddy_ai_sticky
+        } else {
+            &self.state.wb_sticky
+        }
+    }
+
+    /// 家族竞速对冲阈值视图（per-pool 独立配置：CN 用 wb_hedge_threshold_ms，
+    /// Intl 用 buddy_ai_hedge_threshold_ms；0 = 关闭对冲）
+    pub fn route_hedge_ms(&self) -> u64 {
+        if self.buddy_ai {
+            self.state
+                .buddy_ai_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.state
+                .wb_hedge_threshold_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// 家族模型级冷却表视图（独立实例：CN/Intl 同名模型不混轮）
+    pub fn route_model_cooldowns(&self) -> &Mutex<std::collections::HashMap<String, (i64, u32)>> {
+        if self.buddy_ai {
+            &self.state.buddy_ai_model_cooldowns
+        } else {
+            &self.state.model_cooldowns
+        }
+    }
+
+    /// 池标签（请求日志 pool 列 + Key 白名单约束作用域）
+    pub fn pool_label(&self) -> &'static str {
+        if self.buddy_ai { "buddy-ai" } else { "buddy" }
+    }
+
+    /// 记账桶（§3.1 硬约束 5：Intl 用量与国内分账）
+    pub fn usage_bucket(&self) -> super::usage::UsageBucket {
+        if self.buddy_ai {
+            super::usage::UsageBucket::BuddyAi
+        } else {
+            super::usage::UsageBucket::Wb
+        }
+    }
+
+    /// 显式会话粘性是否生效（§4.2：buddy-ai 档独立开关，默认关；wb 档恒开）
+    pub fn sticky_on(&self) -> bool {
+        !self.buddy_ai
+            || self
+                .state
+                .buddy_ai_sticky_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 粘性解析（带开关门控；关闭时恒 None，不读陈旧绑定）
+    pub fn sticky_resolve(
+        &self,
+        key: &SessionKey,
+        now: i64,
+    ) -> Option<super::wb_sticky::Binding> {
+        if !self.sticky_on() {
+            return None;
+        }
+        self.route_sticky().resolve(key, now)
+    }
+
+    /// 粘性绑定（带开关门控；关闭时静默跳过，unbind 不受影响可清陈旧绑定）
+    pub fn sticky_bind(&self, key: &SessionKey, uid: &str, conv_id: &str, now: i64) {
+        if !self.sticky_on() {
+            return;
+        }
+        self.route_sticky().bind(key, uid, conv_id, now);
+    }
+
+    /// 家族清洗模板键（§4.3 分区：wb_template_map | buddy_ai_template_map）
+    pub fn templates_key(&self) -> &'static str {
+        if self.buddy_ai { "buddy_ai_template_map" } else { "wb_template_map" }
+    }
+}
+
+impl std::ops::Deref for WbView {
+    type Target = ApiSharedState;
+
+    fn deref(&self) -> &ApiSharedState {
+        &self.state
+    }
+}
+
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -69,9 +206,9 @@ pub(crate) fn gen_conv_id() -> String {
 
 // ==================== 模型级冷却（T2.7/F-34） ====================
 
-/// 模型是否处于冷却中；返回剩余秒数
-pub fn model_cooling_remaining(state: &ApiSharedState, model: &str) -> Option<i64> {
-    let map = safe_lock(&state.model_cooldowns);
+/// 模型是否处于冷却中；返回剩余秒数（视图感知：buddy-ai 档读独立冷却表）
+pub fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
+    let map = safe_lock(&state.route_model_cooldowns());
     let (until, _) = map.get(model)?;
     let now = now_ts();
     if *until > now {
@@ -83,7 +220,7 @@ pub fn model_cooling_remaining(state: &ApiSharedState, model: &str) -> Option<i6
 
 /// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
 /// 带错误消息时先尝试解析精确恢复时刻（note_model_failure_ex）。
-pub fn note_model_failure(state: &ApiSharedState, model: &str) {
+pub fn note_model_failure(state: &WbView, model: &str) {
     note_model_failure_ex(state, model, None);
 }
 
@@ -92,8 +229,8 @@ pub fn note_model_failure(state: &ApiSharedState, model: &str) {
 ///    errors.rs 情报互证 2026-10-03）→ 冷却至精确恢复时刻（钳制 ≤7 天防异常值）；
 /// ② 解析失败/无消息 → 既有渐进退避。后续不可解析的失败取「渐进退避 vs 既有
 ///    冷却截止」的较大者——账号实际仍被限额到恢复时刻，不能被 10s 渐进值缩短。
-pub fn note_model_failure_ex(state: &ApiSharedState, model: &str, msg: Option<&str>) {
-    let mut map = safe_lock(&state.model_cooldowns);
+pub fn note_model_failure_ex(state: &WbView, model: &str, msg: Option<&str>) {
+    let mut map = safe_lock(&state.route_model_cooldowns());
     let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
     let fails = fails + 1;
     let now = now_ts();
@@ -105,6 +242,111 @@ pub fn note_model_failure_ex(state: &ApiSharedState, model: &str, msg: Option<&s
         }
     };
     map.insert(model.to_string(), (until, fails));
+}
+
+// ==================== 账号级配额冷却（2026-10-19 实测复盘；3.8.5 移植） ====================
+//
+// 背景：WB 6004 限额（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）是**账号级**配额。
+// 2026-10-19 线上实测：132 账号 21:38 触顶 429，顾城/Clease 配额未耗尽却被既有
+// 模型级冷却连坐封锁至恢复时刻（从未被真实尝试）——模型级冷却的经验依据来自
+// Qoder 排队类错误（`qoder_route.rs` 注释），对 WB 账号限额并不成立。
+//
+// 新语义：
+// - 6004 限额类失败 → 记**账号级**冷却（键 `{model}|{uid}`，冷却至精确恢复时刻），
+//   dispatch 取号后跳过冷却中账号换下一候选（uid 已入 tried，全池冷却自然收敛到
+//   轮换耗尽收尾）
+// - 全池账号均处冷却时升级写模型级冷却（入口快速失败 429 + 跨池回退语义保留）
+// - 其余失败（Server/空完成/风控等模型级现象）维持既有模型级冷却不变
+//
+// 表为进程内存态（静态 OnceLock，镜像 qoder_route::QODER_MODEL_COOLDOWNS 先例，
+// 规避共享状态构造点扩散）；重启即清零；成功请求清除对应账号条目。
+// 注：3.8.5 的模型级冷却表是**视图感知**的（CN/Buddy-AI 分表，见 WbView
+// ::route_model_cooldowns），升级写模型级冷却时必须走视图，避免写到另一张表。
+
+static WB_ACCT_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (i64, u32)>>> = OnceLock::new();
+
+fn acct_cooldown_map() -> &'static Mutex<HashMap<String, (i64, u32)>> {
+    WB_ACCT_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 账号级冷却键：`{model}|{uid}`
+fn acct_model_key(model: &str, uid: &str) -> String {
+    format!("{model}|{uid}")
+}
+
+/// 该账号对本模型是否处于配额冷却中
+pub fn account_model_cooling(model: &str, uid: &str) -> bool {
+    let map = safe_lock(acct_cooldown_map());
+    match map.get(&acct_model_key(model, uid)) {
+        Some((until, _)) => *until > now_ts(),
+        None => false,
+    }
+}
+
+/// 账号级冷却快照（/status 观测用）：[(键, 截止 Unix 秒, 失败次数)]
+pub fn account_cooling_snapshot() -> Vec<(String, i64, u32)> {
+    safe_lock(acct_cooldown_map())
+        .iter()
+        .map(|(k, (until, fails))| (k.clone(), *until, *fails))
+        .collect()
+}
+
+/// 记录一次账号级配额冷却（until = 恢复时刻 Unix 秒）
+fn note_acct_cooldown(model: &str, uid: &str, until: i64) {
+    let key = acct_model_key(model, uid);
+    let mut map = safe_lock(acct_cooldown_map());
+    let fails = map.get(&key).map(|(_, f)| f + 1).unwrap_or(1);
+    // 取较大者：并发请求不可把恢复时刻提前
+    let until = map.get(&key).map(|(u, _)| *u).unwrap_or(0).max(until);
+    map.insert(key, (until, fails));
+}
+
+/// 成功后清除该账号对本模型的冷却条目
+pub fn clear_account_model_failure(model: &str, uid: &str) {
+    safe_lock(acct_cooldown_map()).remove(&acct_model_key(model, uid));
+}
+
+/// WB 失败分流：6004 限额类（消息含可解析恢复时刻）→ 账号级冷却；
+/// 其余（Server/空完成/风控等模型级现象）→ 既有模型级冷却。
+pub fn note_wb_failure(state: &WbView, model: &str, uid: Option<&str>, msg: Option<&str>) {
+    match uid {
+        Some(uid) if msg.and_then(parse_quota_reset_at).is_some() => {
+            let until = msg.and_then(parse_quota_reset_at).unwrap_or_else(|| now_ts() + 60);
+            note_acct_cooldown(model, uid, until);
+            escalate_if_pool_exhausted(state, model);
+        }
+        _ => note_model_failure_ex(state, model, msg),
+    }
+}
+
+/// 全池账号均对本模型处冷却 → 升级写模型级冷却（截止取各账号最大值），
+/// 保留 dispatch 入口快速失败 429 + 跨池回退语义（dispatch.rs pool_health）。
+/// disabled/禁用账号无冷却条目会阻止升级——此时 dispatch skip-continue 收敛到
+/// 轮换耗尽收尾（NoHealthy 503），行为仍正确，仅收尾文案不同。
+fn escalate_if_pool_exhausted(state: &WbView, model: &str) {
+    let uids = state.route_pool().uids();
+    if uids.is_empty() {
+        return;
+    }
+    let map = safe_lock(acct_cooldown_map());
+    let now = now_ts();
+    let mut all_cooling = true;
+    let mut max_until = 0i64;
+    for uid in &uids {
+        match map.get(&acct_model_key(model, uid)) {
+            Some((until, _)) if *until > now => max_until = max_until.max(*until),
+            _ => {
+                all_cooling = false;
+                break;
+            }
+        }
+    }
+    drop(map);
+    if all_cooling {
+        let mut model_map = safe_lock(state.route_model_cooldowns());
+        let prev = model_map.get(model).copied().unwrap_or((0, 0));
+        model_map.insert(model.to_string(), (max_until.max(prev.0), prev.1 + 1));
+    }
 }
 
 /// 从限额文案解析精确恢复时刻（agent2api parse_quota_reset_at 同源语义）：
@@ -183,109 +425,6 @@ fn try_parse_dt(b: &[u8], i: usize) -> Option<i64> {
         .map(|dt| dt.and_utc().timestamp() - 8 * 3600)
 }
 
-// ==================== 账号级配额冷却（2026-10-19 实测复盘） ====================
-//
-// 背景：WB 6004 限额（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）是**账号级**配额
-// （2026-10-19 日志复盘：132 账号 21:38 触顶 429，顾城/Clease 配额未耗尽却被既有
-// 模型级冷却连坐封锁至恢复时刻，从未被真实尝试）。模型级冷却（T2.7/F-34）的经验
-// 依据来自 Qoder 排队类错误，对 WB 账号限额不成立。
-//
-// 新语义：
-// - 6004 限额类失败 → 记**账号级**冷却（键 `{model}|{uid}`，冷却至精确恢复时刻），
-//   dispatch 取号后跳过冷却中账号换下一候选（uid 已入 tried，全池冷却自然收敛
-//   到轮换耗尽收尾）；
-// - 全池账号均处冷却时升级写模型级冷却（入口快速失败 429 + 跨池回退语义保留）；
-// - 其余失败（Server/空完成/风控等模型级现象）维持既有模型级冷却不变。
-//
-// 表为进程内存态（静态 OnceLock，镜像 qoder_route::QODER_MODEL_COOLDOWNS 先例，
-// 规避 ApiSharedState 构造点扩散），重启即清零；成功请求清除对应账号条目。
-
-static WB_ACCT_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (i64, u32)>>> = OnceLock::new();
-
-fn acct_cooldown_map() -> &'static Mutex<HashMap<String, (i64, u32)>> {
-    WB_ACCT_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 账号级冷却键：`{model}|{uid}`
-fn acct_model_key(model: &str, uid: &str) -> String {
-    format!("{model}|{uid}")
-}
-
-/// 该账号对本模型是否处于配额冷却中
-pub fn account_model_cooling(model: &str, uid: &str) -> bool {
-    let map = safe_lock(acct_cooldown_map());
-    match map.get(&acct_model_key(model, uid)) {
-        Some((until, _)) => *until > now_ts(),
-        None => false,
-    }
-}
-
-/// 账号级冷却快照（/status 观测用）：[(键, 截止 Unix 秒, 失败次数)]
-pub fn account_cooling_snapshot() -> Vec<(String, i64, u32)> {
-    safe_lock(acct_cooldown_map())
-        .iter()
-        .map(|(k, (until, fails))| (k.clone(), *until, *fails))
-        .collect()
-}
-
-/// 记录一次账号级配额冷却（until = 恢复时刻 Unix 秒）
-fn note_acct_cooldown(model: &str, uid: &str, until: i64) {
-    let key = acct_model_key(model, uid);
-    let mut map = safe_lock(acct_cooldown_map());
-    let fails = map.get(&key).map(|(_, f)| f + 1).unwrap_or(1);
-    // 取较大者：并发请求不可把恢复时刻提前
-    let until = map.get(&key).map(|(u, _)| *u).unwrap_or(0).max(until);
-    map.insert(key, (until, fails));
-}
-
-/// 成功后清除该账号对本模型的冷却条目
-pub fn clear_account_model_failure(model: &str, uid: &str) {
-    safe_lock(acct_cooldown_map()).remove(&acct_model_key(model, uid));
-}
-
-/// WB 失败分流（2026-10-19 复盘）：6004 限额类（消息含可解析恢复时刻）→
-/// 账号级冷却；其余（Server/空完成/风控等模型级现象）→ 既有模型级冷却。
-pub fn note_wb_failure(state: &ApiSharedState, model: &str, uid: Option<&str>, msg: Option<&str>) {
-    match uid {
-        Some(uid) if msg.and_then(parse_quota_reset_at).is_some() => {
-            let until = msg.and_then(parse_quota_reset_at).unwrap_or_else(|| now_ts() + 60);
-            note_acct_cooldown(model, uid, until);
-            escalate_if_pool_exhausted(state, model);
-        }
-        _ => note_model_failure_ex(state, model, msg),
-    }
-}
-
-/// 全池账号均对本模型处冷却 → 升级写模型级冷却（截止取各账号最大值），
-/// 保留 dispatch 入口快速失败 429 + 跨池回退语义（dispatch.rs pool_health）。
-/// disabled/禁用账号无冷却条目会阻止升级——此时 dispatch skip-continue 收敛到
-/// 轮换耗尽收尾（NoHealthy 503），行为仍正确，仅收尾文案不同。
-fn escalate_if_pool_exhausted(state: &ApiSharedState, model: &str) {
-    let uids = state.wb_pool.uids();
-    if uids.is_empty() {
-        return;
-    }
-    let map = safe_lock(acct_cooldown_map());
-    let now = now_ts();
-    let mut all_cooling = true;
-    let mut max_until = 0i64;
-    for uid in &uids {
-        match map.get(&acct_model_key(model, uid)) {
-            Some((until, _)) if *until > now => max_until = max_until.max(*until),
-            _ => {
-                all_cooling = false;
-                break;
-            }
-        }
-    }
-    drop(map);
-    if all_cooling {
-        let mut model_map = safe_lock(&state.model_cooldowns);
-        let prev = model_map.get(model).copied().unwrap_or((0, 0));
-        model_map.insert(model.to_string(), (max_until.max(prev.0), prev.1 + 1));
-    }
-}
-
 /// 从上游 HTTP 错误响应体提取 message（6004 限额文案随 JSON body 下发）；
 /// 兼容 message / error.message / msg（腾讯系接口两种字段名都有）；
 /// 解析失败返回 None → 调用方落回渐进退避
@@ -299,8 +438,8 @@ fn upstream_msg(resp_body: &str) -> Option<String> {
 }
 
 /// 请求成功后清除该模型的冷却与失败计数
-pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
-    safe_lock(&state.model_cooldowns).remove(model);
+pub fn clear_model_failure(state: &WbView, model: &str) {
+    safe_lock(&state.route_model_cooldowns()).remove(model);
 }
 
 // ==================== 审核模板映射热更新（T2.1） ====================
@@ -310,12 +449,26 @@ pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
 /// 兼容）；KV 缺失/损坏/空表 = 纯默认。issue #99 ⑥ 合并语义：内置默认表全量
 /// 生效，自定义表按 from 逐字覆盖（merged_template_rules）——默认表新增布防
 /// 规则自动对存量自定义生效，不再被旧「整体替代」语义吞掉
-pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
-    // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）
+pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
+    // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）；
+    // buddy-ai 档独立键 `buddy_ai_template_map`（§4.3 分区清洗）
     let custom = crate::store::db(&state.data_dir)
-        .kv_get::<wb_payload::TemplateMapFile>("wb_template_map")
+        .kv_get::<wb_payload::TemplateMapFile>(state.templates_key())
         .into_rules();
     wb_payload::merged_template_rules(custom)
+}
+
+/// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
+/// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
+/// 单键不分档；当前接线面仅 Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）——WB 池（wb_sse
+/// 管线）与 qoder 未接入，接入时同键复用即可（工具集指纹是上游风控家族
+/// 共性，分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+pub fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
+    let custom = crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
+        .into_rules();
+    wb_payload::merged_tool_alias_rules(custom)
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -323,6 +476,19 @@ pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
+    // 审查修复（M1）：4001/模型级豁免——模型在当前 function 下不可用是模型问题
+    // 非账号问题（与 mod.rs classify_error/classify_solo_error 同口径），返回 None
+    // 不冷却账号；否则单模型故障会被误判 Server 级触发整池 30 分钟熔断
+    if code == 4001 || super::is_model_config_mismatch(msg) {
+        return ErrKind::None;
+    }
+    // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
+    // 禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录账号即随
+    // 池快照重建恢复调度；流内走既有 kind 分支——
+    // 未流出 break 换号接替 / 已流出就地收尾，禁用与解绑粘性由 note_error 生效
+    if code == 11140 || super::retry::is_account_restricted_error(msg) {
+        return ErrKind::Forbidden;
+    }
     let lower = msg.to_lowercase();
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
@@ -366,8 +532,8 @@ struct HedgeLease {
 }
 
 impl HedgeLease {
-    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
-        let counter = state.wb_pool.inflight_handle(uid);
+    fn acquire(state: &WbView, uid: &str) -> Self {
+        let counter = state.route_pool().inflight_handle(uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self { uid: uid.to_string(), counter }
     }
@@ -388,6 +554,10 @@ struct RaceWin {
     hedge: Option<HedgeLease>,
     /// 对冲接管（对冲请求先出首字）
     takeover: bool,
+    /// 审查修复（L2）：竞速败者已死标记（EOF/IO/超窗，随 RaceOutcome 透传），
+    /// settle_hedge 据此对败者补记错误/冷却，账单可解释
+    primary_failed: bool,
+    hedge_failed: bool,
 }
 
 /// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
@@ -397,21 +567,26 @@ struct RaceWin {
 /// 接管时 guard 重绑到对冲账号（流计数随流存续）。
 #[allow(clippy::too_many_arguments)]
 fn race_first_byte(
-    state: &Arc<ApiSharedState>,
+    state: &WbView,
     primary_uid: &str,
+    conv_id: &str,
     converted: &[u8],
     reader: Box<dyn Read + Send>,
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
 ) -> Result<RaceWin, ()> {
-    let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
-    if hedge_ms == 0 {
+    let hedge_ms = state.route_hedge_ms();
+    // issue #138 P1：大 body 跳过首字对冲——对冲需 converted.to_vec() 全量快照
+    // 并按 hedge 账号整包重建请求，大包下内存瞬时翻倍，得不偿失（默认 256KiB）
+    if hedge_ms == 0 || converted.len() > super::routes::HEDGE_SKIP_BODY_BYTES {
         return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
             lines,
             uid: primary_uid.to_string(),
             hedge: None,
             takeover: false,
+            primary_failed: false,
+            hedge_failed: false,
         });
     }
     let state2 = state.clone();
@@ -419,9 +594,15 @@ fn race_first_byte(
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
+    // 对冲闭包 move 捕获（同 body 取快照）：conv_id 随闭包存续
+    let conv_id2 = conv_id.to_string();
+    // 审查修复（L2）：捕获对冲账号 uid（仅建连成功 = 对冲实际发起时记录）——
+    // 双败 Err 路径租约随竞速 Drop、无从取 uid，Err 时据此对对冲侧补记错误
+    let hedge_uid_cell = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let hedge_uid_slot = hedge_uid_cell.clone();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
-            .wb_pool
+            .route_pool()
             .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), false)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
@@ -438,7 +619,8 @@ fn race_first_byte(
             enterprise_id: picked2.enterprise_id.clone(),
             global_region: picked2.global_region,
         };
-        let reader2 = wb_upstream::make_wb_request(&creds2, &body).ok()?;
+        let reader2 = wb_upstream::make_wb_request(&creds2, &conv_id2, &body).ok()?;
+        *hedge_uid_slot.borrow_mut() = Some(picked2.uid.clone());
         Some((reader2, lease))
     };
     match wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
@@ -451,22 +633,46 @@ fn race_first_byte(
             } else {
                 primary_uid.to_string()
             };
-            Ok(RaceWin { uid, lines: out.lines, hedge: out.hedge, takeover: out.takeover })
+            Ok(RaceWin {
+                uid,
+                lines: out.lines,
+                hedge: out.hedge,
+                takeover: out.takeover,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
+            })
         }
-        Err(()) => Err(()),
+        Err(()) => {
+            // 审查修复（L2）：双败时对冲侧同样记 Server 错误（主侧由调用方按
+            // picked.uid 记，与本处对齐）——失败请求留失败痕迹，账单可解释
+            if let Some(huid) = hedge_uid_cell.borrow().as_deref() {
+                state.route_pool().note_error(huid, ErrKind::Server);
+            }
+            Err(())
+        }
     }
 }
 
 /// 竞速结束后处理对冲计数与日志（F-76③/F-77）：
 /// - 释放对冲账号竞速窗口的在途占用（租约 Drop，-1 恰好一次）；
 /// - 接管时 guard 重绑到对冲账号（原账号解绑 -1、对冲账号 +1，流计数随流存续）；
-/// - [SCHED] 日志记录 hedge_takeover / hedge_lost。
+/// - [SCHED] 日志记录 hedge_takeover / hedge_lost；
+/// - 审查修复（L2）：竞速败者记账——已死一侧（EOF/IO/超窗）补记 Server 错误
+///   触发冷却；仅「输竞速但未死」一侧不记（账号健康，防误伤）
 fn settle_hedge(
-    state: &ApiSharedState,
+    state: &WbView,
     win: &mut RaceWin,
     mut guard: InflightGuard,
     primary_uid: &str,
 ) -> InflightGuard {
+    if win.primary_failed {
+        state.route_pool().note_error(primary_uid, ErrKind::Server);
+    }
+    if win.hedge_failed {
+        if let Some(lease) = win.hedge.as_ref() {
+            state.route_pool().note_error(&lease.uid, ErrKind::Server);
+        }
+    }
     // take 移交所有权：本函数返回前 Drop（竞速窗口计数 -1 恰好一次）
     let Some(lease) = win.hedge.take() else {
         return guard;
@@ -489,7 +695,7 @@ fn settle_hedge(
 }
 
 /// 长上下文提示（F-76④）：输入粗估超阈值时返回 (token 估算, 降档开关状态)
-fn longctx_estimate(state: &ApiSharedState, peek: &Value) -> Option<(u64, bool)> {
+fn longctx_estimate(state: &WbView, peek: &Value) -> Option<(u64, bool)> {
     let t = super::wb_model_route::estimate_input_tokens(peek);
     if t < super::wb_model_route::LONGCTX_TOKEN_THRESHOLD {
         return None;
@@ -503,7 +709,7 @@ fn longctx_estimate(state: &ApiSharedState, peek: &Value) -> Option<(u64, bool)>
 }
 
 /// 上下文过大提示日志（F-76④：仅标注不做真裁剪）
-fn log_longctx_hint(state: &ApiSharedState, peek: &Value, model: &str) {
+fn log_longctx_hint(state: &WbView, peek: &Value, model: &str) {
     if let Some((tokens, downgrade)) = longctx_estimate(state, peek) {
         state.logger.log_sched_event(&format!(
             "longctx_hint model={} tokens≈{}k downgrade={}",
@@ -518,6 +724,7 @@ fn log_longctx_hint(state: &ApiSharedState, peek: &Value, model: &str) {
 
 pub fn wb_stream_chat(
     state: Arc<ApiSharedState>,
+    buddy_ai: bool,
     body_vec: Vec<u8>,
     model: String,
     start_ts: Instant,
@@ -569,7 +776,9 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
+        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
+        let view = WbView::new(state, buddy_ai);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -588,7 +797,7 @@ pub fn wb_stream_chat(
 
 #[allow(clippy::too_many_arguments)]
 fn run_wb_stream(
-    state: &Arc<ApiSharedState>,
+    state: &WbView,
     body_vec: &[u8],
     model: &str,
     proto: Protocol,
@@ -601,10 +810,18 @@ fn run_wb_stream(
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
-    let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
-    let sticky_key = SessionKey::from_body(&peek);
-    // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
-    log_longctx_hint(state, &peek, model);
+    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示与
+    // effort 后立即释放，不再存活整条流（大 body 下 DOM 放大 3~6 倍）；sticky
+    // 键改走 from_slice 窄探测，块内也不再有整包 DOM
+    let (sticky_key, effort_hint) = {
+        let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(state, &peek, model);
+        (
+            SessionKey::from_slice(body_vec),
+            peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+        )
+    };
     let templates = load_templates(state);
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -613,20 +830,19 @@ fn run_wb_stream(
     // Key 白名单指 Trae 账号，不得误过滤 WB 池）。
     // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
     let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
-        .and_then(|k| k.pool_constraints("buddy"))
+        .and_then(|k| k.pool_constraints(state.pool_label()))
         .map_or((None, None), |c| (c.allowed, c.dedicated));
 
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
     // 子 Key 限定上游不含粘性账号时忽略粘性
     let sticky0: Option<(String, String)> = state
-        .wb_sticky
-        .resolve(&sticky_key, now_ts())
+        .sticky_resolve(&sticky_key, now_ts())
         .and_then(|b| {
             if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                 return None;
             }
             state
-                .wb_pool
+                .route_pool()
                 .pick_by_uid(&b.uid, false)
                 .map(|_| (b.uid, b.conv_id))
         });
@@ -640,7 +856,7 @@ fn run_wb_stream(
         .as_ref()
         .and_then(|(u, _)| {
             state
-                .wb_pool
+                .route_pool()
                 .pick_sticky_yield(u, allowed_set.as_ref(), false)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
@@ -649,12 +865,16 @@ fn run_wb_stream(
                     p
                 })
         })
-        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
+        .or_else(|| dedicated.as_deref().and_then(|uid| state.route_pool().pick_by_uid(uid, false)));
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+    // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
+    // 防换号重试期间断连落 "none" 致账单排查失据
+    let mut last_bound_uid: Option<String> = None;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
@@ -662,13 +882,15 @@ fn run_wb_stream(
         // 轮换耗尽收尾同口径），防用量页 requests 缺口
         if tx.is_closed() {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
+            // 审查修复（L1）：归因复用最近绑定账号（从未绑定才落 "none"）
+            let uid = last_bound_uid.as_deref().unwrap_or("none");
+            state.record_usage_bucket(state.usage_bucket(), model, uid, key_id, false, true, duration_ms, 0, 0);
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
+            None => match state.route_pool().pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -678,34 +900,38 @@ fn run_wb_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
+                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）
+                    // 才标记，TTL 内同池新请求直接激进起步，不再从零试探烧账号
+                    super::wb_payload::mark_channel_fp_block(
+                        state.pool_label(),
+                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                    );
                     state.logger.log_request(
-                        "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
+                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "",
                         Some(&exhaust_msg),
                     );
-                    let diag = state.wb_pool.diagnose();
+                    let diag = state.route_pool().diagnose();
                     let diag_summary: Vec<String> = diag
                         .iter()
                         .map(|d| format!("{}({})", d.name, d.reason))
                         .collect();
-                    // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本，
-                    // 供反查漏网触发句（与 11128 诊断同口径，样本 = 清洗前原始请求体）
-                    let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
-                        format!(" 指纹样本: {}", wb_payload::fingerprint_sample(body_vec))
-                    } else {
-                        String::new()
-                    };
+                    // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                    // （kind=empty，样本 = 清洗前原始请求体），返回日志注记供反查
+                    let sample_note =
+                        wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
+                        state.pool_label(),
                         diag_summary.join(", "),
                         sample_note,
                     ));
@@ -721,10 +947,10 @@ fn run_wb_stream(
             },
         };
         tried.insert(picked.uid.clone());
-        // 账号级配额冷却（2026-10-19 复盘）：6004 限额为账号级配额，该账号对本
-        // 模型仍处冷却 → 跳过换下一候选（不计错误；uid 已入 tried，全池冷却时
-        // 自然收敛到轮换耗尽收尾）
-        if account_model_cooling(model, &picked.uid) {
+        // 账号级配额冷却（2026-10-19 复盘 / 3.8.5 移植）：6004 限额为账号级配额，
+        // 该账号对本模型仍处冷却 → 跳过换下一候选（不计错误；uid 已入 tried，
+        // 全池冷却时自然收敛到轮换耗尽收尾）
+        if account_model_cooling(model, picked.uid.as_str()) {
             continue;
         }
         // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
@@ -733,17 +959,19 @@ fn run_wb_stream(
         // 锁定、busy_fallback 降级）保留原无条件绑定语义。
         // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
         let bound = if picked.over_limit {
-            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+            guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
             true
         } else {
             guard.bind_account_cas(
-                state.wb_pool.inflight_handle(&picked.uid),
-                state.wb_pool.concurrency_limit(),
+                state.route_pool().inflight_handle(&picked.uid),
+                state.route_pool().concurrency_limit(),
             )
         };
         if !bound {
             continue;
         }
+        // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
+        last_bound_uid = Some(picked.uid.clone());
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
@@ -756,10 +984,29 @@ fn run_wb_stream(
 
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, model)
-            .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+            .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
+        // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定请求、tried.len()
+        // 随换号轮换递增——跨重试候选必变；空完成后（empty_hits>0）或池级指纹
+        // 拦截 TTL 内（issue #122 缺口2）追加激进清洗（issue #122 方案 C2）
+        let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
         let mut converted = wb_payload::prepare_wb_chat_body(
             body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+            seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
         );
+        // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
+        // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+        if sanitize {
+            if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                if last_residual_note.as_deref() != Some(note.as_str()) {
+                    last_residual_note = Some(note.clone());
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                        state.pool_label(),
+                        picked.uid
+                    ));
+                }
+            }
+        }
         let mut creds = WbCreds {
             id: picked.uid.clone(),
             uid: picked.uid.clone(),
@@ -776,11 +1023,11 @@ fn run_wb_stream(
             // 审查 M5：断连为请求终局，补记一行失败用量（已绑定 picked 账号）
             if tx.is_closed() {
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                 return;
             }
             let ttfb_start = Instant::now();
-            match wb_upstream::make_wb_request(&creds, &converted) {
+            match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                 Ok(reader) => {
                     // 首字超时 10s（T2.7/F-34）：超时视为上游故障 → 换号；
                     // F-76③ 慢请求竞速对冲：首字超阈值时向第二账号发对冲请求，
@@ -788,6 +1035,7 @@ fn run_wb_stream(
                     let mut win = match race_first_byte(
                         state,
                         &picked.uid,
+                        &conv_id,
                         &converted,
                         reader,
                         &tried,
@@ -796,7 +1044,7 @@ fn run_wb_stream(
                     ) {
                         Ok(w) => w,
                         Err(()) => {
-                            state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                            state.route_pool().note_error(&picked.uid, ErrKind::Server);
                             note_model_failure(state, model);
                             break;
                         }
@@ -824,11 +1072,15 @@ fn run_wb_stream(
                             // M4 审查修复：缓存读 tokens 旁路入账（宽口径别名提取；
                             // 上游未下发得 0 不入账，与 credits「不得伪造」口径一致）
                             state.record_usage_cached(
-                                super::usage::UsageBucket::Wb,
+                                state.usage_bucket(),
                                 usage.as_ref().map(cached_tokens_of).unwrap_or(0),
                             );
-                            state.record_usage_ttfb(
-                                true, model, win_uid, key_id, error_info.is_none() && !failed_inline,
+                            // 分桶修复（审查 P1）：按 route_pool 实际桶入账——原写死
+                            // is_wb=true，buddy-ai 流式成功请求全部误入 wb_days 桶
+                            //（国内 Buddy 看板虚高、buddy_ai_days 只剩失败行，积分看板失真）
+                            state.record_usage_bucket_ttfb(
+                                state.usage_bucket(), model, win_uid, key_id,
+                                error_info.is_none() && !failed_inline,
                                 true, duration_ms, pt, ct, Some(ttfb_ms),
                             );
                         }
@@ -840,9 +1092,9 @@ fn run_wb_stream(
                                 // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
                                 if sent_any {
                                     state.logger.log_request_ttfb(
-                                        "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
-                                        &state.wb_pool.name_of(win_uid), Some("空完成（内容已流出）→ 就地收尾"),
+                                        &state.route_pool().name_of(win_uid), Some("空完成（内容已流出）→ 就地收尾"),
                                     );
                                     return;
                                 }
@@ -850,21 +1102,87 @@ fn run_wb_stream(
                                 // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
                                 empty_hits += 1;
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                    &state.route_pool().name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
                                 );
                                 break;
                             }
+                            // 11128 流内形态（issue #123）：渠道风控以 HTTP 200 +
+                            // SSE 错误帧下发时此前无处置——短冷却换号、无日志、
+                            // 无指纹样本，诊断闭环断裂。口径同下方 Err 分支：
+                            // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
+                            // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
+                            if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                // sent_any 护栏（审查修复，对齐上方空完成分支）：内容已
+                                // 流出时同号重试会向同一 SSE 流拼接第二份完整响应 →
+                                // 未清洗也不得重试，直接落下方 Fatal 终局
+                                if !sanitize && !sent_any {
+                                    sanitize = true;
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                    ));
+                                    converted = wb_payload::prepare_wb_chat_body(
+                                        body_vec, model, &picked.uid, &conv_id, effort.as_deref(),
+                                        true, &templates, seed, true,
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    // 断连检测：重试等待期间客户端离开则终止
+                                    if tx.is_closed() {
+                                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                        state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                        return;
+                                    }
+                                    continue; // 内层 attempt loop：同号重试
+                                }
+                                // Fatal 终局：样本按请求最多落一次（落完即 return，
+                                // 无需按请求去重）
+                                let sample = wb_payload::fingerprint_sample(body_vec);
+                                let note = wb_payload::template_hit_note();
+                                state.logger.log_sched_event(&format!(
+                                    "11128 指纹样本: {}{}", sample, note
+                                ));
+                                wb_payload::record_fingerprint_sample(
+                                    "11128", state.pool_label(), &sample, &note,
+                                );
+                                // 终局说明（审查修复：区分两种不可重试情形——清洗后
+                                // 仍命中=模板需更新；内容已流出=不可同号重试）
+                                if sanitize {
+                                    state.logger.log_sched_event(
+                                        "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                    );
+                                } else {
+                                    state.logger.log_sched_event(
+                                        "11128 流内命中且内容已流出：不可同号重试（避免拼接第二份响应），就地终局",
+                                    );
+                                }
+                                // 已清洗仍命中：指纹拦截与账号无关，换号必再命中
+                                //（issue #57 口径）——Fatal 终局，同上方 HTTP-Err Fatal
+                                let fatal_msg = format!("upstream 400 error: 11128 {}", msg);
+                                // 记账（审查修复）：仅未流出（sent_any=false，通用记账
+                                // 块跳过）时补账——已流出时通用块已落终态行，再补即
+                                // requests 重复虚高。归因统一 win_uid（对冲胜者可能与
+                                // picked 不一致，与下方日志口径一致）
+                                if !sent_any {
+                                    state.record_usage_bucket(state.usage_bucket(), model, win_uid, key_id, false, true, duration_ms, 0, 0);
+                                }
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 400, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.route_pool().name_of(win_uid), Some(&fatal_msg),
+                                );
+                                send_stream_error_wb(tx, proto, 400, &fatal_msg);
+                                return;
+                            }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.wb_pool.note_error(win_uid, kind);
+                                state.route_pool().note_error(win_uid, kind);
                                 note_wb_failure(state, model, Some(win_uid), Some(&msg));
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&win_uid);
+                                    state.route_sticky().unbind_uid(&win_uid);
                                 }
                             }
                             if !sent_any {
@@ -872,9 +1190,9 @@ fn run_wb_stream(
                                 break;
                             }
                             state.logger.log_request_ttfb(
-                                "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), &key_name,
-                                &state.wb_pool.name_of(win_uid), Some(&msg),
+                                &state.route_pool().name_of(win_uid), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
                         }
@@ -885,22 +1203,22 @@ fn run_wb_stream(
                                 // 粘性会话；亦不 note_error——错误已原样给到客户端，内容类
                                 // 失败计入冷却会造成账号过度冷却
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), Some("流内失败已透传客户端"),
+                                    &state.route_pool().name_of(win_uid), Some("流内失败已透传客户端"),
                                 );
                                 return;
                             }
-                            state.wb_pool.note_success(win_uid);
+                            state.route_pool().note_success(win_uid);
                             clear_model_failure(state, model);
                             clear_account_model_failure(model, win_uid);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
-                            state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
-                            state.wb_sticky.save(&state.data_dir);
+                            state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
+                            state.route_sticky().save(&state.data_dir);
                             state.logger.log_request_ttfb(
-                                "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), &key_name,
-                                &state.wb_pool.name_of(win_uid), None,
+                                &state.route_pool().name_of(win_uid), None,
                             );
                             return;
                         }
@@ -916,14 +1234,17 @@ fn run_wb_stream(
                             state.logger.log_sched_event(&format!(
                                 "11128 强制清洗重试{}", wb_payload::template_hit_note()
                             ));
+                            // aggressive=true（issue #122 缺口3）：11128 是显式指纹
+                            // 确认，强制清洗即全力清洗（激进规则一并生效）
                             converted = wb_payload::prepare_wb_chat_body(
                                 body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                seed, true,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                             if tx.is_closed() {
                                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -934,11 +1255,18 @@ fn run_wb_stream(
                         let sample = wb_payload::fingerprint_sample(body_vec);
                         if last_11128_sample.as_deref() != Some(sample.as_str()) {
                             last_11128_sample = Some(sample.clone());
+                            let note = wb_payload::template_hit_note();
                             state.logger.log_sched_event(&format!(
                                 "11128 指纹样本: {}{}",
-                                sample,
-                                wb_payload::template_hit_note()
+                                sample, note
                             ));
+                            // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+                            wb_payload::record_fingerprint_sample(
+                                "11128",
+                                state.pool_label(),
+                                &sample,
+                                &note,
+                            );
                             // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
                             state.logger.log_sched_event(
                                 "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -954,7 +1282,7 @@ fn run_wb_stream(
                             // （审查 M5：补记失败终态用量）
                             if tx.is_closed() {
                                 let duration_ms = start_ts.elapsed().as_millis() as u64;
-                                state.record_usage(true, model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
+                                state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true, duration_ms, 0, 0);
                                 return;
                             }
                             continue;
@@ -963,9 +1291,9 @@ fn run_wb_stream(
                             // T2.6：401 → 刷新一次凭证后同号重试（每账号每请求一次）
                             if status == 401 && !refreshed.contains(&picked.uid) {
                                 refreshed.insert(picked.uid.clone());
-                                match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                     Ok(new_token) => {
-                                        state.wb_pool.update_jwt(&picked.uid, &new_token);
+                                        state.route_pool().update_jwt(&picked.uid, &new_token);
                                         creds.token = new_token;
                                         continue;
                                     }
@@ -982,12 +1310,12 @@ fn run_wb_stream(
                                 }
                             }
                             let kind = classify_error(status, &resp_body);
-                            state.wb_pool.note_error(&picked.uid, kind);
+                            state.route_pool().note_error(&picked.uid, kind);
                             // issue #67：硬冷却/禁用类错误解绑该账号粘性
                             if kind.unbinds_sticky() {
-                                state.wb_sticky.unbind_uid(&picked.uid);
+                                state.route_sticky().unbind_uid(&picked.uid);
                             }
-                            note_wb_failure(state, model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
+                            note_wb_failure(state, model, Some(picked.uid.as_str()), upstream_msg(&resp_body).as_deref());
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
                                 picked.uid,
@@ -995,9 +1323,9 @@ fn run_wb_stream(
                                 safe_slice(&resp_body, 200)
                             ));
                             state.logger.log_request(
-                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
-                                &key_name, &state.wb_pool.name_of(&picked.uid),
+                                &key_name, &state.route_pool().name_of(&picked.uid),
                                 Some(&format!("upstream status={}", status)),
                             );
                             break; // 换号
@@ -1006,12 +1334,12 @@ fn run_wb_stream(
                             let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
                             // 终态记账对齐 SwitchKey/耗尽收尾（审查 F3）：Fatal 是请求
                             // 终局，此前仅 log_request 导致用量统计页缺口
-                            state.record_usage(true, model, &picked.uid, key_id, false, true,
+                            state.record_usage_bucket(state.usage_bucket(), model, &picked.uid, key_id, false, true,
                                 start_ts.elapsed().as_millis() as u64, 0, 0);
                             state.logger.log_request(
-                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                state.pool_label(), "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
-                                &key_name, &state.wb_pool.name_of(&picked.uid),
+                                &key_name, &state.route_pool().name_of(&picked.uid),
                                 Some(&msg),
                             );
                             send_stream_error_wb(tx, proto, status as i64, &msg);
@@ -1028,6 +1356,7 @@ fn run_wb_stream(
 
 pub async fn wb_aggregate_chat(
     state: Arc<ApiSharedState>,
+    buddy_ai: bool,
     body_vec: Vec<u8>,
     model: String,
     stream: bool,
@@ -1043,29 +1372,40 @@ pub async fn wb_aggregate_chat(
     let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
+        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
+        // 影子化后家族字段（route_pool/route_sticky/记账桶/池标签）按视图分流，
+        // 共享字段（data_dir/logger/wb_sanitize）经 Deref 零改动
+        let state = WbView::new(state, buddy_ai);
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
-        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
-        log_longctx_hint(&state, &peek, &model);
+        // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示
+        // 与 effort 后立即释放，不再存活整条闭包；sticky 键改走 from_slice 窄探测，
+        // 块内也不再有整包 DOM（大 body 下 DOM 放大 3~6 倍）
+        let (sticky_key, effort_hint) = {
+            let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+            // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+            log_longctx_hint(&state, &peek, &model);
+            (
+                SessionKey::from_slice(&body_vec),
+                peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+            )
+        };
         let templates = load_templates(&state);
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
         let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
-            .and_then(|k| k.pool_constraints("buddy"))
+            .and_then(|k| k.pool_constraints(state.pool_label()))
             .map_or((None, None), |c| (c.allowed, c.dedicated));
 
         let sticky0: Option<(String, String)> = state
-            .wb_sticky
-            .resolve(&sticky_key, now_ts())
+            .sticky_resolve(&sticky_key, now_ts())
             .and_then(|b| {
                 if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                     return None;
                 }
                 state
-                    .wb_pool
+                    .route_pool()
                     .pick_by_uid(&b.uid, false)
                     .map(|_| (b.uid, b.conv_id))
             });
@@ -1078,7 +1418,7 @@ pub async fn wb_aggregate_chat(
             .as_ref()
             .and_then(|(u, _)| {
                 state
-                    .wb_pool
+                    .route_pool()
                     .pick_sticky_yield(u, allowed_set.as_ref(), false)
                     .map(|(p, ev)| {
                         if let Some(ev) = ev {
@@ -1087,17 +1427,18 @@ pub async fn wb_aggregate_chat(
                         p
                     })
             })
-            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid, false)));
+            .or_else(|| dedicated.as_deref().and_then(|uid| state.route_pool().pick_by_uid(uid, false)));
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
 
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
+                None => match state.route_pool().pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -1105,19 +1446,25 @@ pub async fn wb_aggregate_chat(
                         p
                     }
                     None => {
-                        state.record_usage(true, &model, "none", &key_id, false, stream,
+                        state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
+                        let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
+                        super::wb_payload::mark_channel_fp_block(
+                            state.pool_label(),
+                            exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                        );
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
                                 tried.len(),
                                 empty_hits,
+                                state.pool_label(),
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
@@ -1126,8 +1473,8 @@ pub async fn wb_aggregate_chat(
                 },
             };
             tried.insert(picked.uid.clone());
-            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘）
-            if account_model_cooling(&model, &picked.uid) {
+            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘 / 3.8.5 移植）
+            if account_model_cooling(&model, picked.uid.as_str()) {
                 continue;
             }
             // F-77 账号级在途计数：取号即绑定。
@@ -1136,12 +1483,12 @@ pub async fn wb_aggregate_chat(
             // 锁定、busy_fallback 降级）保留原无条件绑定语义。
             // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
             let bound = if picked.over_limit {
-                guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+                guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
                 true
             } else {
                 guard.bind_account_cas(
-                    state.wb_pool.inflight_handle(&picked.uid),
-                    state.wb_pool.concurrency_limit(),
+                    state.route_pool().inflight_handle(&picked.uid),
+                    state.route_pool().concurrency_limit(),
                 )
             };
             if !bound {
@@ -1159,10 +1506,27 @@ pub async fn wb_aggregate_chat(
 
             let catalog = super::wb_catalog::load(&state.data_dir);
             let effort = super::wb_catalog::find(&catalog, &model)
-                .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
+                .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
+            // 多候选改写种子 + 激进清洗开关（issue #122 方案 C1/C2，同流式路径口径：
+            // 种子随换号轮换递增，空完成后/池级拦截 TTL 内追加激进规则）
+            let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
             let mut converted = wb_payload::prepare_wb_chat_body(
                 &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
             );
+            // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+            if sanitize {
+                if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                    if last_residual_note.as_deref() != Some(note.as_str()) {
+                        last_residual_note = Some(note.clone());
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                            state.pool_label(),
+                            picked.uid
+                        ));
+                    }
+                }
+            }
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
                 uid: picked.uid.clone(),
@@ -1176,13 +1540,14 @@ pub async fn wb_aggregate_chat(
             let mut same_attempt: u32 = 0;
             loop {
                 let ttfb_start = Instant::now();
-                match wb_upstream::make_wb_request(&creds, &converted) {
+                match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
                         // 首字超时：非流式聚合同样适用（上游只回 SSE）；
                         // F-76③ 慢请求竞速对冲（对冲关闭时与纯首字超时语义一致）
                         let mut win = match race_first_byte(
                             &state,
                             &picked.uid,
+                            &conv_id,
                             &converted,
                             reader,
                             &tried,
@@ -1191,7 +1556,7 @@ pub async fn wb_aggregate_chat(
                         ) {
                             Ok(w) => w,
                             Err(()) => {
-                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.route_pool().note_error(&picked.uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
                                 break;
                             }
@@ -1208,14 +1573,14 @@ pub async fn wb_aggregate_chat(
                                     // 空完成（影子风控/上游异常，issue #57）：换号重试，
                                     // 口径同下方「empty response」（Server 级短冷却）
                                     empty_hits += 1;
-                                    state.wb_pool.note_error(win_uid, ErrKind::Server);
+                                    state.route_pool().note_error(win_uid, ErrKind::Server);
                                     note_model_failure(&state, &model);
                                     // 每请求终态单行（审查问题6）：换号是中间态不落账
                                     // （终局由后续成功行/耗尽 none 行统一落）
                                     state.logger.log_request_ttfb(
-                                        "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                        state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
-                                        &state.wb_pool.name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                        &state.route_pool().name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
                                     );
                                     break;
                                 }
@@ -1224,31 +1589,71 @@ pub async fn wb_aggregate_chat(
                                 let (pt, ct) = r.get("usage").map(u64_pair).unwrap_or((0, 0));
                                 // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）
                                 state.record_usage_cached(
-                                    super::usage::UsageBucket::Wb,
+                                    state.usage_bucket(),
                                     r.get("usage").map(cached_tokens_of).unwrap_or(0),
                                 );
                                 // F-76① TTFT 入账
-                                state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
-                                state.wb_pool.note_success(win_uid);
+                                state.record_usage_bucket_ttfb(state.usage_bucket(), &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
+                                state.route_pool().note_success(win_uid);
                                 clear_model_failure(&state, &model);
                                 clear_account_model_failure(&model, win_uid);
-                                state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
-                                state.wb_sticky.save(&state.data_dir);
+                                state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
+                                state.route_sticky().save(&state.data_dir);
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), None,
+                                    &state.route_pool().name_of(win_uid), None,
                                 );
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // 11128 流内形态（issue #123）：口径同下方 Err 分支——
+                                // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
+                                // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
+                                if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                    if !sanitize {
+                                        sanitize = true;
+                                        state.logger.log_sched_event(&format!(
+                                            "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                        ));
+                                        converted = wb_payload::prepare_wb_chat_body(
+                                            &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(),
+                                            true, &templates, seed, true,
+                                        );
+                                        std::thread::sleep(std::time::Duration::from_millis(200));
+                                        continue; // 内层 loop：同号重试
+                                    }
+                                    // Fatal 终局：样本按请求最多落一次（落完即
+                                    // return，无需按请求去重）
+                                    let sample = wb_payload::fingerprint_sample(&body_vec);
+                                    let note = wb_payload::template_hit_note();
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 指纹样本: {}{}", sample, note
+                                    ));
+                                    wb_payload::record_fingerprint_sample(
+                                        "11128", state.pool_label(), &sample, &note,
+                                    );
+                                    state.logger.log_sched_event(
+                                        "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                    );
+                                    // 已清洗仍命中：指纹拦截与账号无关，换号必再命中
+                                    //（issue #57 口径）——Fatal 终局，外层透传 400
+                                    let fatal_msg = format!("upstream 400 error: 11128 {}", msg);
+                                    state.record_usage_bucket(state.usage_bucket(), &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 400, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&fatal_msg),
+                                    );
+                                    return Err(fatal_msg);
+                                }
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
-                                    state.wb_pool.note_error(win_uid, kind);
+                                    state.route_pool().note_error(win_uid, kind);
                                     note_wb_failure(&state, &model, Some(win_uid), Some(&msg));
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
-                                        state.wb_sticky.unbind_uid(&win_uid);
+                                        state.route_sticky().unbind_uid(&win_uid);
                                     }
                                 }
                                 *safe_lock(&state.last_error) =
@@ -1256,21 +1661,21 @@ pub async fn wb_aggregate_chat(
                                 // 每请求终态单行（审查问题6）：换号是中间态不落账
                                 // （终局由后续成功行/耗尽 none 行统一落）
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), Some(&msg),
+                                    &state.route_pool().name_of(win_uid), Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
                                 break;
                             }
                             _ => {
-                                state.wb_pool.note_error(win_uid, ErrKind::Server);
+                                state.route_pool().note_error(win_uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
                                 // 每请求终态单行（审查问题6）：换号是中间态不落账
                                 state.logger.log_request_ttfb(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), Some("empty response"),
+                                    &state.route_pool().name_of(win_uid), Some("empty response"),
                                 );
                                 break;
                             }
@@ -1284,8 +1689,10 @@ pub async fn wb_aggregate_chat(
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", wb_payload::template_hit_note()
                                 ));
+                                // aggressive=true（issue #122 缺口3，同流式路径口径）
                                 converted = wb_payload::prepare_wb_chat_body(
                                     &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
+                                    seed, true,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
@@ -1296,11 +1703,18 @@ pub async fn wb_aggregate_chat(
                             let sample = wb_payload::fingerprint_sample(&body_vec);
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
+                                let note = wb_payload::template_hit_note();
                                 state.logger.log_sched_event(&format!(
                                     "11128 指纹样本: {}{}",
-                                    sample,
-                                    wb_payload::template_hit_note()
+                                    sample, note
                                 ));
+                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+                                wb_payload::record_fingerprint_sample(
+                                    "11128",
+                                    state.pool_label(),
+                                    &sample,
+                                    &note,
+                                );
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -1315,9 +1729,9 @@ pub async fn wb_aggregate_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                    match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                         Ok(new_token) => {
-                                            state.wb_pool.update_jwt(&picked.uid, &new_token);
+                                            state.route_pool().update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
                                             continue;
                                         }
@@ -1333,20 +1747,20 @@ pub async fn wb_aggregate_chat(
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.wb_pool.note_error(&picked.uid, kind);
+                                state.route_pool().note_error(&picked.uid, kind);
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                    state.route_sticky().unbind_uid(&picked.uid);
                                 }
-                                note_wb_failure(&state, &model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
+                                note_wb_failure(&state, &model, Some(picked.uid.as_str()), upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
                                 // 不落账（对齐流式路径），由终局分支统一落行
                                 state.logger.log_request(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
-                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                    &key_name, &state.route_pool().name_of(&picked.uid),
                                     Some(&format!("upstream status={}", status)),
                                 );
                                 break;
@@ -1354,12 +1768,12 @@ pub async fn wb_aggregate_chat(
                             RetryAction::Fatal => {
                                 // 终态记账对齐 SwitchKey 分支（审查 F3）：Fatal 是请求
                                 // 终局，此前仅 log_request 导致用量统计页缺口
-                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
+                                state.record_usage_bucket(state.usage_bucket(), &model, &picked.uid, &key_id, false, stream,
                                     start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(
-                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                    state.pool_label(), "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
-                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                    &key_name, &state.route_pool().name_of(&picked.uid),
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
@@ -1442,6 +1856,7 @@ pub async fn wb_aggregate_chat(
 /// Key 约束/分级重试与非流式管线同一套规则。
 pub async fn wb_tool_exec_chat(
     state: Arc<ApiSharedState>,
+    buddy_ai: bool,
     mut chat_body: Value,
     model: String,
     stream: bool,
@@ -1457,6 +1872,8 @@ pub async fn wb_tool_exec_chat(
         // inflight guard 随后台任务存续至编排完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let model = model_inner;
+        // wb 族池视图（§3.2）：影子化分流（同 wb_aggregate_chat 注释）
+        let state = WbView::new(state, buddy_ai);
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let templates = load_templates(&state);
@@ -1469,7 +1886,7 @@ pub async fn wb_tool_exec_chat(
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
         let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
-            .and_then(|k| k.pool_constraints("buddy"))
+            .and_then(|k| k.pool_constraints(state.pool_label()))
             .map_or((None, None), |c| (c.allowed, c.dedicated));
 
         let catalog = super::wb_catalog::load(&state.data_dir);
@@ -1479,7 +1896,11 @@ pub async fn wb_tool_exec_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 11128 强制清洗升级（issue #122 缺口3）：toolexec 无独立重建调用点，
+        // 11128 分支置位后由 round 回退重跑 prepare 时生效
+        let mut force_aggressive = false;
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1494,7 +1915,7 @@ pub async fn wb_tool_exec_chat(
 
         'accounts: loop {
             let picked = match state
-                .wb_pool
+                .route_pool()
                 .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
             {
                 Some((p, ev)) => {
@@ -1506,8 +1927,8 @@ pub async fn wb_tool_exec_chat(
                 None => break,
             };
             tried.insert(picked.uid.clone());
-            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘）
-            if account_model_cooling(&model, &picked.uid) {
+            // 账号级配额冷却跳过（语义同流式路径，2026-10-19 复盘 / 3.8.5 移植）
+            if account_model_cooling(&model, picked.uid.as_str()) {
                 continue;
             }
             let conv_id = gen_conv_id();
@@ -1517,12 +1938,12 @@ pub async fn wb_tool_exec_chat(
             // 保留原无条件绑定语义。
             // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
             let bound = if picked.over_limit {
-                guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+                guard = guard.bind_account(state.route_pool().inflight_handle(&picked.uid));
                 true
             } else {
                 guard.bind_account_cas(
-                    state.wb_pool.inflight_handle(&picked.uid),
-                    state.wb_pool.concurrency_limit(),
+                    state.route_pool().inflight_handle(&picked.uid),
+                    state.route_pool().concurrency_limit(),
                 )
             };
             if !bound {
@@ -1558,18 +1979,36 @@ pub async fn wb_tool_exec_chat(
                 round += 1;
 
                 let body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default();
+                // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定账号、round 随
+                // 工具执行轮次递增；空完成后/池级拦截 TTL 内/11128 强制清洗
+                // （issue #122 缺口3）追加激进清洗（issue #122 方案 C2）
                 let converted = wb_payload::prepare_wb_chat_body(
                     &body_bytes, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
+                    wb_payload::variant_seed(&conv_id, round as u64),
+                    empty_hits > 0 || force_aggressive || wb_payload::fp_block_recent(state.pool_label()),
                 );
+                // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
+                if sanitize {
+                    if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                        if last_residual_note.as_deref() != Some(note.as_str()) {
+                            last_residual_note = Some(note.clone());
+                            state.logger.log_debug_line(format!(
+                                "[DEBUG] 残指纹自检命中: {note} pool={} uid={}",
+                                state.pool_label(),
+                                picked.uid
+                            ));
+                        }
+                    }
+                }
 
                 // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
                 let ttfb_start = Instant::now();
-                match wb_upstream::make_wb_request(&creds, &converted) {
+                match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
                         let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
                             Ok(l) => l,
                             Err(()) => {
-                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.route_pool().note_error(&picked.uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
                                 break Err("上游首字超时".to_string());
                             }
@@ -1578,13 +2017,49 @@ pub async fn wb_tool_exec_chat(
                         let (completion, error_info) =
                             wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
                         if let Some((code, msg)) = error_info {
+                            // 11128 流内形态（issue #123）：口径同下方 Err 分支——
+                            // round 回退重跑当前轮（不消耗轮次，下一轮循环顶部
+                            // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
+                            // 样本后按原路径换号（不冷却：指纹拦截与账号无关）
+                            if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
+                                if !sanitize {
+                                    sanitize = true;
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
+                                    ));
+                                    round = round.saturating_sub(1);
+                                    force_aggressive = true;
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                    continue;
+                                }
+                                let sample = wb_payload::fingerprint_sample(
+                                    &serde_json::to_vec(&chat_body).unwrap_or_default(),
+                                );
+                                if last_11128_sample.as_deref() != Some(sample.as_str()) {
+                                    last_11128_sample = Some(sample.clone());
+                                    let note = wb_payload::template_hit_note();
+                                    state.logger.log_sched_event(&format!(
+                                        "11128 指纹样本: {}{}", sample, note
+                                    ));
+                                    wb_payload::record_fingerprint_sample(
+                                        "11128", state.pool_label(), &sample, &note,
+                                    );
+                                    state.logger.log_sched_event(
+                                        "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
+                                    );
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "wb-toolexec uid={} code={} msg={}", picked.uid, code, msg
+                                ));
+                                break Err(msg);
+                            }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.wb_pool.note_error(&picked.uid, kind);
-                                note_wb_failure(&state, &model, Some(&picked.uid), Some(&msg));
+                                state.route_pool().note_error(&picked.uid, kind);
+                                note_wb_failure(&state, &model, Some(picked.uid.as_str()), Some(&msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                    state.route_sticky().unbind_uid(&picked.uid);
                                 }
                             }
                             *safe_lock(&state.last_error) =
@@ -1601,9 +2076,9 @@ pub async fn wb_tool_exec_chat(
                             empty_hits += 1;
                             let duration_ms = start_ts.elapsed().as_millis() as u64;
                             state.logger.log_request_ttfb(
-                                "buddy", "POST", "/v1/responses", &model, stream, 502, &picked.uid,
+                                state.pool_label(), "POST", "/v1/responses", &model, stream, 502, &picked.uid,
                                 duration_ms, last_ttfb_ms, &key_name,
-                                &state.wb_pool.name_of(&picked.uid),
+                                &state.route_pool().name_of(&picked.uid),
                                 Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
                             );
                             break Err("空完成（影子风控/上游异常）".to_string());
@@ -1689,6 +2164,9 @@ pub async fn wb_tool_exec_chat(
                                     "11128 强制清洗重试{}", wb_payload::template_hit_note()
                                 ));
                                 round = round.saturating_sub(1);
+                                // aggressive 升级（issue #122 缺口3）：11128 显式指纹
+                                // 确认 → round 回退重跑 prepare 时激进规则一并生效
+                                force_aggressive = true;
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
                             }
@@ -1699,11 +2177,18 @@ pub async fn wb_tool_exec_chat(
                             );
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
+                                let note = wb_payload::template_hit_note();
                                 state.logger.log_sched_event(&format!(
                                     "11128 指纹样本: {}{}",
-                                    sample,
-                                    wb_payload::template_hit_note()
+                                    sample, note
                                 ));
+                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+                                wb_payload::record_fingerprint_sample(
+                                    "11128",
+                                    state.pool_label(),
+                                    &sample,
+                                    &note,
+                                );
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -1720,9 +2205,9 @@ pub async fn wb_tool_exec_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, Some(&creds.token)) {
+                                    match wb_upstream::refresh_access_token_for(&state.data_dir, &picked.uid, Some(&creds.token), state.buddy_ai) {
                                         Ok(new_token) => {
-                                            state.wb_pool.update_jwt(&picked.uid, &new_token);
+                                            state.route_pool().update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
                                             continue;
                                         }
@@ -1744,12 +2229,12 @@ pub async fn wb_tool_exec_chat(
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.wb_pool.note_error(&picked.uid, kind);
+                                state.route_pool().note_error(&picked.uid, kind);
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                    state.route_sticky().unbind_uid(&picked.uid);
                                 }
-                                note_wb_failure(&state, &model, Some(&picked.uid), upstream_msg(&resp_body).as_deref());
+                                note_wb_failure(&state, &model, Some(picked.uid.as_str()), upstream_msg(&resp_body).as_deref());
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
                             RetryAction::Fatal => {
@@ -1762,9 +2247,9 @@ pub async fn wb_tool_exec_chat(
 
             match outcome {
                 Ok(c) => {
-                    state.wb_pool.note_success(&picked.uid);
+                    state.route_pool().note_success(&picked.uid);
                     clear_model_failure(&state, &model);
-                    clear_account_model_failure(&model, &picked.uid);
+                    clear_account_model_failure(&model, picked.uid.as_str());
                     success_uid = Some(picked.uid.clone());
                     final_completion = Some(c);
                     break 'accounts;
@@ -1787,14 +2272,14 @@ pub async fn wb_tool_exec_chat(
                 // write_back_acc_usage 写回 cache_read_token，cached_tokens_of
                 // 键集覆盖该键可直接提取；未下发得 0 不入账
                 state.record_usage_cached(
-                    super::usage::UsageBucket::Wb,
+                    state.usage_bucket(),
                     completion.get("usage").map(cached_tokens_of).unwrap_or(0),
                 );
                 // F-76① TTFT 入账：最终轮首字耗时
-                state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
+                state.record_usage_bucket_ttfb(state.usage_bucket(), &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
                 state.logger.log_request_ttfb(
-                    "buddy", "POST", "/v1/responses", &model, stream, 200, usage_uid,
-                    duration_ms, last_ttfb_ms, &key_name, &state.wb_pool.name_of(usage_uid),
+                    state.pool_label(), "POST", "/v1/responses", &model, stream, 200, usage_uid,
+                    duration_ms, last_ttfb_ms, &key_name, &state.route_pool().name_of(usage_uid),
                     Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
                 );
                 // Responses 投影：web_search_call 历史项前置
@@ -1805,23 +2290,29 @@ pub async fn wb_tool_exec_chat(
             None => {
                 // 失败终局带上请求级真实消耗（审查 P1：跨账号跨轮次已消耗的
                 // tokens 原硬编码 0,0 全部丢弃，含失败账号与中间轮回喂）
-                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, req_acc_usage.0, req_acc_usage.1);
+                state.record_usage_bucket(state.usage_bucket(), &model, "wb-toolexec", &key_id, false, stream, duration_ms, req_acc_usage.0, req_acc_usage.1);
                 state.logger.log_request(
-                    "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
+                    state.pool_label(), "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, &key_name, "", last_err.as_deref(),
                 );
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None, false);
+                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
+                    super::wb_payload::mark_channel_fp_block(
+                        state.pool_label(),
+                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
+                    );
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
                     // tool 消息，样本取首条 system + 工具清单，语义不受影响）
                     if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                         state.logger.log_debug_line(format!(
-                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
                             tried.len(),
                             empty_hits,
+                            state.pool_label(),
                             wb_payload::fingerprint_sample(
                                 &serde_json::to_vec(&chat_body).unwrap_or_default()
                             ),
@@ -2051,6 +2542,14 @@ mod tests {
         assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
         // message 关键词优先级不受 code 分段影响
         assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+        // 11140 账号级风控（issue #136 反馈）：流内 code / 关键词均 → Forbidden
+        assert!(matches!(classify_wb_error(11140, "x"), ErrKind::Forbidden));
+        assert!(matches!(
+            classify_wb_error(200, "系统检测到该账号存在异常使用行为，如需申诉请提交反馈"),
+            ErrKind::Forbidden
+        ));
+        // 与渠道级 11128 互不误撞
+        assert!(!matches!(classify_wb_error(11128, "request illegal"), ErrKind::Forbidden));
     }
 
     /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；
@@ -2164,9 +2663,10 @@ mod tests {
     }
 
     /// 账号级配额冷却（2026-10-19 复盘）：记录/查询/清零生命周期 + 恢复时刻
-    /// 不可被并发写提前 + 过期自然失效。模型名加时间戳隔离并行测试共享静态表。
+    /// 不可被并发写提前 + 过期自然失效 + 键隔离（model|uid 互不串扰）。
+    /// 模型名加时间戳隔离并行测试共享静态表。
     #[test]
-    fn acct_quota_cooldown_lifecycle() {
+    fn acct_quota_cooldown_lifecycle_and_isolation() {
         let model = format!("t-acct-{}", now_ts());
         let uid = "uid_x";
         assert!(!account_model_cooling(&model, uid));
@@ -2180,22 +2680,12 @@ mod tests {
         let expired = format!("{model}-expired");
         note_acct_cooldown(&expired, uid, now_ts() - 1);
         assert!(!account_model_cooling(&expired, uid));
+        // 键隔离：同模型不同账号、同账号不同模型互不影响
+        assert!(account_model_cooling(&model, "uid_x"));
+        assert!(!account_model_cooling(&model, "uid_y"));
+        assert!(!account_model_cooling(&format!("{model}-other"), "uid_x"));
         // 成功清零
         clear_account_model_failure(&model, uid);
         assert!(!account_model_cooling(&model, uid));
-    }
-
-    /// 失败分流：6004 限额文案（可解析恢复时刻）→ 账号级冷却；无消息/不可
-    /// 解析 → 模型级冷却（既有语义不变）。分流判定不含状态构造，直接测
-    /// parse 门控口径与 note_acct_cooldown 键隔离（model|uid 互不串扰）。
-    #[test]
-    fn acct_quota_key_isolation() {
-        let model = format!("t-iso-{}", now_ts());
-        note_acct_cooldown(&model, "uid_a", now_ts() + 3600);
-        // 同模型不同账号互不影响
-        assert!(account_model_cooling(&model, "uid_a"));
-        assert!(!account_model_cooling(&model, "uid_b"));
-        // 不同模型同账号互不影响
-        assert!(!account_model_cooling(&format!("{}-other", model), "uid_a"));
     }
 }

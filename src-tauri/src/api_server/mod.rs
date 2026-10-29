@@ -2,6 +2,7 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod config_cache;
+pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
@@ -79,18 +80,31 @@ pub struct ApiSharedState {
     pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
     pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// buddy-ai（国际版）池粘性 TTL 秒（per-pool，默认 300；§4.2 粘性按池独立）
+    pub buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// buddy-ai 竞速对冲阈值毫秒（per-pool 独立配置，0 = 关闭；WbView::route_hedge_ms
+    /// 按 CN/Intl 档取值）
+    pub buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
+    /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
+    pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
     /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
     /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
     /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
+    /// buddy-ai 显式会话粘性存储（§4.2：`g:` 前缀命名空间，与 wb/qoder/trae 互不串绑）
+    pub buddy_ai_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
     /// session_key → (上次成功服务的资源池, 过期时间 Unix 秒)，TTL 60s 软粘
     pub pool_sticky: Mutex<std::collections::HashMap<String, (dispatch::TargetPool, i64)>>,
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
     /// 优先级高于 Key 级冷却
     pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// buddy-ai（国际版）模型级冷却独立实例（§4.2：Intl 池冷却表独立——同名模型
+    /// 跨区不混轮，CN 侧模型故障不得冷却 Intl 池同型号，反之亦然）
+    pub buddy_ai_model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -112,6 +126,11 @@ pub struct ApiSharedState {
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
     pub wb_probe_ok: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针（G8 审查修复）：与 wb_probe 同频控口径，
+    /// 探测 BILLING_BASE_GLOBAL（workbuddy.ai）；-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64,
+    /// buddy-ai（国际版）上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
+    pub buddy_ai_probe_ok: std::sync::atomic::AtomicI64,
     /// 跨池回退日志节流（审查中等项 + 二审细化）：key = "model|reason"，
     /// value = 上次落盘 Unix 毫秒；60s 窗口内同 model 同因回退只落盘一次，
     /// 防逐请求刷盘放大；不同 model/reason 互不抑制
@@ -147,6 +166,13 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
+    /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居；
+    /// 阶段 1 仅注册 + healthz selectable，dispatch 接线在阶段 2）
+    pub buddy_ai_pool: ApiPool,
+    /// buddy-ai 上游开关（api_pool.json.buddy_ai_enabled；默认关——dispatch
+    /// 「buddy-ai」档显式开启制，由用户在 API 服务页显式开启国际档）
+    pub buddy_ai_enabled: std::sync::atomic::AtomicBool,
     /// Trae 池会话粘性存储（per-pool 会话粘性批次新增）：与 wb/qoder sticky 共用
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
@@ -156,6 +182,72 @@ pub struct ApiSharedState {
     /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
     /// fail-open 误判（配置改非环回但服务仍绑环回时按实际值豁免，反之按实际值走鉴权）
     pub listen_host: std::sync::Mutex<String>,
+    /// custom 上游组会话粘上游（P2）：session_key → (cm.id, 过期 Instant)，
+    /// TTL 60s，内存态不落盘（与池粘性同口径；custom_lb 模块消费）
+    pub custom_upstream_sticky:
+        Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    /// custom 上游组加权轮询计数（P2）：canonical 模型名 → 组内共享计数器——
+    /// 按模型分组各计各的，避免单全局计数器跨组交替破坏组内分布
+    pub custom_lb_counters: Mutex<std::collections::HashMap<String, std::sync::atomic::AtomicUsize>>,
+}
+
+/// 测试专用：全字段默认构造（custom_route 端到端轮换测试等无 fixture 的
+/// 测试模块复用；开关取生产默认值，池为空池）
+#[cfg(test)]
+pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState {
+    ApiSharedState {
+        pool: pool::ApiPool::new(),
+        wb_pool: pool::ApiPool::new(),
+        wb_enabled: std::sync::atomic::AtomicBool::new(true),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+        wb_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_sticky: wb_sticky::StickyStore::default(),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        default_model: String::new(),
+        logger: ApiLogger::new(data_dir.join("logs")),
+        data_dir,
+        total_requests: AtomicU64::new(0),
+        inflight: Arc::new(AtomicU64::new(0)),
+        active_uid: Mutex::new(None),
+        last_error: Mutex::new(None),
+        debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(usage::UsageFile::default()),
+        usage_dirty: Mutex::new(Vec::new()),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
+        trae_jwt_refresh: None,
+        trae_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_pool: pool::ApiPool::new(),
+        qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_identity: None,
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_sticky: wb_sticky::StickyStore::default(),
+        trae_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_pool: pool::ApiPool::new(),
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+        listen_host: Mutex::new("127.0.0.1".to_string()),
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
+    }
 }
 
 impl ApiSharedState {
@@ -220,8 +312,62 @@ impl ApiSharedState {
             .push((bucket, day));
     }
 
+    /// 记录一次请求用量（按桶，buddy-ai 档记账分区用，§3.1 硬约束 5）；落盘策略同 record_usage
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_bucket(
+        &self,
+        bucket: usage::UsageBucket,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        self.record_usage_bucket_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, None,
+        );
+    }
+
+    /// 记录一次请求用量（按桶 + TTFT）：wb_route 池视图分流记账的唯一入口
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_bucket_ttfb(
+        &self,
+        bucket: usage::UsageBucket,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+            completion_tokens, ttfb_ms,
+        );
+        // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((bucket, day));
+    }
+
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
-    /// uid 固定 "custom"，落盘策略与 record_usage 相同
+    /// uid 固定 "custom"，落盘策略与 record_usage 相同。
+    /// `session`：请求级会话上下文（issue #149 P2）——同步直写 custom_sessions 流水
+    /// （request_id 内部生成 uuid，纯 INSERT；写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_custom(
         &self,
@@ -232,7 +378,11 @@ impl ApiSharedState {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        session: &usage::CustomSessionCtx,
     ) {
+        // day 先取定（同 record_usage_qoder）：用量行、流水行与标脏行共用同一日期键，
+        // 杜绝跨零点时三者分裂到不同日期
+        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
@@ -242,8 +392,25 @@ impl ApiSharedState {
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
-        let day = usage::today_key();
         drop(guard);
+        // issue #149 P2：请求级流水同步落库（静默，不影响记账主路径）
+        let _ = crate::store::docs::custom_session_insert(
+            &crate::store::db(&self.data_dir),
+            &uuid::Uuid::new_v4().to_string(),
+            &session.session_id,
+            &session.uid,
+            &day,
+            chrono::Local::now().timestamp(),
+            model,
+            session.stage,
+            &session.key_name,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -261,8 +428,10 @@ impl ApiSharedState {
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_cached_in(bucket, cached);
+        // 审查修复（用量跨日归行）：day 在持锁期间取定一次，cached_tokens 写入
+        // 与标脏落盘共用同一日期键，杜绝跨零点时写入行与标脏行分裂到两日
         let day = usage::today_key();
+        guard.record_cached_in(bucket, &day, cached);
         drop(guard);
         self.usage_dirty
             .lock()
@@ -467,6 +636,10 @@ pub enum ErrKind {
     HardCredit,
     /// 403 封禁（F-29 v1.2）：禁用账号，标注需人工确认
     Forbidden,
+    /// 付费受限（issue #145）：模型仅付费账号可用（如 Kimi K3.1 Pro），
+    /// 属账号订阅档位与模型的固有不匹配——不冷却不禁用（note_error no-op），
+    /// 由 routes 层换号重试；根治手段是渠道内单模型开关（TraeModelMeta.enabled）
+    PaidRestricted,
 }
 
 impl ErrKind {
@@ -479,8 +652,11 @@ impl ErrKind {
             // 熔断基础时长 30m；指数递增在 pool::note_error 内按 cb_trips 计算
             ErrKind::Server => std::time::Duration::from_secs(30 * 60),
             ErrKind::Client => std::time::Duration::from_secs(10 * 60),
-            // 由 note_error 特殊处理（次日 04:00 / 直接禁用），无固定时长
-            ErrKind::HardCredit | ErrKind::Forbidden | ErrKind::None => std::time::Duration::ZERO,
+            // 由 note_error 特殊处理（次日 04:00 / 直接禁用 / no-op），无固定时长
+            ErrKind::HardCredit
+            | ErrKind::Forbidden
+            | ErrKind::PaidRestricted
+            | ErrKind::None => std::time::Duration::ZERO,
         }
     }
 
@@ -495,6 +671,7 @@ impl ErrKind {
             ErrKind::Client => "Client",
             ErrKind::HardCredit => "HardCredit",
             ErrKind::Forbidden => "Forbidden",
+            ErrKind::PaidRestricted => "PaidRestricted",
         }
     }
 
@@ -549,6 +726,25 @@ pub fn is_credit_exhausted_error(body: &str) -> bool {
         || lower.contains("额度不足")
 }
 
+/// 付费受限短语表（issue #145）：模型仅付费账号/付费套餐可用（如 Kimi K3.1 Pro）。
+/// 命中 → PaidRestricted：不冷却账号（免费账号调度付费模型必败是固有不匹配，
+/// 冷却 10 分钟只会白白缩减可用池），由 routes 层换号重试、管理端单模型开关根治。
+/// 有意采用保守长短语（吸取 contains("plan") 误判 planned maintenance 的教训），
+/// 且调用方排在显式配额信号（积分耗尽/1005 plan limit）之后，防
+/// "plan limit exceeded, upgrade your plan" 类配额报文被归为付费受限
+pub fn is_paid_restricted_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("requires a paid")
+        || lower.contains("paid plan")
+        || lower.contains("paid subscription")
+        || lower.contains("upgrade to a paid")
+        || lower.contains("仅限付费")
+        || lower.contains("付费用户")
+        || lower.contains("付费账号")
+        || lower.contains("升级套餐")
+        || lower.contains("套餐不支持")
+}
+
 /// 按 HTTP 状态码 + body 判定错误类别
 pub fn classify_error(status: u16, body: &str) -> ErrKind {
     // 4001：模型问题非账号问题，不冷却账号
@@ -559,12 +755,24 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
     if is_credit_exhausted_error(body) {
         return ErrKind::HardCredit;
     }
+    // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
+    // 禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录账号即随
+    // 池快照重建恢复调度；优先于状态码口径，该错误以 HTTP 400 形态到达时
+    // 默认 400 → Client 仅短冷却，账号会被持续调度每请求必败
+    if retry::is_account_restricted_error(body) {
+        return ErrKind::Forbidden;
+    }
     // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
     let lower_body = body.to_lowercase();
     if (body.contains("\"code\":1005") || body.contains("\"code\": 1005"))
         && (lower_body.contains("plan limit") || lower_body.contains("plan_limit"))
     {
         return ErrKind::PlanLimit;
+    }
+    // 付费受限（issue #145）：排在显式配额信号之后，防配额报文误判；
+    // 不冷却账号（PaidRestricted → note_error no-op）
+    if is_paid_restricted_error(body) {
+        return ErrKind::PaidRestricted;
     }
     match status {
         401 => ErrKind::SessionDead,
@@ -597,6 +805,11 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     // 避免落入 4008 SoftRate（60s）冷却后很快被再次选中、循环薅同一账号
     if is_credit_exhausted_error(msg) {
         return ErrKind::HardCredit;
+    }
+    // 付费受限（issue #145）：排在显式配额信号之后、4008 宽泛分支之前
+    //（防 "exceeded" 等宽泛词把付费受限报文归为 SoftRate 误冷却）
+    if is_paid_restricted_error(msg) {
+        return ErrKind::PaidRestricted;
     }
     // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
     if code == 4008
@@ -758,6 +971,7 @@ mod inflight_tests {
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),
@@ -770,6 +984,8 @@ mod inflight_tests {
             usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
             trae_jwt_refresh: None,
             trae_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -780,7 +996,15 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_sticky: wb_sticky::StickyStore::default(),
+            buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            buddy_ai_pool: pool::ApiPool::new(),
+            buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+            custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         };
         {
             let _g = state.inflight_guard();
@@ -813,5 +1037,83 @@ mod inflight_tests {
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+/// issue #145 错误分类测试：付费受限（PaidRestricted）识别与排序防误判
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// 付费受限长短语命中与保守性（不含付费语义的报文不误判）
+    #[test]
+    fn t01_paid_restricted_phrases() {
+        assert!(is_paid_restricted_error(
+            "This model requires a paid subscription to use."
+        ));
+        assert!(is_paid_restricted_error("请升级套餐后再使用该模型"));
+        assert!(is_paid_restricted_error("该模型仅限付费用户使用"));
+        // 保守性：宽泛 "plan" 字样不命中（吸取 contains("plan") 误判 planned
+        // maintenance 的教训）
+        assert!(!is_paid_restricted_error("planned maintenance"));
+        assert!(!is_paid_restricted_error("plan limit exceeded"));
+    }
+
+    /// classify_error：付费受限在状态码兜底（403/400 → Forbidden/Client）之前
+    /// 识别——否则免费账号调度付费模型会被 403/400 兜底误冷却
+    #[test]
+    fn t02_error_paid_restricted_before_status_fallback() {
+        assert_eq!(
+            classify_error(403, "model requires a paid subscription"),
+            ErrKind::PaidRestricted
+        );
+        assert_eq!(
+            classify_error(400, "该模型仅限付费账号使用"),
+            ErrKind::PaidRestricted
+        );
+    }
+
+    /// 排序防误判①：显式配额信号（积分耗尽 / 1005 plan limit）优先于付费受限，
+    /// "plan limit exceeded, upgrade your plan" 类配额报文不误归付费受限
+    #[test]
+    fn t03_explicit_quota_signals_win_over_paid_restricted() {
+        assert_eq!(
+            classify_error(400, "insufficient credit, upgrade your plan"),
+            ErrKind::HardCredit
+        );
+        assert_eq!(
+            classify_error(
+                400,
+                "{\"code\":1005,\"message\":\"plan limit exceeded, upgrade your plan\"}"
+            ),
+            ErrKind::PlanLimit
+        );
+        assert_eq!(
+            classify_solo_error(1005, "plan limit exceeded, upgrade your plan"),
+            ErrKind::PlanLimit
+        );
+    }
+
+    /// 排序防误判②：classify_solo_error 付费受限检查在 4008 宽泛分支
+    /// （contains "quota"/"exceeded"/"rate"）之前，防付费报文误归 SoftRate（60s）
+    #[test]
+    fn t04_solo_paid_restricted_before_generic_quota() {
+        assert_eq!(
+            classify_solo_error(0, "该模型仅限付费用户使用，请升级套餐"),
+            ErrKind::PaidRestricted
+        );
+        // 对照：无付费短语的 exceeded 报文仍按既有口径归 SoftRate
+        assert_eq!(classify_solo_error(4008, "quota exceeded"), ErrKind::SoftRate);
+    }
+
+    /// 冷却语义：零时长（note_error no-op 的前置约定）、标识串、不解绑粘性
+    #[test]
+    fn t05_paid_restricted_cooldown_semantics() {
+        assert_eq!(
+            ErrKind::PaidRestricted.cooldown_duration(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(ErrKind::PaidRestricted.as_str(), "PaidRestricted");
+        assert!(!ErrKind::PaidRestricted.unbinds_sticky());
     }
 }

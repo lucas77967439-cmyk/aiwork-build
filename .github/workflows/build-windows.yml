@@ -7,6 +7,7 @@ on:
       - master
       - macos_main
       - feat/export-accounts-json
+      - v3.8.5
   workflow_dispatch:
 
 jobs:
@@ -39,21 +40,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app (NSIS + MSI)
-        id: build
-        shell: bash
-        run: |
-          set -o pipefail
-          npm run tauri build -- --bundles nsis,msi 2>&1 | tee build.log
-
-      # 诊断闭环：无论成败都上传 build.log 为 artifact（job logs 需 admin token，
-      # 而 artifact 可在仓库 Actions 页面直接下载）
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          if-no-files-found: warn
+        run: npm run tauri build -- --bundles nsis,msi
 
       # 审查 M15：CI 缺测试防线——产物未经测试验证即上传。放在 tauri build 之后：
       # generate_context! 宏依赖 frontendDist（../dist，由 beforeBuildCommand 生成）
@@ -97,7 +84,7 @@ jobs:
       # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
       # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
       - name: Publish to GitHub Release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5'
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:

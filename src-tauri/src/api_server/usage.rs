@@ -230,18 +230,20 @@ impl DayStats {
 }
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
-/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求（阶段 3）
+/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求；
+/// BuddyAi = Buddy 国际版（buddy-ai 独立池）请求（§3.1 记账分区，与国内混计禁止）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
     Trae,
     Wb,
     Custom,
     Qoder,
+    BuddyAi,
 }
 
 /// 用量数据根结构：日期 → 单日统计。
 /// 按资源池分桶：days = Trae 模型请求；wb_days = WB 上游请求；custom_days = 自定义模型请求；
-/// qoder_days = Qoder 上游请求
+/// qoder_days = Qoder 上游请求；buddy_ai_days = buddy-ai 国际池请求
 /// （serde default，旧文件无对应桶时视为空——历史混入数据无法追溯分离，从启用时点起分账）。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct UsageFile {
@@ -253,6 +255,8 @@ pub struct UsageFile {
     pub custom_days: HashMap<String, DayStats>,
     #[serde(default)]
     pub qoder_days: HashMap<String, DayStats>,
+    #[serde(default)]
+    pub buddy_ai_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
@@ -262,6 +266,7 @@ impl UsageFile {
             UsageBucket::Wb => &mut self.wb_days,
             UsageBucket::Custom => &mut self.custom_days,
             UsageBucket::Qoder => &mut self.qoder_days,
+            UsageBucket::BuddyAi => &mut self.buddy_ai_days,
         }
     }
 
@@ -272,6 +277,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::BuddyAi => &self.buddy_ai_days,
         };
         b.get(day)
     }
@@ -389,12 +395,15 @@ impl UsageFile {
         d.record_credits(model, credits, original);
     }
 
-    /// 按桶记录一次缓存读 tokens 测量到当日 entry（M4 审查修复：
-    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）
-    pub fn record_cached_in(&mut self, bucket: UsageBucket, cached: u64) {
-        let day = today_key();
+    /// 按桶记录一次缓存读 tokens 测量到指定日期 entry（M4 审查修复：
+    /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）。
+    /// 审查修复（用量跨日归行）：`day` 由调用方在持锁期间取定并传入，
+    /// 写入路径内不再自行取 today——杜绝跨零点时 cached_tokens 与同一请求
+    /// 其他统计/标脏落盘行分裂到不同日期行（对齐 record_in_ttfb_on 的
+    /// 「调用方定日」语义）
+    pub fn record_cached_in(&mut self, bucket: UsageBucket, day: &str, cached: u64) {
         self.bucket_mut(bucket)
-            .entry(day)
+            .entry(day.to_string())
             .or_default()
             .record_cached(cached);
     }
@@ -403,7 +412,7 @@ impl UsageFile {
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
         let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
-        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days, &mut self.qoder_days] {
+        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days, &mut self.qoder_days, &mut self.buddy_ai_days] {
             bucket.retain(|d, _| d.as_str() >= cutoff_str.as_str());
         }
     }
@@ -418,6 +427,7 @@ impl UsageFile {
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
+            UsageBucket::BuddyAi => &self.buddy_ai_days,
         };
         // 窗口含今日：days=7 → 今日与此前 6 个日历天（字符串比较口径对齐 trim）
         let cutoff = (chrono::Local::now().date_naive()
@@ -464,6 +474,19 @@ impl QoderSessionCtx {
     }
 }
 
+/// Custom 网关请求级会话上下文（issue #149 P2：custom_sessions 流水行）。
+/// request_id 由记账入口内部生成 uuid（custom 上游无信封可取，纯 INSERT 无幂等诉求）；
+/// session_id = conversation_key（前 2 条消息指纹，"cv|" 前缀，跨轮稳定）；
+/// stage = 请求阶段（main_first / main / tool / unknown）。
+pub struct CustomSessionCtx {
+    pub session_id: String,
+    pub stage: &'static str,
+    /// 请求所用 API Key 的 key_id（custom 桶用量 uid 固定 "custom"，流水行落真实 key_id）
+    pub uid: String,
+    pub key_name: String,
+    pub preview: String,
+}
+
 /// 从存储加载用量数据（缺失/损坏回退空结构），并裁剪过期日期。
 /// SQLite 化 P3：api_usage 表；P7 修订：记账改为当日单行 upsert 后，
 /// 存储侧保留期裁剪在启动 load 时一次性执行。
@@ -473,6 +496,8 @@ pub fn load(data_dir: &Path) -> UsageFile {
     let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
     let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
+    let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     f
 }
 
@@ -489,6 +514,7 @@ pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStat
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
+        UsageBucket::BuddyAi => "buddy-ai",
     };
     crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }

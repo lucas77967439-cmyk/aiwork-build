@@ -3,12 +3,18 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
   ApiServiceStatus,
+  BuddyAiAccountView,
+  BuddyAiUsageOfficialAll,
+  BuddyAiTokenStats,
   ApiPoolFile,
   ApiKeyEntry,
   CcSwitchStatus,
   ApiKeysFileView,
   SanitizeMapView,
   SanitizeRule,
+  SanitizeTier,
+  ToolAliasMapView,
+  FingerprintSample,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -167,10 +173,14 @@ export const api = {
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
-    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（分离启动，不注入代理） */
-    openWorkbuddyApp: () => invoke('open_workbuddy_app'),
-    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
-    openCodebuddyApp: () => invoke('open_codebuddy_app'),
+    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（代理运行中传端口注入 --proxy-server 抓包） */
+    openWorkbuddyApp: (proxyPort?: number) => invoke('open_workbuddy_app', { proxyPort }),
+    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（代理注入同上） */
+    openCodebuddyApp: (proxyPort?: number) => invoke('open_codebuddy_app', { proxyPort }),
+    /** BuddyAI 国际客户端：打开 WorkBuddy AI（Programs\WorkBuddyAI，独立探测档案；代理运行中传端口注入 --proxy-server 抓包） */
+    openWorkbuddyAiApp: (proxyPort?: number) => invoke('open_workbuddy_ai_app', { proxyPort }),
+    /** BuddyAI 国际客户端：打开 CodeBuddy AI（Programs\CodeBuddy；代理注入同上） */
+    openCodebuddyAiApp: (proxyPort?: number) => invoke('open_codebuddy_ai_app', { proxyPort }),
     /** CodeBuddy 桌面环境检测（exe/进程/auth uid；与 WorkBuddy 共享 auth 文件） */
     codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
   },
@@ -207,6 +217,9 @@ export const api = {
       invoke<number>('cooldown_clear_all'),
     refreshJwt: (userId: string, force = false) =>
       invoke<string>('refresh_jwt', { userId, force }),
+    // issue #126：续期前置判活——JWT 服务端仍存活时 Err(出路指引)，判死/fail-open 时 Ok
+    renewPreflight: (userId: string) =>
+      invoke<void>('renew_jwt_preflight', { userId }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
     importAccounts: (content: string, only?: number[]) =>
       invoke<ImportReport>('accounts_import', { content, only }),
@@ -337,7 +350,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
+    targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -346,7 +359,7 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
@@ -423,6 +436,126 @@ export const api = {
         'doubao_account_get_credential',
         { userId },
       ),
+  },
+  // ---- Buddy 国际版（buddy-ai 独立池；Rust commands/workbuddy/buddy_ai.rs）----
+  buddyai: {
+    /** buddy-ai OAuth 扫码登录（workbuddy.ai + platform=workbuddy-ai）；
+     *  事件 buddy-ai-oauth-progress / buddy-ai-oauth-done（与 wb-oauth 同构、独立前缀） */
+    oauthLogin: () => invoke<void>('buddy_ai_oauth_login'),
+    accountsList: () => invoke<BuddyAiAccountView[]>('buddy_ai_accounts_list'),
+    /** 手工导入国际账号凭证（区域必选校验：domain 须含 .workbuddy.ai） */
+    accountImportCreds: (name?: string, accessToken?: string, refreshToken?: string, domain?: string) =>
+      invoke<{ id: string; domain: string }>('buddy_ai_account_import_creds', {
+        name: name ?? null,
+        accessToken: accessToken ?? null,
+        refreshToken: refreshToken ?? null,
+        domain: domain ?? null,
+      }),
+    accountRemove: (userId: string) => invoke('buddy_ai_account_remove', { userId }),
+    /** 凭证续期（R-2a 实测端点，rt 轮换回写；失败按暂态不标 needs_relogin） */
+    refreshToken: (userId: string) => invoke<string>('buddy_ai_refresh_token', { userId }),
+    /** 每日活跃打卡（手动触发；进度经 buddy-ai-checkin-progress NDJSON 推送） */
+    checkinStart: () => invoke<void>('buddy_ai_checkin_start'),
+    /** 打卡结果按日查询（近 N 天，默认 30；概述趋势/签到日历共用） */
+    checkinResults: (days?: number) =>
+      invoke<WbCheckinRecord[]>('buddy_ai_checkin_results', { days: days ?? null }),
+    /** 编辑账号（昵称/备注/分组；P3 对齐 workbuddy_account_save） */
+    accountSave: (userId: string, patch: { name?: string; note?: string; group_id?: string }) =>
+      invoke<void>('buddy_ai_account_save', {
+        userId,
+        name: patch.name ?? null,
+        note: patch.note ?? null,
+        groupId: patch.group_id ?? null,
+      }),
+    /** 账号启停（停用即退出打卡花名册与网关取号） */
+    accountToggle: (userId: string, disabled: boolean) =>
+      invoke<void>('buddy_ai_account_toggle', { userId, disabled }),
+    /** 官网请求流水（P9：get-user-request-usage 分页，credit/model/client/requestTime/inputTrunc） */
+    requestUsage: (userId: string, days?: number, page?: number, pageSize?: number) =>
+      invoke<{
+        total: number;
+        page: number;
+        pageSize: number;
+        rows: Array<{
+          requestId: string;
+          credit: number;
+          model: string;
+          client: string;
+          requestTime: string;
+          inputTrunc: string;
+          agentPurpose: string;
+        }>;
+      }>('buddy_ai_request_usage', {
+        userId,
+        days: days ?? null,
+        page: page ?? null,
+        pageSize: pageSize ?? null,
+      }),
+    /** 积分历史查询（P8 趋势曲线数据源；同日覆盖快照，默认 90 天） */
+    creditsHistory: (days?: number) =>
+      invoke<Array<{ date: string; ts: number; total_balance: number; accounts: Array<{ id: string; name: string; balance: number | null }>; earned: number | null }>>(
+        'buddy_ai_credits_history',
+        { days: days ?? null },
+      ),
+    /** 账号池导出（includeCredentials=true 时须提供 password：凭证以 AIWQENC1 信封加密写入导出文件，不回传明文） */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
+      invoke<Record<string, unknown>>('buddy_ai_accounts_export', {
+        includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
+      }),
+    /** 账号池导入（accounts_export 回导；加密信封文件须传 password 解密，明文旧文件 password 传 null 兼容） */
+    accountsImport: (poolJson: Record<string, unknown>, password?: string | null) =>
+      invoke<{ added: number; skipped: number; invalid: number; tokens_added: number }>(
+        'buddy_ai_accounts_import',
+        { poolJson, password: password ?? null },
+      ),
+    /** 扫描本机 WorkBuddy AI 客户端登录账号（account-snapshot.json；识别+池内匹配） */
+    localScan: () =>
+      invoke<{
+        found: boolean;
+        reason?: string;
+        uid?: string;
+        nickname?: string;
+        edition_type?: string;
+        is_pro?: boolean;
+        saved_at_ms?: number;
+        in_pool?: boolean;
+        pool_account_id?: string;
+      }>('buddy_ai_local_scan'),
+    /** 环境重置（白名单目录清理；items 含 login = 登录态清除，前端强确认） */
+    envReset: (items: string[]) =>
+      invoke<{ results: { item: string; ok: boolean; detail: string }[]; failed: number }>(
+        'buddy_ai_env_reset',
+        { items },
+      ),
+    /** 打开 WorkBuddy AI 国际客户端数据目录（%USERPROFILE%\.workbuddy-ai） */
+    openDataDir: () => invoke<void>('buddy_ai_open_data_dir'),
+    /** 手动同步 Intl 模型目录（/v3/config 直连 → 动态替换；返回替换模型数） */
+    catalogSync: () => invoke<number>('buddy_ai_catalog_sync'),
+    /** 积分同步（get-user-resource TotalDosage → 池快照三键回写），返回刷新后账号视图 */
+    creditsFetch: () => invoke<BuddyAiAccountView[]>('buddy_ai_credits_fetch'),
+    /** 全账号官网用量聚合（积分看板「官网」源；31 天零填充，10min 缓存 + stale-on-error） */
+    usageOfficialAll: () => invoke<BuddyAiUsageOfficialAll>('buddy_ai_usage_official_all'),
+    /** 本地 Token 统计（~/.workbuddy-ai/projects 会话 jsonl 扫描；fresh=true 跳过 10min 结果缓存） */
+    tokenStats: (fresh?: boolean) =>
+      invoke<BuddyAiTokenStats>('buddy_ai_token_stats', { fresh: fresh ?? null }),
+    /** 会话明细（定时落地的官网请求级行缓存，纯缓存零网络；镜像国内 workbuddy.usageSessions） */
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('buddy_ai_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
   workbuddy: {
@@ -740,6 +873,24 @@ export const api = {
         wbTagIds?: string[] | null;
         /** Qoder 池标签筛选；null/未传 = 保留原值 */
         qoderTagIds?: string[] | null;
+        /** Buddy 国际版（buddy-ai）独立池开关（阶段 2，显式开启制）；null/未传 = 保留原值 */
+        buddyAiEnabled?: boolean;
+        /** buddy-ai 显式会话粘性开关；null/未传 = 保留原值 */
+        buddyAiStickyEnabled?: boolean;
+        /** buddy-ai 池粘性 TTL 秒（P6 顺延补齐）；null/未传 = 保留原值 */
+        buddyAiPoolStickyTtlSecs?: number;
+        /** buddy-ai 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        buddyAiAccountConcurrencyLimit?: number;
+        /** buddy-ai 会话粘性 TTL 秒；null/未传 = 保留原值 */
+        buddyAiStickyTtlSecs?: number;
+        /** buddy-ai 竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        buddyAiHedgeThresholdMs?: number;
+        /** buddy-ai 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
+        buddyAiGroupIds?: string[] | null;
+        /** buddy-ai 池标签筛选；null/未传 = 保留原值，空数组 = 清空 */
+        buddyAiTagIds?: string[] | null;
+        /** buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        buddyAiStrategy?: string;
       },
       wbStrategy?: string,
     ) =>
@@ -776,6 +927,15 @@ export const api = {
         traeTagIds: wbFlags?.traeTagIds ?? null,
         wbTagIds: wbFlags?.wbTagIds ?? null,
         qoderTagIds: wbFlags?.qoderTagIds ?? null,
+        buddyAiEnabled: wbFlags?.buddyAiEnabled ?? null,
+        buddyAiStickyEnabled: wbFlags?.buddyAiStickyEnabled ?? null,
+        buddyAiPoolStickyTtlSecs: wbFlags?.buddyAiPoolStickyTtlSecs ?? null,
+        buddyAiAccountConcurrencyLimit: wbFlags?.buddyAiAccountConcurrencyLimit ?? null,
+        buddyAiStickyTtlSecs: wbFlags?.buddyAiStickyTtlSecs ?? null,
+        buddyAiHedgeThresholdMs: wbFlags?.buddyAiHedgeThresholdMs ?? null,
+        buddyAiGroupIds: wbFlags?.buddyAiGroupIds ?? null,
+        buddyAiTagIds: wbFlags?.buddyAiTagIds ?? null,
+        buddyAiStrategy: wbFlags?.buddyAiStrategy ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -786,6 +946,8 @@ export const api = {
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
+    /** Buddy 国际版（buddy-ai）池实时状态（全局 API 管理·API Keys 调度配置候选） */
+    buddyAiPoolStatus: () => invoke<PoolStatus[]>('buddy_ai_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
     qoderCatalogSync: () => invoke<number>('qoder_catalog_sync'),
     logsList: () => invoke<string[]>('api_logs_list'),
@@ -811,6 +973,8 @@ export const api = {
     wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
     // WB 目录模型列表（Buddy「资源调度」页展示）
     wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
+    /** Buddy 国际版（buddy-ai）模型目录（§4.4 首版静态配置） */
+    buddyAiCatalogList: () => invoke<WbModelInfo[]>('api_buddy_ai_catalog_list'),
     // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
     // side：trae（Trae 模型网关）/ wb（WB 上游网关），两套条目互不覆盖
     ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
@@ -833,9 +997,37 @@ export const api = {
     // WB 上游用量统计（wb_days 桶，Buddy「资源调度」页专用，与 Trae 侧分账）
     wbUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_wb_usage_stats', { days: days ?? null }),
+    // buddy-ai 国际池用量统计（buddy_ai_days 桶，BuddyAI「积分看板·模型消耗排行」专用）
+    buddyAiUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_buddy_ai_usage_stats', { days: days ?? null }),
     // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
     customUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),
+    // 自定义池会话明细（issue #149 P2：custom_sessions 请求级流水，读时两遍归并）
+    customSessionsQuery: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('custom_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
+    // 自定义池会话展开明细（session_id = conversation_key 精确匹配；mode 位 = 阶段标签）
+    customSessionDetail: (opts: { date: string; uid: string; sessionId: string; preview: string }) =>
+      invoke<UsageSessionView[]>('custom_session_detail_query', {
+        date: opts.date,
+        uid: opts.uid,
+        sessionId: opts.sessionId,
+        preview: opts.preview,
+      }),
     // Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
     qoderUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_qoder_usage_stats', { days: days ?? null }),
@@ -848,6 +1040,9 @@ export const api = {
     customModelsRemove: (id: string) => invoke<boolean>('custom_models_remove', { id }),
     // 自定义模型连通性测试：发一条最小 chat 请求（max_tokens=16），成功返回摘要 / 失败返回原因
     customModelTest: (model: CustomModel) => invoke<string>('custom_model_test', { model }),
+    // 自定义上游熔断状态快照（P3 可观测）：每条仍在冷却中的上游 (id, fails, cooling_secs)
+    customLbStatus: () =>
+      invoke<{ id: string; fails: number; cooling_secs: number }[]>('custom_lb_status'),
     // ---- 统一网关命令（Phase 1 §8.1）：统一模型目录 / 网关设置 ----
     // 顶层参数用 camelCase（availableOnly），嵌套结构体字段保持 snake_case
     unifiedModels: (availableOnly?: boolean) =>
@@ -883,13 +1078,30 @@ export const api = {
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
     // ---- 指纹清洗规则表（wb_template_map KV）----
-    // builtin=true = 当前生效内置默认规则（尚未自定义）；保存后成为独立自定义副本
-    templateMapGet: () => invoke<SanitizeMapView>('wb_template_map_get'),
+    // builtin=true = 当前生效内置默认规则（尚未自定义）；保存后成为独立自定义副本。
+    // issue #129：档位分区——'wb'（wb 池 + Trae 池共用键）| 'buddy-ai'（国际档独立键）
+    templateMapGet: (tier?: SanitizeTier) =>
+      invoke<SanitizeMapView>('wb_template_map_get', { tier: tier ?? null }),
     // 整体替换保存；load_templates 每请求读取，保存即对下一请求生效，无需重启网关
-    templateMapSet: (templates: SanitizeRule[]) =>
+    templateMapSet: (templates: SanitizeRule[], tier?: SanitizeTier) =>
       invoke<void>('wb_template_map_set', {
+        tier: tier ?? null,
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
       }),
+    // ---- 工具名别名表（issue #150：tool_alias_map KV，单键不分档）----
+    // Trae 池 tools 工具集指纹识别治本：请求侧工具名→别名、响应侧逆映射回改。
+    // builtin=true = 当前生效内置默认表（尚未自定义）；保存后成为独立自定义副本
+    // （合并语义：内置表全量生效，自定义按 from 覆盖/追加，to=null 停用）。
+    // load_tool_alias_rules 每请求读取，保存即对下一请求生效，无需重启网关
+    toolAliasMapGet: () => invoke<ToolAliasMapView>('wb_tool_alias_map_get'),
+    toolAliasMapSet: (rules: SanitizeRule[]) =>
+      invoke<void>('wb_tool_alias_map_set', {
+        map: { rules, updated_at: Math.floor(Date.now() / 1000) },
+      }),
+    // ---- 指纹样本（issue #125 增强：一键从样本生成规则）----
+    // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）
+    fingerprintSamplesGet: () => invoke<FingerprintSample[]>('fingerprint_samples_get'),
+    fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
@@ -1006,87 +1218,100 @@ export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
   const unsubs: UnlistenFn[] = [];
-  if (handlers.onProxyLog) {
-    unsubs.push(
-      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-    );
-  }
-  if (handlers.onAccountCaptured) {
-    unsubs.push(
-      await listen<string>('account-captured', (e) =>
-        handlers.onAccountCaptured!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onCheckinProgress) {
-    unsubs.push(
-      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-        handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchProgress) {
-    unsubs.push(
-      await listen<string>('switch-progress', (e) =>
-        handlers.onSwitchProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchDone) {
-    unsubs.push(
-      await listen<SwitchDoneEvent>('switch-done', (e) =>
-        handlers.onSwitchDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginProgress) {
-    unsubs.push(
-      await listen<string>('save-login-progress', (e) =>
-        handlers.onSaveLoginProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginDone) {
-    unsubs.push(
-      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-        handlers.onSaveLoginDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetProgress) {
-    unsubs.push(
-      await listen<string>('device-reset-progress', (e) =>
-        handlers.onDeviceResetProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetDone) {
-    unsubs.push(
-      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-        handlers.onDeviceResetDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileProgress) {
-    unsubs.push(
-      await listen<string>('profile-progress', (e) =>
-        handlers.onProfileProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileDone) {
-    unsubs.push(
-      await listen<ProfileDoneEvent>('profile-done', (e) =>
-        handlers.onProfileDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onQoderCheckinProgress) {
-    unsubs.push(
-      await listen<string>('qoder-checkin-progress', (e) =>
-        handlers.onQoderCheckinProgress!(e.payload),
-      ),
-    );
+  // 审查修复（L31）：注册中途失败（某事件 listen 抛错）时，先注销已注册的
+  // 前 N-1 个监听再重抛，避免泄漏；调用方（store）拿到异常时也不会有残留监听
+  try {
+    if (handlers.onProxyLog) {
+      unsubs.push(
+        await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
+      );
+    }
+    if (handlers.onAccountCaptured) {
+      unsubs.push(
+        await listen<string>('account-captured', (e) =>
+          handlers.onAccountCaptured!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCheckinProgress) {
+      unsubs.push(
+        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+          handlers.onCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchProgress) {
+      unsubs.push(
+        await listen<string>('switch-progress', (e) =>
+          handlers.onSwitchProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchDone) {
+      unsubs.push(
+        await listen<SwitchDoneEvent>('switch-done', (e) =>
+          handlers.onSwitchDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginProgress) {
+      unsubs.push(
+        await listen<string>('save-login-progress', (e) =>
+          handlers.onSaveLoginProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginDone) {
+      unsubs.push(
+        await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+          handlers.onSaveLoginDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetProgress) {
+      unsubs.push(
+        await listen<string>('device-reset-progress', (e) =>
+          handlers.onDeviceResetProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetDone) {
+      unsubs.push(
+        await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+          handlers.onDeviceResetDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileProgress) {
+      unsubs.push(
+        await listen<string>('profile-progress', (e) =>
+          handlers.onProfileProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileDone) {
+      unsubs.push(
+        await listen<ProfileDoneEvent>('profile-done', (e) =>
+          handlers.onProfileDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onQoderCheckinProgress) {
+      unsubs.push(
+        await listen<string>('qoder-checkin-progress', (e) =>
+          handlers.onQoderCheckinProgress!(e.payload),
+        ),
+      );
+    }
+  } catch (err) {
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        /* 单个注销失败不阻断清理，继续注销其余监听 */
+      }
+    }
+    throw err;
   }
   return unsubs;
 }

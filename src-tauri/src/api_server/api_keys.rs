@@ -55,15 +55,15 @@ pub enum KeyCheck {
 pub struct ResolvedKey {
     pub id: String,
     /// 限定上游账号 uid 白名单；空 = 不限。
-    /// bind=""（跟随全局调度）时条目可带池前缀 `trae:`/`buddy:`（issue #30 混合
-    /// 白名单）；绑定池时为对应池裸 uid；旧数据全裸 uid = 仅约束 buddy 池
+    /// bind=""（跟随全局调度）时条目可带池前缀 `trae:`/`buddy:`/`buddy-ai:`/`qoder:`
+    /// （issue #30 混合白名单）；绑定池时为对应池裸 uid；旧数据全裸 uid = 仅约束 buddy 池
     pub allowed_accounts: Vec<String>,
     /// expire_first | dedicated
     pub schedule_mode: String,
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
     /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
-    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "buddy-ai" | "qoder"
     pub bind_pool: String,
     /// 共享分组 id 白名单（未展开；鉴权时经 org_index 展开并入 allowed_accounts）
     pub allowed_groups: Vec<String>,
@@ -123,7 +123,8 @@ impl ResolvedKey {
         self.allowed_accounts.extend(extra);
     }
 
-    /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")；空或非法 = None）
+    /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")/Some("buddy-ai")/
+    /// Some("qoder")；空或非法 = None）
     pub fn bind_pool(&self) -> Option<&'static str> {
         parse_bind_pool(&self.bind_pool)
     }
@@ -223,12 +224,15 @@ impl ResolvedKey {
     }
 }
 
-/// 解析 bind_pool 字段为静态池标识（空/非法→None）
+/// 解析 bind_pool 字段为静态池标识（空/非法→None）；buddy-ai（国际版独立池）
+/// 随阶段 2 放行；custom（v3 决策 C：绑定 custom = custom 优先 + 不可用按序回退）
 pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "buddy-ai" => Some("buddy-ai"),
         "qoder" => Some("qoder"),
+        "custom" => Some("custom"),
         _ => None,
     }
 }
@@ -463,8 +467,18 @@ struct KeysEntry {
 /// 日志只记条数，不落 Key 值。
 fn registry_load(data_dir: &Path) -> ApiKeysFile {
     if let Some(v) = crate::vault::ns_get(data_dir, VAULT_NS, VAULT_KEY) {
-        if let Ok(f) = serde_json::from_value::<ApiKeysFile>(v) {
-            return f;
+        match serde_json::from_value::<ApiKeysFile>(v) {
+            Ok(f) => return f,
+            Err(e) => {
+                // 审查修复（M4）：fail-closed——vault 记录存在但反序列化失败时，
+                // 不得落入下方遗留库迁移把陈旧 legacy 快照覆盖回 vault
+                //（已删 Key 复活）；报错并返回空表拒绝迁移覆盖（无 Key 放行
+                // 仅在显式 auth_disabled 时生效，缺省即全拒绝，等人工修复 vault）
+                eprintln!(
+                    "[api_keys] vault 注册表反序列化失败，拒绝遗留库迁移覆盖（fail-closed，防止陈旧快照复活已删 Key）: {e}"
+                );
+                return ApiKeysFile::default();
+            }
         }
     }
     let legacy = crate::store::docs::api_keys_load(&crate::store::db(data_dir));
@@ -488,24 +502,6 @@ fn registry_load(data_dir: &Path) -> ApiKeysFile {
 fn registry_save(data_dir: &Path, f: &ApiKeysFile) -> Result<(), String> {
     let v = serde_json::to_value(f).map_err(|e| format!("Key 注册表序列化失败: {e}"))?;
     crate::vault::ns_set(data_dir, VAULT_NS, VAULT_KEY, &v)
-}
-
-/// 从遗留明文存储（SQLite `api_keys` 行表 + kv `api_keys_auth_disabled`）读取 Key
-/// 注册表并写入 vault 权威存储。返回同步的 Key 条数。
-///
-/// 用途（CLI `--task-run api-keys-init` / 手工修复）：vault 记录丢失、为空或需要
-/// 以行表定义为准覆盖时补齐。行表无定义且未显式关闭鉴权时返回 0，不写 vault
-/// （避免把「空」当成有效配置覆盖掉 vault 中已有的 Key）。
-///
-/// 与 `registry_load` 的被动迁移区别：那是「vault 无记录时才读行表」，本函数是
-/// **主动**以行表为准覆盖 vault，供外部工具/脚本在无法操作 GUI 时维护 Key。
-pub fn sync_registry_from_legacy(data_dir: &Path) -> Result<usize, String> {
-    let legacy = crate::store::docs::api_keys_load(&crate::store::db(data_dir));
-    if legacy.keys.is_empty() && !legacy.auth_disabled {
-        return Ok(0);
-    }
-    registry_save(data_dir, &legacy)?;
-    Ok(legacy.keys.len())
 }
 
 /// 锁内取条目：缓存未命中时加载（vault 优先 + 遗留迁移）并插入（首读即缓存）

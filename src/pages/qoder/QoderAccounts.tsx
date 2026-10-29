@@ -420,7 +420,7 @@ export default function QoderAccounts() {
     setOauthCanceling(false);
     // 兼容模式（上次授权超时后自动切换）：授权 URL 不带 client_id（预案见 qoder_oauth.rs）
     const compat = oauthCompatRef.current;
-    setOauthMsg(compat ? '正在打开 Qoder 授权页（兼容模式）…' : '正在打开 Qoder 授权页…');
+    setOauthMsg(compat ? '正在打开 Qoder 登录页（兼容模式）…' : '正在打开 Qoder 登录页…');
     if (compat) pushToast('info', '本次 OAuth 使用兼容模式（不带 client_id），用于绕过授权页「参数无效」');
     setOauthUrl(null);
     setShowOauth(true);
@@ -952,6 +952,38 @@ export default function QoderAccounts() {
                             IDE 登录中
                           </Badge>
                         )}
+                        {/* 快照健康度（双端）：切换后登录身份未确认 → 红色警示；健康 → 灰色快照态（含保存时间） */}
+                        {a.snapshot_verify_failed_at_ms != null && (
+                          <Badge
+                            tone="red"
+                            title={`IDE 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_at_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            IDE 快照验证失败
+                          </Badge>
+                        )}
+                        {a.snapshot_verify_failed_work_at_ms != null && (
+                          <Badge
+                            tone="red"
+                            title={`Work 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_work_at_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            Work 快照验证失败
+                          </Badge>
+                        )}
+                        {a.snapshot_verify_failed_at_ms == null &&
+                          a.snapshot_verify_failed_work_at_ms == null &&
+                          (a.snapshot_saved_at_ms != null || a.snapshot_saved_at_work_ms != null) && (
+                            <Badge
+                              tone="slate"
+                              title={[
+                                a.snapshot_saved_at_ms != null && `IDE 快照保存于 ${new Date(a.snapshot_saved_at_ms).toLocaleString('zh-CN')}`,
+                                a.snapshot_saved_at_work_ms != null && `Work 快照保存于 ${new Date(a.snapshot_saved_at_work_ms).toLocaleString('zh-CN')}`,
+                              ]
+                                .filter(Boolean)
+                                .join('；')}
+                            >
+                              快照✓
+                            </Badge>
+                          )}
                       </div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>
@@ -963,6 +995,8 @@ export default function QoderAccounts() {
                           void api.qoder.accountMove(a.id, gid).then(() => {
                             setAccounts((prev) => prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)));
                             reloadGroups();
+                            // 审查修复（L38）：行内分组调整成功补可见反馈（原先仅失败有提示）
+                            pushToast('success', `「${a.nickname || a.id}」分组已调整`);
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
                       />

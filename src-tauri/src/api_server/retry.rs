@@ -30,22 +30,33 @@ pub fn is_thinking_signature_error(body: &str) -> bool {
 pub fn is_illegal_channel_error(body: &str) -> bool {
     body.contains("Illegal API invocation")
         || body.contains("unapproved channel")
-        || contains_code_11128(body)
+        || contains_code_value(body, "11128")
 }
 
-/// `"code": 11128` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
+/// 11140 账号级风控识别（issue #136 反馈）：上游判定「账号存在异常行为，
+/// 已被限制使用」，账号整体被限制、需申诉恢复。与 11128 渠道级（按请求
+/// 指纹、与账号无关、换号无意义）相反——11140 换号有意义，受限账号由
+/// classify → Forbidden 禁用（内存态，无手动启用入口——申诉处理后重启
+/// 应用或重新登录账号即随池快照重建恢复调度）。
+/// 中文关键词 + code 数字边界匹配（报文可能只带关键词或只带 code）
+pub fn is_account_restricted_error(body: &str) -> bool {
+    body.contains("账号存在异常")
+        || body.contains("已被限制使用")
+        || contains_code_value(body, "11140")
+}
+
+/// `"code": <code>` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
 /// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
 /// `some_code` 等字段名
-fn contains_code_11128(body: &str) -> bool {
+fn contains_code_value(body: &str, code: &str) -> bool {
     const KEY: &str = "\"code\"";
-    const CODE: &str = "11128";
     let mut rest = body;
     while let Some(pos) = rest.find(KEY) {
         let after_key = rest[pos + KEY.len()..].trim_start();
         if let Some(after_colon) = after_key.strip_prefix(':') {
             let after_colon = after_colon.trim_start();
-            if let Some(tail) = after_colon.strip_prefix(CODE) {
+            if let Some(tail) = after_colon.strip_prefix(code) {
                 if !tail.starts_with(|c: char| c.is_ascii_digit()) {
                     return true;
                 }
@@ -74,12 +85,18 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
     if status == 400 && super::is_credit_exhausted_error(body) {
         return RetryAction::SwitchKey;
     }
+    // 400 + 11140 账号级风控（issue #136 反馈）：账号被上游限制使用，与 11128
+    // 渠道级相反——换号有意义（受限账号由 classify → Forbidden 禁用），
+    // Fatal 会把请求卡死在受限账号上每问必败
+    if status == 400 && is_account_restricted_error(body) {
+        return RetryAction::SwitchKey;
+    }
     match status {
         // 429：优先 Retry-After；缺省线性退避 1/2/3s；耗尽后换号
         429 => {
             // 6004 限额（消息含「将在 … UTC+8 重置」可解析恢复时刻）：账号配额
             // 耗尽至恢复时刻，同号重试（Retry-After 钳 60s ×3）纯浪费 ~3 分钟
-            // → 直接换号（2026-10-19 实测复盘）
+            // → 直接换号（2026-10-19 实测复盘，3.8.5 移植）
             if super::wb_route::parse_quota_reset_at(body).is_some() {
                 return RetryAction::SwitchKey;
             }
@@ -165,21 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn quota_reset_429_switches_key_immediately() {
-        // 6004 限额文案（恢复时刻取未来 1 小时，满足「未来且 ≤7 天」钳制）：
-        // 账号配额耗尽至恢复时刻，同号重试无意义 → 直接换号
-        let reset = (chrono::Utc::now() + chrono::Duration::hours(1))
-            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
-        let body = format!("触发限额，将在 {} UTC+8 重置", reset.format("%Y-%m-%d %H:%M:%S"));
-        assert_eq!(retry_plan(429, &body, 0, Some(61_551)), RetryAction::SwitchKey);
-        // 普通限频 429（无可解析恢复时刻）→ 维持 Retry-After 退避语义
-        assert_eq!(
-            retry_plan(429, "rate limited", 0, Some(7)),
-            RetryAction::RetrySame { delay_ms: 7000 }
-        );
-    }
-
-    #[test]
     fn server_errors_backoff_exponentially() {
         assert_eq!(
             retry_plan(503, "", 0, None),
@@ -235,6 +237,27 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_429_switches_key_immediately() {
+        // 6004 限额文案（恢复时刻取未来 1 小时，满足「未来且 ≤7 天」钳制）：
+        // 账号配额耗尽至恢复时刻，同号重试无意义 → 直接换号
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let body = format!(
+            "触发限额，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(
+            retry_plan(429, &body, 0, Some(61_551)),
+            RetryAction::SwitchKey
+        );
+        // 普通限频 429（无可解析恢复时刻）→ 维持 Retry-After 退避语义
+        assert_eq!(
+            retry_plan(429, "rate limited", 0, Some(7)),
+            RetryAction::RetrySame { delay_ms: 7000 }
+        );
+    }
+
+    #[test]
     fn illegal_channel_code_match_tolerates_whitespace() {
         // 紧凑与空白两种序列化形态均命中（issue #57 审查修复）
         assert!(is_illegal_channel_error(r#"{"error":{"code":11128,"msg":"x"}}"#));
@@ -249,5 +272,33 @@ mod tests {
         // 关键词兜底仍有效
         assert!(is_illegal_channel_error("Illegal API invocation from channel"));
         assert!(!is_illegal_channel_error("normal upstream error"));
+    }
+
+    #[test]
+    fn account_restricted_error_and_retry_plan() {
+        // 11140 账号级风控识别（issue #136 反馈）：code 形态 + 关键词形态
+        assert!(is_account_restricted_error(
+            r#"{"error":{"code":11140,"msg":"账号存在异常行为，已被限制使用"}}"#
+        ));
+        assert!(is_account_restricted_error(
+            "系统检测到该账号存在异常使用行为，如需申诉请提交反馈 11140"
+        ));
+        assert!(is_account_restricted_error("账号已被限制使用"));
+        // 数字边界：更长/相邻数字不误撞
+        assert!(!is_account_restricted_error(r#"{"code":111400}"#));
+        assert!(!is_account_restricted_error(r#"{"code":11141}"#));
+        assert!(!is_account_restricted_error("insufficient credit"));
+        // 400 + 11140 → SwitchKey（换号接替），不得 Fatal 卡死在受限账号
+        assert_eq!(
+            retry_plan(400, r#"{"code":11140,"msg":"账号存在异常行为，已被限制使用"}"#, 0, None),
+            RetryAction::SwitchKey
+        );
+        // 与 11128 渠道级互不误撞
+        assert!(!is_illegal_channel_error(
+            r#"{"code":11140,"msg":"账号存在异常行为"}"#
+        ));
+        assert!(!is_account_restricted_error(
+            r#"{"code":11128,"msg":"request illegal"}"#
+        ));
     }
 }

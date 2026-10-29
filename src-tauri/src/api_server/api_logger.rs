@@ -120,7 +120,7 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error, None)
     }
 
     /// 记录一条 API 请求日志（流式请求带 TTFB 首字耗时字段）
@@ -141,7 +141,28 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, key_name, acct_name, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, key_name, acct_name, error, None)
+    }
+
+    /// 记录一条 API 请求日志（附请求阶段字段，issue #149 P1，custom 池用）：
+    /// `stage`：请求阶段标签（main_first / main / tool / unknown），None 不输出该字段
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_request_stage(
+        &self,
+        pool: &str,
+        method: &str,
+        path: &str,
+        model: &str,
+        stream: bool,
+        status: u16,
+        uid: &str,
+        duration_ms: u64,
+        key_name: &str,
+        acct_name: &str,
+        stage: Option<&str>,
+        error: Option<&str>,
+    ) {
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error, stage)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -159,12 +180,17 @@ impl ApiLogger {
         key_name: &str,
         acct_name: &str,
         error: Option<&str>,
+        stage: Option<&str>,
     ) {
         let (h, m, s) = Self::local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let ttfb_part = match ttfb_ms {
             Some(t) => format!(" ttfb={t}ms"),
+            None => String::new(),
+        };
+        let stage_part = match stage {
+            Some(s) => format!(" stage={s}"),
             None => String::new(),
         };
         let err_part = match error {
@@ -176,9 +202,9 @@ impl ApiLogger {
         let acct_disp = if acct_name.is_empty() { "-" } else { acct_name };
 
         let line = format!(
-            "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}\n",
+            "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}{}\n",
             h, m, s,
-            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, err_part,
+            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, stage_part, err_part,
         );
 
         self.enqueue(line);
@@ -418,7 +444,18 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
                 st.date = today;
             }
             // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
-            Err(_) => {
+            Err(e) => {
+                // 审查修复（L4）：打开失败不再无痕丢整批——stderr + app_log 落一条
+                // 观测行（含丢弃行数与目标路径），防磁盘满/权限故障期间日志静默丢失
+                let msg = format!(
+                    "[api_logger] 打开日志文件失败，丢弃本批 {} 行（path={}）: {e}",
+                    st.queue.len(),
+                    path.display()
+                );
+                eprintln!("{msg}");
+                if let Some(data_dir) = dir.parent() {
+                    crate::fs_utils::app_log(data_dir, &msg);
+                }
                 st.queue.clear();
                 st.date = today;
                 return;

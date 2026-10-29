@@ -174,7 +174,9 @@ fn deep_reward_dig(v: &Value, depth: usize) -> Option<f64> {
     }
 }
 
-/// 递归找余额数值字段：键名含 remaining/balance/capacity（大小写不敏感，排除 total）。
+/// 递归找余额数值字段：键名含 remain/balance（大小写不敏感，排除 total；不含
+/// 裸 capacity——CapacitySize/UsedCapacity 是总量/已用键，当余额即翻倍类错误，
+/// 对齐 wb_credits M3「总量不当余额」原则）。
 /// 用于 billing summary 结构未知时的余额差值兜底（pre/post 同结构，首命中稳定）。
 fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
     if depth > 8 {
@@ -184,9 +186,7 @@ fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
         Value::Object(m) => {
             for (k, val) in m {
                 let kl = k.to_ascii_lowercase();
-                if (kl.contains("remaining") || kl.contains("balance") || kl.contains("capacity"))
-                    && !kl.contains("total")
-                {
+                if (kl.contains("remain") || kl.contains("balance")) && !kl.contains("total") {
                     if let Some(n) = num_or_none(Some(val)) {
                         return Some(n);
                     }
@@ -387,11 +387,10 @@ fn fetch_balance(agent: &ureq::Agent, headers: &[(String, String)], base: &str) 
         return None;
     }
     let b = body?;
-    num_or_none(fs_utils::dig(
-        &b,
-        &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
-    ))
-    .or_else(|| deep_balance_dig(&b, 0))
+    // 与积分页统一解析器（wb_credits::balance_from_summary）：聚合父字段 +
+    // Packages[] 明细并存时不翻倍（issue #120），pre/post 与积分页口径一致；
+    // deep_balance_dig 保留为最后回退。
+    crate::tasks::wb_credits::balance_from_summary(&b).or_else(|| deep_balance_dig(&b, 0))
 }
 
 /// WB credits 域余额（WorkBuddy 积分账本）：billing meter 是通用积分账本，
@@ -509,7 +508,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）。
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
-        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, &aid, &creds);
+        let (new, fail_reason, fail_detail) = wb_common::refresh_token_once_locked(state, agent, &aid, &creds);
         match new {
             Some(new) => {
                 sync_pool_expiry(state, &aid, &new);
@@ -530,10 +529,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
             None => {
                 // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
                 if fail_reason == Some(wb_common::RefreshFail::Auth) {
-                    wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
+                    // issue #118：透传上游 error/error_description，便于区分会话失效与账号封禁
+                    let mut reason = format!("签到 refresh 失败: {message}");
+                    if let Some(d) = fail_detail.as_deref() {
+                        reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
+                    }
+                    wb_common::mark_needs_relogin(state, &aid, &reason);
                 }
                 kind = "fail".into();
-                message = "登录态失效且刷新失败，需重新登录".into();
+                message = match fail_detail.as_deref() {
+                    Some(d) => format!(
+                        "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
+                        wb_common::refresh_fail_hint(d)
+                    ),
+                    None => "登录态失效且刷新失败，需重新登录".into(),
+                };
                 reward = None;
             }
         }
@@ -665,7 +675,7 @@ where
     let (kind, msg) = f(&headers);
     if kind == "auth" {
         // H-1：加锁刷新 + 二次检查 + 内部落库（原 refresh_token_once_ex + 手工 save）
-        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
+        let (new, fail_reason, fail_detail) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
         if let Some(new) = new {
             sync_pool_expiry(state, acct_id, &new);
             let h2 = wb_common::build_auth_headers(&new, false);
@@ -678,11 +688,38 @@ where
             }
             return (kind2, msg2);
         }
-        // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）
-        if fail_reason == Some(wb_common::RefreshFail::Auth) {
-            wb_common::mark_needs_relogin(state, acct_id, &format!("refresh 失败: {msg}"));
+        // 审查修复（M16）：按 RefreshFail 枚举区分文案——仅 Auth/NoRefreshToken 归为
+        // 登录态问题（前者标 needs_relogin，后者无 rt 永不自愈同样标）；Network/
+        // BadResponse/Busy 属瞬时失败（下次调度自然重试），如实报瞬时失败，
+        // 不再渲染成「登录态失效」误导用户去重登
+        let auth_dead = matches!(
+            fail_reason,
+            Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
+        );
+        if auth_dead {
+            // issue #118：透传上游错误细节，便于区分会话失效与账号封禁
+            let mut reason = format!("refresh 失败: {msg}");
+            if let Some(d) = fail_detail.as_deref() {
+                reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
+            }
+            wb_common::mark_needs_relogin(state, acct_id, &reason);
+            let msg_fail = match fail_detail.as_deref() {
+                Some(d) => format!(
+                    "登录态失效且刷新失败；上游: {d}（{}）",
+                    wb_common::refresh_fail_hint(d)
+                ),
+                None => "登录态失效且刷新失败".into(),
+            };
+            return ("fail".into(), msg_fail);
         }
-        return ("fail".into(), "登录态失效且刷新失败".into());
+        let msg_fail = match fail_detail.as_deref() {
+            Some(d) => format!(
+                "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试；上游: {d}（{}）",
+                wb_common::refresh_fail_hint(d)
+            ),
+            None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
+        };
+        return ("fail".into(), msg_fail);
     }
     (kind, msg)
 }

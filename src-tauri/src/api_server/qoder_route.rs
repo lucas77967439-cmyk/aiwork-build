@@ -422,6 +422,10 @@ struct QoderRaceWin {
     /// 胜者信封的 (request_id, session_id, record_id)（G4）：主账号胜 = 主信封 id，
     /// 对冲接管 = 对冲信封 id；记账按胜者落定，与会话行 uid 同源
     session_ids: Option<(String, String, String)>,
+    /// 审查修复（L2）：竞速败者已死标记（EOF/IO/超窗，随 RaceOutcome 透传），
+    /// settle_qoder_hedge 据此对败者补记错误/冷却（镜像 wb_route::settle_hedge）
+    primary_failed: bool,
+    hedge_failed: bool,
 }
 
 /// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
@@ -442,11 +446,14 @@ fn race_qoder_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
+    converted_len: usize,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
-    if hedge_ms == 0 {
+    // issue #138 P1：大 body 跳过首字对冲——对冲需整包重建 agent 信封，
+    // 大包下内存瞬时翻倍，得不偿失（默认 256KiB，与 WB/Trae 池同口径）
+    if hedge_ms == 0 || converted_len > super::routes::HEDGE_SKIP_BODY_BYTES {
         let lines = lines_with_first_byte_timeout(primary_reader)?;
         return Ok(QoderRaceWin {
             lines,
@@ -454,6 +461,8 @@ fn race_qoder_first_byte(
             hedge: None,
             takeover: false,
             session_ids: primary_session_ids.clone(),
+            primary_failed: false,
+            hedge_failed: false,
         });
     }
     let state2 = state.clone();
@@ -466,6 +475,10 @@ fn race_qoder_first_byte(
     let entry2 = entry.clone();
     let mk2 = model_key.to_string();
     let ms2 = model_source.to_string();
+    // 审查修复（L2）：捕获对冲账号 uid（仅建连成功 = 对冲实际发起时记录）——
+    // 双败 Err 路径租约随竞速 Drop、无从取 uid，Err 时据此对对冲侧补记错误
+    let hedge_uid_cell = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let hedge_uid_slot = hedge_uid_cell.clone();
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
@@ -481,6 +494,7 @@ fn race_qoder_first_byte(
         let session_ids = extract_envelope_ids(&converted2);
         let lease = QoderHedgeLease::acquire(&state2, &picked2.uid, session_ids);
         let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
+        *hedge_uid_slot.borrow_mut() = Some(picked2.uid.clone());
         Some((reader2, lease))
     };
     match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
@@ -505,21 +519,39 @@ fn race_qoder_first_byte(
                 hedge: out.hedge,
                 takeover: out.takeover,
                 session_ids,
+                primary_failed: out.primary_failed,
+                hedge_failed: out.hedge_failed,
             })
         }
-        Err(()) => Err(()),
+        Err(()) => {
+            // 审查修复（L2）：双败时对冲侧同样记 Server 错误（主侧由调用方按
+            // picked.uid 记，与本处对齐）——镜像 wb_route::race_first_byte
+            if let Some(huid) = hedge_uid_cell.borrow().as_deref() {
+                state.qoder_pool.note_error(huid, ErrKind::Server);
+            }
+            Err(())
+        }
     }
 }
 
 /// 竞速结束后处理对冲计数与日志（镜像 wb_route::settle_hedge）：
 /// 释放对冲账号竞速窗口占用；接管时 guard 重绑到对冲账号；[SCHED] 日志记录
-/// hedge_takeover / hedge_lost
+/// hedge_takeover / hedge_lost；审查修复（L2）：竞速败者记账——已死一侧
+/// （EOF/IO/超窗）补记 Server 错误触发冷却，仅「输竞速但未死」一侧不记
 fn settle_qoder_hedge(
     state: &ApiSharedState,
     win: &mut QoderRaceWin,
     mut guard: InflightGuard,
     primary_uid: &str,
 ) -> InflightGuard {
+    if win.primary_failed {
+        state.qoder_pool.note_error(primary_uid, ErrKind::Server);
+    }
+    if win.hedge_failed {
+        if let Some(lease) = win.hedge.as_ref() {
+            state.qoder_pool.note_error(&lease.uid, ErrKind::Server);
+        }
+    }
     let Some(lease) = win.hedge.take() else {
         return guard;
     };
@@ -772,16 +804,14 @@ fn run_qoder_stream(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
+                    // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                    // （kind=empty），返回日志注记供反查漏网触发句
+                    let sample_note =
+                        super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{sample_note}",
                         tried.len(),
                         empty_hits,
-                        // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（三池同口径）
-                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
-                            format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(body_vec))
-                        } else {
-                            String::new()
-                        }
                     ));
                     let err_body = json!({
                         "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
@@ -919,6 +949,7 @@ fn run_qoder_stream(
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
                         &envelope_ids,
+                        converted.len(),
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1397,14 +1428,16 @@ pub async fn qoder_aggregate_chat(
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
-                        // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
-                        // [DEBUG] 行，就地补齐；三池同口径）
-                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                        // （kind=empty，非流式路径无收尾 [DEBUG] 行，就地补齐；三池同口径）
+                        let sample_note = super::wb_payload::empty_sample_note(
+                            &exhaust_tag, "qoder", &body_vec,
+                        );
+                        if !sample_note.is_empty() {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{sample_note}",
                                 tried.len(),
                                 empty_hits,
-                                super::wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
                         return Err(exhaust_msg);
@@ -1495,6 +1528,7 @@ pub async fn qoder_aggregate_chat(
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
                             &envelope_ids,
+                            converted.len(),
                         ) {
                             Ok(w) => w,
                             Err(()) => {

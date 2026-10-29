@@ -25,6 +25,8 @@ pub const ROW_TABLES: &[&str] = &[
     "doubao_accounts",
     "wb_accounts",
     "wb_tokens",
+    "buddy_ai_accounts",
+    "buddy_ai_tokens",
     "qoder_accounts",
     "qoder_tokens",
     "qoder_checkin_results",
@@ -80,6 +82,18 @@ const DDL: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE TABLE IF NOT EXISTS wb_tokens (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）：与 wb 池表结构同构、
+    // 零共享——账号池 + token store 双表独立，杜绝混居（§3.1 硬约束 1）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_accounts (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS buddy_ai_tokens (
         pk         TEXT PRIMARY KEY,
         data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -174,6 +188,26 @@ const DDL: &[&str] = &[
         message TEXT NOT NULL DEFAULT '',
         reward  REAL
     )",
+    // buddy-ai 每日活跃打卡结果（P2 对齐国内 wb_checkin_results：日期趋势/日历/结果列表数据源）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_checkin_results (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        date    TEXT NOT NULL DEFAULT '',
+        time    TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        name    TEXT NOT NULL DEFAULT '',
+        status  TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        reward  REAL
+    )",
+    // P8：buddy-ai 每日积分快照（同日覆盖 + 365 天裁剪；镜像 wb_credits_history，
+    // 积分看板趋势曲线数据源——打卡回写与手动同步双挂点保证有数据的天不缺格）
+    "CREATE TABLE IF NOT EXISTS buddy_ai_credits_history (
+        date          TEXT PRIMARY KEY,
+        ts            INTEGER NOT NULL DEFAULT 0,
+        total_balance REAL NOT NULL DEFAULT 0,
+        accounts      TEXT NOT NULL DEFAULT '[]',
+        earned        REAL
+    )",
     "CREATE TABLE IF NOT EXISTS doubao_health_events (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL
@@ -232,6 +266,27 @@ const DDL: &[&str] = &[
         record_id   TEXT NOT NULL DEFAULT ''
     )",
     "CREATE INDEX IF NOT EXISTS idx_qoder_sessions_date ON qoder_sessions(date)",
+    // issue #149 P2：custom 网关请求级会话流水（自研用量低频，无 compact 定时合并，
+    // 仅 90 天保留期裁剪）。request_id 内部生成 uuid（custom 上游无信封可取，纯 INSERT）；
+    // session_id = conversation_key（"cv|" 前缀，前 2 条消息指纹，跨轮稳定）；
+    // stage = 请求阶段（main_first/main/tool/unknown）；uid 落 key_id，key_name = Key 展示名。
+    "CREATE TABLE IF NOT EXISTS custom_sessions (
+        request_id  TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL DEFAULT '',
+        uid         TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL,
+        ts          INTEGER NOT NULL DEFAULT 0,
+        model       TEXT NOT NULL DEFAULT '',
+        stage       TEXT NOT NULL DEFAULT '',
+        key_name    TEXT NOT NULL DEFAULT '',
+        pt          INTEGER NOT NULL DEFAULT 0,
+        ct          INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        stream      INTEGER NOT NULL DEFAULT 0,
+        ok          INTEGER NOT NULL DEFAULT 1,
+        preview     TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_custom_sessions_date ON custom_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
     "CREATE TABLE IF NOT EXISTS sticky_bindings (
         key        TEXT PRIMARY KEY,
@@ -243,6 +298,7 @@ const DDL: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS idx_credits_history_date ON credits_history(date)",
     "CREATE INDEX IF NOT EXISTS idx_wb_checkin_results_date ON wb_checkin_results(date)",
+    "CREATE INDEX IF NOT EXISTS idx_buddy_ai_checkin_results_date ON buddy_ai_checkin_results(date)",
     "CREATE INDEX IF NOT EXISTS idx_checkin_results_day ON checkin_results(day)",
 ];
 

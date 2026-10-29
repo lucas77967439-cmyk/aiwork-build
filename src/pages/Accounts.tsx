@@ -515,6 +515,24 @@ export default function Accounts() {
                             Trae 登录中
                           </Badge>
                         )}
+                        {/* 快照健康度：切换后登录身份未确认 → 红色警示；健康 → 灰色快照态（含保存时间） */}
+                        {a.snapshot_verify_failed_at_ms != null ? (
+                          <Badge
+                            tone="red"
+                            title={`最近一次切换后未确认登录身份（${new Date(a.snapshot_verify_failed_at_ms).toLocaleString('zh-CN')}）：快照登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            快照验证失败
+                          </Badge>
+                        ) : (
+                          a.snapshot_saved_at_ms != null && (
+                            <Badge
+                              tone="slate"
+                              title={`登录态快照最近保存于 ${new Date(a.snapshot_saved_at_ms).toLocaleString('zh-CN')}`}
+                            >
+                              快照✓
+                            </Badge>
+                          )
+                        )}
                       </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>
@@ -611,7 +629,14 @@ export default function Accounts() {
                             否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
                           <button
-                            title={switchingTo || savingLogin ? '切换/保存进行中，暂不能续期' : '续期 JWT（启动代理并切换账号）'}
+                            /* issue #126 语义澄清：本按钮是「被动捕获」，依赖 TRAE 重新鉴权才有新 JWT */
+                            title={
+                              switchingTo || savingLogin
+                                ? '切换/保存进行中，暂不能续期'
+                                : a.has_refresh_token
+                                  ? '续期 JWT（启动代理并切换账号捕获；JWT 仍有效时抓不到新凭证，请改用「刷新 JWT」）'
+                                  : '重新捕获 JWT（仅当 JWT 已失效、TRAE 重新鉴权时才能捕获新凭证；凭证仍有效请保持代理开启等待过期自动续期，或重新 OAuth 登录）'
+                            }
                             onClick={() => void renewJwt(a.user_id)}
                             disabled={busy}
                             className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"
