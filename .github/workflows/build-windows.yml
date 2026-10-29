@@ -63,7 +63,10 @@ jobs:
         run: cargo test --workspace
 
       # portable zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
+      # 2026-10-29：改为非致命——portable zip 是可选产物（更新器只装 setup/msi，
+      # 清单生成也允许缺失时跳过），其打包失败不应阻断安装包发布。
       - name: Package portable zip
+        continue-on-error: true
         run: node scripts/package_portable.mjs
 
       # 审查 M15：统一命名 + 生成发布校验清单 latest.json（单一清单原则，
@@ -77,7 +80,8 @@ jobs:
           mkdir -p release/windows
           cp release/*_x64-setup.exe release/windows/
           cp release/*_x64_zh-CN.msi release/windows/
-          cp release/*_x64_portable.zip release/windows/
+          # portable zip 可选（打包步骤为非致命），缺失时跳过而不失败
+          cp release/*_x64_portable.zip release/windows/ 2>/dev/null || echo "portable zip 缺失，跳过"
           cp release/latest.json release/windows/
 
       - name: Upload build artifacts
