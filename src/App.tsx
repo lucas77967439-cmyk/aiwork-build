@@ -141,12 +141,15 @@ export default function App() {
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <TitleBar />
-      <div className="flex min-h-0 flex-1">
-        <Sidebar view={view} onNav={setView} />
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          <TopBar />
-          <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
-        </main>
+      {/* issue #152：横向滚动容器。视口 < --app-min-width 时内容行整体滚动，不再挤压布局 */}
+      <div className="min-h-0 flex-1 overflow-x-auto">
+        <div className="flex h-full min-w-[var(--app-min-width)]">
+          <Sidebar view={view} onNav={setView} />
+          <main className="relative flex min-w-0 flex-1 flex-col">
+            <TopBar />
+            <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
+          </main>
+        </div>
       </div>
       <Toaster />
       {/* 全局 API 管理弹窗（任意 activeApp 视图均可打开，unified-api-gateway-design §5.2） */}
