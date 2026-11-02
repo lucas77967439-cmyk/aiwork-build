@@ -60,8 +60,13 @@ jobs:
 
       # 审查 M15：统一命名 + 生成发布校验清单 latest.json（单一清单原则，
       # updater.rs fail-closed 依赖：清单缺失/版本不符/哈希不匹配均拒绝更新）
+      # 2026-11-03：去掉 --strict（与上游 build-macos.yml 同口径）。3.8.8 的
+      # rename_release.mjs 新增了 dmg 产物检查，而 Windows 构建机不产出 dmg →
+      # missing 非空 → --strict 直接退出 1，导致本步失败、后续上传与发布全被跳过
+      #（Run #15 即因此失败）。必需产物（Windows：exe/msi）仍由脚本内的
+      # REQUIRED_ON_THIS_HOST 判定并 die，保护不降级。
       - name: Rename release artifacts + generate latest.json
-        run: node scripts/rename_release.mjs --strict
+        run: node scripts/rename_release.mjs
 
       - name: Stage artifacts (release/windows)
         shell: bash
