@@ -515,9 +515,10 @@ fn analyze_login_sessions(user_data: &std::path::Path) -> LoginSessionAnalysis {
 }
 
 /// 豆包客户端 User Data 目录（Live 态，登录 Cookie/uid 检测用）。
+/// 单一事实源 switcher::profile::doubao_data_dir（Windows 带 User Data 层，
+/// mac 直挂 ~/Library/Application Support/Doubao——合并审查 #1）
 fn doubao_live_user_data_dir() -> Option<PathBuf> {
-    let localappdata = std::env::var("LOCALAPPDATA").ok()?;
-    let dir = PathBuf::from(localappdata).join("Doubao").join("User Data");
+    let dir = crate::switcher::profile::doubao_data_dir();
     dir.exists().then_some(dir)
 }
 
@@ -624,7 +625,7 @@ pub(crate) fn probe_live_session_alive(user_id: &str) -> Result<(), String> {
 /// 返回 Err(原因) = 确认无登录会话/游客态；Ok(()) = 放行（含检测不可用 fail-open）。
 pub(crate) fn ensure_live_has_login_session() -> Result<(), String> {
     let Some(dir) = doubao_live_user_data_dir() else {
-        return Err("未找到豆包客户端数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".to_string());
+        return Err("未找到豆包客户端数据目录，请先安装并登录豆包".to_string());
     };
     match analyze_login_sessions(&dir) {
         LoginSessionAnalysis::LoggedIn => Ok(()),
@@ -653,31 +654,19 @@ fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
 }
 
 /// 从代理抓包凭证读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）。
-/// SQLite 化（P3）：kv `doubao_captured_credentials`。
+/// 凭证只进 vault（审查 P2 收敛）：经 vault::doubao_captured_get 优先读 vault ns，
+/// 兼容回退旧 kv 一次。
 fn read_captured_uid(state: &State<AppState>) -> Option<String> {
-    let v = read_captured_credentials(&state.data_dir);
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     let uid = v.get("uid")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
-}
-
-/// 读代理抓包凭证（凭证收敛 P1-7）：vault ns "doubao"/"captured" 优先，回退旧
-/// 明文 kv（迁移前存量，启动迁移后即抹除）；均无返回 Null。新写入只进 vault
-pub(crate) fn read_captured_credentials(data_dir: &std::path::Path) -> serde_json::Value {
-    if let Some(v) = crate::vault::ns_get(data_dir, "doubao", "captured") {
-        return v;
-    }
-    crate::store::db(data_dir).kv_get("doubao_captured_credentials")
 }
 
 /// 来源①：从 User Data/Local State 的 profile.info_cache 取最近活跃 Profile 的 saman.user_id。
 /// 文件缺失/无 saman 块/解析失败返回 Ok(None)。
 fn detect_uid_from_local_state() -> Result<Option<String>, String> {
-    let localappdata =
-        std::env::var("LOCALAPPDATA").map_err(|e| format!("读取 LOCALAPPDATA 环境变量失败: {e}"))?;
-    let path = PathBuf::from(localappdata)
-        .join("Doubao")
-        .join("User Data")
-        .join("Local State");
+    // 单一事实源（合并审查 #1：mac 无 User Data 层，原手拼 join 在 mac 恒 miss）
+    let path = crate::switcher::profile::doubao_data_dir().join("Local State");
     if !path.exists() {
         return Ok(None);
     }
@@ -749,8 +738,9 @@ fn pick_uid_from_info_cache(v: &serde_json::Value) -> Option<String> {
 
 /// 从 public_config.json 全树递归收集 uid 候选并择优。文件缺失/解析失败返回 Ok(None)。
 fn detect_uid_from_public_config() -> Result<Option<String>, String> {
-    let appdata = std::env::var("APPDATA").map_err(|e| format!("读取 APPDATA 环境变量失败: {e}"))?;
-    let path = PathBuf::from(appdata).join("Doubao").join("public_config.json");
+    let base = crate::platform::app_support_root()
+        .map_err(|e| format!("读取应用数据根目录失败: {e}"))?;
+    let path = base.join("Doubao").join("public_config.json");
     if !path.exists() {
         return Ok(None);
     }
@@ -1053,8 +1043,8 @@ pub struct DoubaoCapturedCredential {
 
 #[tauri::command]
 pub fn doubao_captured_credential(state: State<AppState>) -> Result<Option<DoubaoCapturedCredential>, String> {
-    // 凭证收敛（P1-7）：vault 优先，回退旧明文 kv
-    let v = read_captured_credentials(&state.data_dir);
+    // 凭证只进 vault（审查 P2 收敛）：优先 vault ns，兼容回退旧 kv 一次
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     if v.is_null() {
         return Ok(None);
     }
@@ -1198,8 +1188,12 @@ pub fn doubao_account_get_credential(
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
 #[tauri::command]
 pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
-    // 读最新抓包凭证（凭证收敛 P1-7：vault 优先，回退旧明文 kv）
-    let v = read_captured_credentials(&state.data_dir);
+    // 读-改-写互斥：罩住 凭证/uid 读取→load→幂等检查→apply_credential（内含 save）段，
+    // 防旧副本整文档覆盖；凭证与 uid 同锁内读取——两者同源于抓包文件，若锁外/锁内
+    // 各读一次，窗口期可能拼出「A 凭证 + B uid」的跨账号污染（审查 P2）
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 读最新抓包凭证（凭证只进 vault，审查 P2 收敛：优先 vault ns，兼容回退旧 kv 一次）
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     if v.is_null() {
         return Ok(None);
     }
@@ -1227,8 +1221,6 @@ pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<Str
         .unwrap_or_default()
         .to_string();
 
-    // 读-改-写互斥：罩住 load→幂等检查→apply_credential（内含 save）段，防旧副本整文档覆盖
-    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     // 目标账号 = 抓包文件自带的 uid（代理 MITM 层用该请求 Cookie 里的 multi_sids
     // 按 **同一条 sessionid** 匹配出的主人）——凭证与归属天然自洽，不允许跨来源拼装。
@@ -1335,6 +1327,7 @@ fn schtasks_create_failure(state: &State<AppState>, task: &str, stderr: &str) ->
 /// 启动豆包 8s 联网滑动续期后关闭，switcher Rust 化后不再依赖 PS 桥）
 #[tauri::command(async)]
 pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 审查修复（命令注入）：原 contains(':')/len 弱校验可被 "12:3&calc" 绕过，改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
@@ -1368,6 +1361,7 @@ pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Resul
 /// 查询豆包续期计划任务状态（存在与否 + 触发时间）
 #[tauri::command(async)]
 pub fn doubao_renew_task_status(_state: State<AppState>) -> Result<String, String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_TASK_NAME;
     let (ok, stdout, _stderr) =
         crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
@@ -1382,6 +1376,7 @@ pub fn doubao_renew_task_status(_state: State<AppState>) -> Result<String, Strin
 /// 注销豆包续期计划任务
 #[tauri::command(async)]
 pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_TASK_NAME;
     let (ok, _stdout, stderr) =
         crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;
@@ -1399,6 +1394,7 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
 /// 注册豆包额度巡检每日计划任务（schtasks 直调主 exe CLI 任务模式，原 python doubao_quota.py --all 已 Rust 化）
 #[tauri::command(async)]
 pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 审查修复（命令注入）：同上，弱校验改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
@@ -1426,6 +1422,7 @@ pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Resul
 /// 查询豆包额度巡检计划任务状态
 #[tauri::command(async)]
 pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
     let (ok, stdout, _stderr) =
         crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
@@ -1439,6 +1436,7 @@ pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, Strin
 /// 注销豆包额度巡检计划任务
 #[tauri::command(async)]
 pub fn doubao_quota_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
     let (ok, _stdout, stderr) =
         crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;
@@ -1590,10 +1588,10 @@ pub fn doubao_snapshot_meta(state: State<AppState>, user_id: String) -> Result<O
 // 独立备份 = 把这些本地状态复制到 data/doubao_chats/<uid>/，与快照解耦：
 // 重装/换机后先恢复对话数据再登录，客户端体验立即可用；配合云端同步，对话不丢。
 
-/// 豆包 User Data 目录（与 env.rs 安装探测一致的默认位置）
+/// 豆包 User Data 目录（单一事实源 switcher::profile::doubao_data_dir，
+/// 合并审查 #1：Windows 带 User Data 层，mac 直挂 Doubao 根）
 fn doubao_user_data_dir() -> PathBuf {
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    PathBuf::from(local).join("Doubao").join("User Data")
+    crate::switcher::profile::doubao_data_dir()
 }
 
 /// 对话数据备份根目录：data/doubao_chats/<uid>/
@@ -1644,7 +1642,7 @@ pub fn doubao_chatdata_backup(state: State<AppState>, user_id: String) -> Result
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let user_data = doubao_user_data_dir();
     if !user_data.is_dir() {
-        return Err("未找到豆包数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".into());
+        return Err("未找到豆包数据目录，请先安装并登录豆包".into());
     }
     let sources = chat_source_dirs(&user_data);
     if sources.is_empty() {

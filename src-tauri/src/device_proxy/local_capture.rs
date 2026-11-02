@@ -2,12 +2,20 @@
 //!
 //! 背景：当前版本 TRAE 的鉴权请求(api.trae.cn)不走系统代理，MITM 代理抓不到
 //! Cloud-IDE-JWT。但 TRAE 把登录态存在本地 Cookies(Chromium 格式)与 Local Storage
-//! leveldb，此处直接解密提取并经 [`handler::update_account_jwt`] 写回
-//! checkin_accounts.json，作为代理方案的兜底（仅 Windows）。
+//! leveldb，此处直接解密提取并经 [`handler::update_account_jwt`] 写回账号表，
+//! 作为代理方案的兜底（Windows + macOS 双平台）。
+//!
+//! 平台差异（均为 Chromium os_crypt 惯例）：
+//! - Windows：Local State `os_crypt.encrypted_key`（DPAPI）→ AES-256-GCM（'v10'）；
+//!   旧格式直接 DPAPI。目录 `%APPDATA%/{TRAE SOLO CN, Trae CN}`。
+//! - macOS：Keychain `<App> Safe Storage`（account="Chrome"，跨应用读取会触发
+//!   钥匙串授权弹窗）→ PBKDF2-HMAC-SHA1(salt="saltysalt", 1003 轮) → AES-128-CBC
+//!  （'v10'，IV=16×空格，PKCS7）。目录 `~/Library/Application Support/{TRAE SOLO CN, Trae CN}`。
+//! - leveldb 明文扫描双平台同款。
 //!
 //! 入口：CLI 任务模式 `--task-run trae-capture-local`（对齐原 `python device_proxy.py
-//! --capture-local` 手动兜底用法）。扫描 Trae 客户端（双应用合并后唯一客户端）数据
-//! 目录，设置 TRAE_APP_DIR 时只扫指定目录。
+//! --capture-local` 手动兜底用法）；另被 refresh_jwt 失败后的本地恢复自动调用。
+//! 扫描 Trae 客户端（双应用合并后唯一客户端）数据目录，设置 TRAE_APP_DIR 时只扫指定目录。
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +24,7 @@ use crate::state::AppState;
 use super::handler::{extract_user_id, update_account_jwt, valid_cloud_ide_jwt, ProxyCtx};
 
 /// 候选应用数据目录（双应用合并后仅 Trae CN）；设置 TRAE_APP_DIR 时只扫指定目录
+#[cfg(windows)]
 fn trae_app_dirs() -> Vec<PathBuf> {
     if let Ok(env) = std::env::var("TRAE_APP_DIR") {
         if !env.is_empty() {
@@ -27,6 +36,24 @@ fn trae_app_dirs() -> Vec<PathBuf> {
         return vec![];
     }
     vec![Path::new(&base).join("Trae CN")]
+}
+
+/// mac 版候选目录：`~/Library/Application Support/Trae CN`
+///（实测目录结构与 Windows Electron 布局一致：根目录 Cookies + Local Storage + Partitions；
+/// TRAE SOLO CN 已随双应用合并退役，不再扫描）
+#[cfg(target_os = "macos")]
+fn trae_app_dirs() -> Vec<PathBuf> {
+    if let Ok(env) = std::env::var("TRAE_APP_DIR") {
+        if !env.is_empty() {
+            return vec![PathBuf::from(env)];
+        }
+    }
+    let base = std::env::var("HOME").unwrap_or_default();
+    if base.is_empty() {
+        return vec![];
+    }
+    let base = Path::new(&base).join("Library").join("Application Support");
+    vec![base.join("Trae CN")]
 }
 
 /// 离线场景构造 ProxyCtx（复用 handler 的账号写回通路；不启动代理、不 emit 前端事件）
@@ -45,8 +72,7 @@ fn offline_ctx(state: &AppState) -> ProxyCtx {
 }
 
 /// 解密 TRAE 本地 Cookies + 扫描 Local Storage leveldb，提取 Cloud-IDE-JWT 写回
-/// checkin_accounts.json（对齐 Python `capture_from_local`）。返回新增/更新账号数。
-#[cfg(windows)]
+/// 账号表（对齐 Python `capture_from_local`）。返回新增/更新账号数。
 pub fn capture_from_local(state: &AppState) -> Result<serde_json::Value, String> {
     let ctx = offline_ctx(state);
     let mut total = 0usize;
@@ -58,11 +84,6 @@ pub fn capture_from_local(state: &AppState) -> Result<serde_json::Value, String>
     }
     ctx.log.log(&format!("[local] 本地捕获完成，新增/更新 {total} 个账号"));
     Ok(serde_json::json!({ "ok": true, "captured": total }))
-}
-
-#[cfg(not(windows))]
-pub fn capture_from_local(_state: &AppState) -> Result<serde_json::Value, String> {
-    Err("本地捕获仅支持 Windows（需 DPAPI + Chromium Cookies 解密）".into())
 }
 
 // ---------------- Windows 解密细节（对齐 Python _chrome_aes_key/_decrypt_cookie） ----------------
@@ -89,7 +110,57 @@ fn chrome_aes_key(app_dir: &Path) -> Result<Vec<u8>, String> {
     crate::vault::dpapi::unprotect(&raw[5..])
 }
 
-/// 单个 cookie 密文解密：v10 为 AES-256-GCM（'v10'+nonce12+ct+tag16），
+/// mac 版密钥：Keychain `<App> Safe Storage`（Chromium os_crypt_mac，account 固定
+/// "Chrome"）→ PBKDF2-HMAC-SHA1(salt="saltysalt", 1003 轮, 16 字节)。
+/// 首次跨应用读取会弹钥匙串授权弹窗，用户须点「始终允许」。
+/// 审查 F9：条目名按候选应用名兜底——TRAE_APP_DIR 可指向任意目录（如符号链接
+/// 或自定义数据目录），其 file_name() 未必等于真实应用名，逐候选尝试防取钥必败。
+#[cfg(target_os = "macos")]
+fn chrome_aes_key(app_dir: &Path) -> Result<Vec<u8>, String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(n) = app_dir.file_name() {
+        let n = n.to_string_lossy().to_string();
+        if !n.is_empty() {
+            candidates.push(n);
+        }
+    }
+    for known in ["TRAE SOLO CN", "Trae CN"] {
+        if !candidates.iter().any(|c| c == known) {
+            candidates.push(known.to_string());
+        }
+    }
+    let mut last_err: Option<String> = None;
+    for app_name in &candidates {
+        let entry = match keyring::Entry::new(&format!("{app_name} Safe Storage"), "Chrome") {
+            Ok(e) => e,
+            Err(e) => {
+                last_err = Some(format!("打开 Keychain 条目失败（{app_name}）: {e}"));
+                continue;
+            }
+        };
+        match entry.get_password() {
+            Ok(password) => {
+                let mut key = vec![0u8; 16];
+                pbkdf2::pbkdf2::<hmac::Hmac<sha1::Sha1>>(
+                    password.as_bytes(),
+                    b"saltysalt",
+                    1003,
+                    &mut key,
+                )
+                .map_err(|e| format!("PBKDF2 密钥派生失败: {e}"))?;
+                return Ok(key);
+            }
+            Err(e) => {
+                last_err = Some(format!(
+                    "读取 Safe Storage 失败（{app_name}）: {e}（若弹了钥匙串授权框请选「始终允许」后重试）"
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "无候选应用名可尝试".into()))
+}
+
+/// 单个 cookie 密文解密（Windows）：v10 为 AES-256-GCM（'v10'+nonce12+ct+tag16），
 /// 旧格式直接 DPAPI。key 缺失时 v10 放弃（返回 None，调用方回退明文 value）。
 #[cfg(windows)]
 fn decrypt_cookie(enc: &[u8], key: Option<&[u8]>) -> Option<String> {
@@ -105,6 +176,23 @@ fn decrypt_cookie(enc: &[u8], key: Option<&[u8]>) -> Option<String> {
         return Some(String::from_utf8_lossy(&plain).to_string());
     }
     crate::vault::dpapi::unprotect(enc).ok().map(|v| String::from_utf8_lossy(&v).to_string())
+}
+
+/// 单个 cookie 密文解密（macOS）：'v10' + AES-128-CBC（IV=16×空格）+ PKCS7 去填充。
+/// mac 无 DPAPI 旧格式，非 v10 前缀一律 None。
+#[cfg(target_os = "macos")]
+fn decrypt_cookie(enc: &[u8], key: Option<&[u8]>) -> Option<String> {
+    use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+    if enc.len() < 19 || &enc[..3] != b"v10" {
+        return None;
+    }
+    let key = key?;
+    let key: &[u8; 16] = key.try_into().ok()?;
+    type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+    let dec = Aes128CbcDec::new_from_slices(key, &[0x20u8; 16]).ok()?;
+    let mut buf = enc[3..].to_vec();
+    let plain = dec.decrypt_padded_mut::<Pkcs7>(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(plain).to_string())
 }
 
 /// 从一段文本里找 Cloud-IDE-JWT（对齐 Python `_find_cloud_ide_jwt`）：
@@ -136,7 +224,8 @@ fn find_cloud_ide_jwt(blob: &str) -> Option<String> {
 
 /// 对单个应用数据目录执行 Cookies 解密 + leveldb 明文扫描（对齐 Python
 /// `_capture_from_app_dir`）。返回新增/更新账号数。
-#[cfg(windows)]
+/// Cookies 库位置双平台兼容：旧版 Electron 在根目录，新版在 Network/ 子目录，
+/// 另有 Partitions/trae-webview 分区——三处都扫，不存在即跳过。
 fn capture_from_app_dir(ctx: &ProxyCtx, app_dir: &Path) -> Result<usize, String> {
     let mut found = 0usize;
     ctx.log.log(&format!("[local] TRAE 数据目录: {}", app_dir.display()));
@@ -152,8 +241,8 @@ fn capture_from_app_dir(ctx: &ProxyCtx, app_dir: &Path) -> Result<usize, String>
         }
     };
 
-    // 1) Cookies 数据库：主分区 + trae-webview 分区
-    let mut dbs = vec![app_dir.join("Network").join("Cookies")];
+    // 1) Cookies 数据库：根目录（mac 实测位置）+ Network/（新版 Chromium 布局）+ trae-webview 分区
+    let mut dbs = vec![app_dir.join("Cookies"), app_dir.join("Network").join("Cookies")];
     let tw = app_dir.join("Partitions").join("trae-webview").join("Cookies");
     if tw.exists() {
         dbs.push(tw);
@@ -193,11 +282,19 @@ impl Drop for TempDirGuard {
 
 /// 复制 Cookies 库到临时目录后只读打开（规避客户端运行时文件锁；
 /// -wal/-shm 一并复制避免读到未 checkpoint 的空库），返回命中的账号数
-#[cfg(windows)]
 fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usize, String> {
     // 审查修复（L7）：临时目录名改用 uuid 随机——原 pid+纳秒时间戳可被推测，
     // 存在抢先创建/植入文件的竞态；uuid v4 不可预测，TempDirGuard 清理与名字无关
     let td = std::env::temp_dir().join(format!("aw_trae_ck_{}", uuid::Uuid::new_v4()));
+    // 审查 L1：目录权限收紧 0700（内容为用户 Cookies 库副本，敏感）+ 清理挂 Drop
+    // guard——中途 panic/线程中断也保证删除，不再依赖正常路径的 remove_dir_all
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
+        let _ = std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&td).map_err(|e| format!("临时目录创建失败: {e}"))?;
     let _guard = TempDirGuard(td.clone());
     let tmp_db = td.join("Cookies");
@@ -254,7 +351,6 @@ fn scan_cookies_db(ctx: &ProxyCtx, db: &Path, key: Option<&[u8]>) -> Result<usiz
 
 /// leveldb 目录明文扫描：.ldb/.log 文件按字节正则找 `Cloud-IDE-JWT <jwt>`
 ///（对齐 Python：不做结构化解析，命中即写回）
-#[cfg(windows)]
 fn scan_leveldb_dir(ctx: &ProxyCtx, ls: &Path) -> usize {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();

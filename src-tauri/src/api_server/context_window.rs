@@ -172,8 +172,17 @@ pub fn qoder_set(data_dir: &Path, model: &str, tokens: Option<u64>) -> Result<Op
                 "上下文长度需在 {QODER_MIN_TOKENS}~{QODER_MAX_TOKENS} token 之间（收到 {n}）"
             ));
         }
-        if crate::tasks::qoder_upstream::resolve(&id, QoderRegion::Cn).is_none() {
-            return Err(format!("模型 {id} 不在 Qoder 目录中，设置不会生效"));
+        match crate::tasks::qoder_upstream::resolve(&id, QoderRegion::Cn) {
+            None => return Err(format!("模型 {id} 不在 Qoder 目录中，设置不会生效")),
+            // 审查修复：Global 专属条目经 resolve 双区兜底也能命中，但执行面
+            // （entry_is_global_only fail-closed）必 404——放行落库只会产生
+            // 永不生效的休眠条目，写入门控与执行面同口径拒绝；清除不受影响
+            Some(entry) if super::qoder_route::entry_is_global_only(&id, &entry) => {
+                return Err(format!(
+                    "模型 {id} 仅 Qoder Global 区提供（CN 网关暂不执行），设置不会生效"
+                ));
+            }
+            _ => {}
         }
     }
     update_table(data_dir, QODER_KV_KEY, |map: &mut BTreeMap<String, u64>| match tokens {
@@ -366,14 +375,26 @@ mod tests {
         // 整表读-改-写无互斥时，20 线程并发保存全部返回成功但最终只剩少数条目
         // （后写者抹掉先写者）。同时混入锁外热路径读与另一张表的写；断言前不手动
         // 失效——迟到回填的旧快照须已被 config_cache 代际校验丢弃。
-        // qoder_set 受目录门控（审查 Medium）：改用目录内模型 id（canonical 归一
-        // 后去重），20 线程按 i % ids.len() 轮询分配，tokens 绑定 id 序号——并发
-        // 交错下最终值确定，断言「每条都在且值正确」仍能检测丢更新
+        // qoder_set 受目录门控（审查 Medium）：改用目录内 CN 区可执行模型 id
+        // （审查 #5：Global 专属条目会被 qoder_set 拒绝，须按写入门控同口径
+        // 预过滤；canonical 归一后去重），20 线程按 i % ids.len() 轮询分配，
+        // tokens 绑定 id 序号——并发交错下最终值确定，断言「每条都在且值正确」
+        // 仍能检测丢更新
         let dir = tmp_dir("concurrent");
         let trae_ids: Vec<&str> = efforts_ref();
         let qoder_ids: Vec<String> = crate::tasks::qoder_upstream::list()
             .iter()
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            // 与 qoder_set 写入门控同口径：CN 区 resolve 命中且非 Global 专属
+            .filter(|id| {
+                crate::tasks::qoder_upstream::resolve(
+                    id,
+                    crate::tasks::qoder_upstream::QoderRegion::Cn,
+                )
+                .is_some_and(|entry| {
+                    !crate::api_server::qoder_route::entry_is_global_only(id, &entry)
+                })
+            })
             .collect();
         assert!(qoder_ids.len() >= 2, "兜底目录为空，门控测试失去意义");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(60));

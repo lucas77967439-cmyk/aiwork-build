@@ -54,15 +54,20 @@ fn rebuild_body(core: &Value, cm: &CustomModel) -> Vec<u8> {
 }
 
 /// custom 专用 agent（快速失败参数）：连接超时 3s（快速失败切换——连接拒绝/
-/// 3s 超时立即进入组内轮换）/ 写 30s / 空闲读 300s（与 wb_agent 同读口径）
-fn custom_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(300))
-        .timeout_write(std::time::Duration::from_secs(30))
-        .timeout_connect(std::time::Duration::from_secs(3))
-        .max_idle_connections(20)
-        .max_idle_connections_per_host(20)
-        .build()
+/// 3s 超时立即进入组内轮换）/ 写 30s / 空闲读 300s（与 wb_agent 同读口径）。
+/// 审查修复（M-1）：静态复用（OnceLock）——Agent 即连接池宿主，每次请求新建
+/// 会让 max_idle_connections 等池参数形同虚设、每次 attempt 全新 TCP/TLS 握手
+fn custom_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_read(std::time::Duration::from_secs(300))
+            .timeout_write(std::time::Duration::from_secs(30))
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .max_idle_connections(20)
+            .max_idle_connections_per_host(20)
+            .build()
+    })
 }
 
 /// 发起自定义上游请求（Bearer 鉴权；agent 由调用方指定——主路径 custom_agent
@@ -115,7 +120,8 @@ fn classify_failure(status: u16) -> FailKind {
     }
 }
 
-/// 请求日志 acct_name：`name#id前4` 区分同组多条（同名不同上游日志可读性）
+/// 请求日志 acct_name：`name#id第4~7字节` 区分同组多条（同名不同上游日志可读性；
+/// id 形如 `cm-<12hex>`，非标 id 安全回退 name）
 fn acct_display(cm: &CustomModel) -> String {
     match cm.id.get(3..7) {
         Some(s) if !s.is_empty() => format!("{}#{}", cm.name, s),
@@ -161,7 +167,8 @@ fn content_text(content: &Value) -> String {
 }
 
 /// 会话分组键（issue #149 P2）：取前 2 条消息（role|content| 拼接）SHA256 前
-/// 4 字节 hex，"cv|" 前缀。不复用 sticky 指纹（pool_session_key 取前 3 条窗口，
+/// 8 字节 hex，"cv|" 前缀（3.8.5 审查 L1 由 4 字节升级，降碰撞误归并）。不复用
+/// sticky 指纹（pool_session_key 取前 3 条窗口，
 /// 轮 2+ 起 assistant/tool 消息挤入后跨轮不稳定）；前 2 条为对话开场白，多轮间
 /// 稳定不变。
 fn conversation_key(core: &Value) -> String {
@@ -177,7 +184,10 @@ fn conversation_key(core: &Value) -> String {
         feed.push('|');
     }
     let digest = Sha256::digest(feed.as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    // 3.8.5 审查 L1：取 8 字节（64-bit）——4 字节生日碰撞约 6.5 万条开场白即过半，
+    // 碰撞会把两个不同会话在保留期窗口内永久归并且无法拆分。升级边界说明：存量
+    // 行仍是 4 字节键，跨升级边界的同一会话会拆成两条展示，90 天保留期内自愈
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("cv|{hex}")
 }
 
@@ -231,6 +241,7 @@ fn key_allowed_for_custom(state: &Arc<ApiSharedState>, key_id: &str) -> Option<H
 /// 连通性探活（custom_model_test 命令底层）：向自定义上游发一条最小 chat 请求
 /// （max_tokens=16 + stream:true，与网关同款 SSE 处理），返回成功摘要 / 失败原因。
 /// 阻塞调用——调用方需放入 spawn_blocking 并外加超时（命令层 30s）。
+/// B3 审查修复：走 probe_agent 独立短超时（20s），命令层超时后不再有长残留线程
 pub fn probe(cm: &CustomModel) -> Result<String, String> {
     let body = json!({
         "model": cm.name,
@@ -437,12 +448,14 @@ pub fn custom_stream_chat(
                     Ok(lines) => {
                         // 可中断行源：stream_forward_ex 停滞期间周期性检查客户端断连。
                         // 自定义上游无 namespace 展平编码 → 空集合禁用编码名拆分（审查 F4）
-                        // B1：迁 stream_forward_ex 四元组——failed_inline = 流内失败
+                        // B1：迁 stream_forward_ex——failed_inline = 流内失败
                         // （response.failed / error 帧）已就地透传客户端，此时 error_info
-                        // 恒 None，旧三元组仅凭 is_none() 会把流内失败误判成功
-                        let (error_info, sent_any, failed_inline, up_usage) = wb_sse::stream_forward_ex(
-                            lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(), None,
-                        );
+                        // 恒 None，旧三元组仅凭 is_none() 会把流内失败误判成功；
+                        // eof_truncated 沿用 macos_main（审查 #6，记账/日志标注截断）
+                        let (error_info, sent_any, failed_inline, up_usage, eof_truncated) =
+                            wb_sse::stream_forward_ex(
+                                lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(), None,
+                            );
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         // 记账成功口径（对齐 wb_route）：无流内错误且未流内失败
                         let ok = error_info.is_none() && !failed_inline;
@@ -454,6 +467,7 @@ pub fn custom_stream_chat(
                                 super::usage::UsageBucket::Custom,
                                 up_usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0),
                             );
+                            // B1 审查修复：failed_inline 时 error_info=None 但非成功
                             state.record_usage_custom(
                                 &model, &key_id, ok, true,
                                 duration_ms, pt, ct, &session_ctx,
@@ -471,6 +485,10 @@ pub fn custom_stream_chat(
                         }
                         match error_info {
                             None => {
+                                // （合并清理：此臂内原残留一段 failed_inline 处理——已在
+                                // 上方 failed_inline 分支 break，永不可达，属两侧同名修复
+                                // 叠加残留；wb_route.rs 的同名块无提前 break，非死代码，
+                                // 勿连带删除）
                                 // 成功：清熔断 + 记会话粘上游
                                 custom_lb::clear_circuit(&cm.id);
                                 if let Some(sk) = &session_key {
@@ -478,7 +496,9 @@ pub fn custom_stream_chat(
                                 }
                                 state.logger.log_request_stage(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, Some(stage), None,
+                                    duration_ms, &key_name, &acct_name, Some(stage),
+                                    // B1 审查修复：EOF 截断的成功行标注截断（与上游原貌不符，排障可观测）
+                                    eof_truncated.then(|| "上游 EOF 截断（未收到 Done），已按协议补齐终止帧"),
                                 );
                                 break;
                             }
@@ -510,7 +530,9 @@ pub fn custom_stream_chat(
                                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                                 state.logger.log_request_stage(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
+                                    duration_ms, &key_name, &acct_name, Some(stage),
+                                    // 审查修复（M-3）：失败 attempt 错误标注带上游业务码
+                                    Some(&format!("upstream code={} msg={}", code, msg)),
                                 );
                                 // SSE 铁律：sent_any 后就地收尾，不轮换（不拼第二份响应）
                                 attempt += 1;
@@ -571,6 +593,8 @@ pub async fn custom_aggregate_chat(
         let _inflight = guard; // 随聚合完成释放（§4.5）
         // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        // A1 审查修复：Key 白名单约束传入组内选路（含粘性命中过滤）
+        let allowed = key_allowed_for_custom(&state, &key_id);
         let prepared_core = parse_body_once(&body_vec);
         let session_key = super::dispatch::pool_session_key(&prepared_core);
         // issue #149 P1/P2：请求阶段分类 + 会话上下文（loop 外一次，全 attempt 共用）
@@ -587,8 +611,10 @@ pub async fn custom_aggregate_chat(
         let max_attempts = group.len().min(3);
         let mut attempt = 0usize;
         let mut last_err = String::from("自定义上游组内无可用条目");
-        // A1/M-2：命中 Key 的 custom 白名单 loop 外解析一次（constraints_for 缓存读）
-        let allowed = key_allowed_for_custom(&state, &key_id);
+        // 终态 HTTP 状态码（审查修复 M-2：与流式路径口径对齐——组耗尽 503 /
+        // 上游 HTTP 错误透传 status / 首字超时 504 / 空响应与流内错误 502，
+        // 不再一律 502，客户端可按状态码区分失败类别）
+        let mut last_status = 503u16;
 
         loop {
             let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical, allowed.as_ref())
@@ -621,6 +647,7 @@ pub async fn custom_aggregate_chat(
                     );
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = status;
                         break;
                     }
                     continue; // 换组内下一上游
@@ -641,6 +668,7 @@ pub async fn custom_aggregate_chat(
                     last_err = "自定义上游 10 秒内未响应（首字超时）".into();
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = 504;
                         break;
                     }
                     continue;
@@ -706,12 +734,17 @@ pub async fn custom_aggregate_chat(
                     set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                     state.logger.log_request_stage(
                         "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
-                        duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
+                        duration_ms, &key_name, &acct_name, Some(stage),
+                        // 审查修复（M-3）：失败 attempt 错误标注带上游业务码，
+                        // 排障时不被 200（上游 HTTP 层真实状态）误导
+                        Some(&format!("upstream code={} msg={}", code, msg)),
                     );
                     // 本地聚合未向客户端产出任何字节 → 可安全轮换
                     last_err = msg;
                     attempt += 1;
                     if attempt >= max_attempts {
+                        // 流内业务码非 HTTP 状态语义 → 终态按 502 报客户端
+                        last_status = 502;
                         break;
                     }
                 }
@@ -725,6 +758,7 @@ pub async fn custom_aggregate_chat(
                     last_err = "自定义上游返回为空".into();
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = 502;
                         break;
                     }
                 }
@@ -738,7 +772,7 @@ pub async fn custom_aggregate_chat(
             stream,
             last_err,
         ));
-        Err(last_err)
+        Err((last_status, last_err))
     })
     .await;
 
@@ -756,8 +790,6 @@ pub async fn custom_aggregate_chat(
                     &resp,
                     &format!("resp_{}", now_ts()),
                     &model_outer,
-                    // 自定义上游无 namespace 展平编码（Responses 分支为防御性兜底）
-                    &std::collections::HashSet::new(),
                 ),
                 Protocol::OpenAi => resp,
             };
@@ -771,10 +803,15 @@ pub async fn custom_aggregate_chat(
                         .unwrap()
                 })
         }
-        Ok(Err(msg)) => match proto {
-            Protocol::Anthropic => anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &msg),
-            _ => openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &msg),
-        },
+        Ok(Err((status, msg))) => {
+            // 审查修复（M-2）：终态状态码与流式路径口径对齐（组耗尽 503 / 上游
+            // HTTP 错误透传 / 首字超时 504 / 空响应与流内错误 502），不再一律 502
+            let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            match proto {
+                Protocol::Anthropic => anthropic_error(sc, "api_error", &msg),
+                _ => openai_error(sc, "upstream_error", &msg),
+            }
+        }
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

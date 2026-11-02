@@ -213,17 +213,17 @@ impl Store {
         })
     }
 
-    /// 整表替换 + kv 元数据写入（单事务）——审查修复（M7）：「行表 + kv 元数据」
-    /// 原拆为 rows_replace 与 kv_set 两个独立事务提交，进程崩溃/并发竞争下可分叉
-    /// （行表已换新而元数据未写或反之，api_keys 行表与鉴权开关分叉最敏感）。
-    /// 本原语在同一事务内完成两者；kv_content 为最终入库字符串（与 kv_set_raw
-    /// 同语义），Value 形态由调用方在事务外先序列化（对齐 rows_replace 时机）。
+    /// 行表整表替换 + KV 写入的**同事务**原语（审查 M4/M7）：`rows_replace` 与
+    /// `kv_set` 分属两个独立事务，进程崩溃/并发竞争下会留下「表已更新而 kv
+    /// 元数据未更新（或反之）」的永久分叉——最敏感的是 api_keys 表与鉴权开关 kv。
+    /// `kv_content` 为最终入库字符串（与 kv_set_raw 同语义），Value 形态由调用方
+    /// 在事务外先序列化（对齐 rows_replace 时机）；为 None 时仅执行行替换。
     pub fn rows_replace_with_kv(
         &self,
         table: &str,
         rows: &[(String, serde_json::Value)],
         kv_key: &str,
-        kv_content: &str,
+        kv_content: Option<&str>,
     ) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {
             return Err(format!("非法表名: {table}"));
@@ -236,7 +236,8 @@ impl Store {
                 serde_json::to_string(data).map_err(|e| format!("序列化失败: {e}"))?,
             ));
         }
-        let kv_text = kv_content.to_string();
+        let kv_key = kv_key.to_string();
+        let kv_content = kv_content.map(str::to_string);
         self.with_conn(move |c| {
             c.execute_batch(&format!("BEGIN; DELETE FROM [{table}];"))?;
             {
@@ -247,11 +248,13 @@ impl Store {
                     stmt.execute(rusqlite::params![pk, text])?;
                 }
             }
-            c.execute(
-                "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
-                 ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-                rusqlite::params![kv_key, kv_text],
-            )?;
+            if let Some(content) = &kv_content {
+                c.execute(
+                    "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                     ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                    rusqlite::params![kv_key, content],
+                )?;
+            }
             c.execute_batch("COMMIT;")?;
             Ok(())
         })
@@ -280,7 +283,32 @@ impl Store {
         })
     }
 
-    /// 单行删除（白名单表；buddy-ai 迁移/账号移除路径用）
+    /// 单行读取（与 row_upsert 配对的读改写原语；返回行文档 Value，行缺失 → None）
+    pub fn row_get(&self, table: &str, pk: &str) -> Result<Option<serde_json::Value>, String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        // with_conn 闭包错误类型 = rusqlite::Error：闭包内只做裸 rusqlite 查询，
+        // JSON 反序列化移到闭包外转 String
+        let raw: Option<String> = self.with_conn(|c| {
+            let mut stmt =
+                c.prepare(&format!("SELECT data FROM [{table}] WHERE pk = ?1"))?;
+            let mut rows = stmt.query(rusqlite::params![pk])?;
+            match rows.next()? {
+                Some(r) => Ok(Some(r.get::<_, String>(0)?)),
+                None => Ok(None),
+            }
+        })?;
+        match raw {
+            Some(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|e| format!("行文档反序列化失败: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// 单行删除（白名单表，与 row_upsert 配对；buddy-ai 迁移/账号移除路径用，
+    /// 仅移除目标 pk 行，不动其余行）
     pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {
             return Err(format!("非法表名: {table}"));

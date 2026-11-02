@@ -39,8 +39,9 @@ export default function BuddyAiCheckin() {
 
   const load = async () => {
     try {
-      // 审查修复（L24）：原两路 .catch(()=>[]) 吞错，外层 catch 不可达，失败静默空态；
-      // 改为逐路 catch 里 toast 报错后再回落空数组
+      // M8 修复（审查 L24）：原两路 `.catch(()=>[])` 吞掉接口错误后外层 catch
+      // 不可达，双接口失败静默展示「暂无数据」空态；改为逐路 catch 里 toast
+      // 报错后再回落空数组（对齐 Overview 页口径）
       const [accs, recs] = await Promise.all([
         api.buddyai.accountsList().catch((err) => {
           pushToast('error', `账号列表加载失败：${String(err).slice(0, 120)}`);

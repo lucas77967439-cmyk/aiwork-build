@@ -372,8 +372,12 @@ impl ApiPool {
                 //   按 uid 派生（与签到伪设备同一派生体系）。绝不发送空 device_id：
                 //   "x-device-id: ''" 是显性指纹异常，容易在上游形成聚集特征触发影子风控。
                 let (device_id, machine_id) = match device_map.get(uid) {
-                    Some(d) => (d.device_id.clone(), seeded_hex(64, uid, "mach")),
-                    None => (
+                    // 空/空白 device_id（手工登记残缺）视同缺条目回落派生，对齐
+                    // trae_checkin get_device_for 口径——绝不发送空 device_id
+                    Some(d) if !d.device_id.trim().is_empty() => {
+                        (d.device_id.clone(), seeded_hex(64, uid, "mach"))
+                    }
+                    _ => (
                         crate::commands::accounts::derive_device(uid).device_id,
                         seeded_hex(64, uid, "mach"),
                     ),
@@ -441,11 +445,13 @@ impl ApiPool {
         }
     }
 
-    /// Qoder 签到奖励运行期增量回写：credits += delta 并拨新 fetched_at，
-    /// expire 以快照为准不动，不触碰冷却/inflight/禁用等运行态（对齐
-    /// update_credits_snapshot 的拨新纪律）。修复「签到充值成功后账号仍被
-    /// 零积分过滤持续排除到下次快照」（every_hours 2h / daily 档最长约 13.5h
-    /// 的排除窗口）；池内不存在的账号静默跳过（与两回写方法同口径）
+    /// Qoder 签到奖励运行期增量回写（issue #102 补缺）：credits += delta 并拨新
+    /// fetched_at——不拨新则充值/领取到账的账号仍按旧快照被零积分过滤排除，直到
+    /// 下次积分快照（every_hours 2h / daily 档最长约 13.5h 的排除窗口）。
+    /// 与 update_credits_snapshot 不同：**不动 credits_expire_at**（签到奖励不改变
+    /// 订阅/包到期，覆写会丢真值）。credits 为 None 按 0.0 基数兜底，结果钳制非负；
+    /// 不触碰冷却/inflight/禁用等运行态（对齐 update_credits 纪律）；池内不存在
+    /// 的账号静默跳过（与两回写方法同口径）。网关未运行时由调用方跳过（None 句柄）。
     pub fn apply_credits_delta(&self, uid: &str, delta: f64) {
         if delta == 0.0 {
             return;
@@ -1362,7 +1368,8 @@ fn clamp_unfreeze(unfreeze: i64, now: i64) -> i64 {
     unfreeze.clamp(now + 60, now + 7 * 24 * 3600)
 }
 
-/// 次日 04:00（本地东八区，与代码库其它处 local_ts 约定一致）的 Unix 秒
+/// 次日 04:00 的 Unix 秒。固定按北京时区（UTC+8）取日界——上游积分按北京时间重置，
+/// 与运行机器的本地时区无关（注意与代码库其它处 local_ts 的本地时区约定不同）
 pub fn next_0400(now: i64) -> i64 {
     let local = now + 8 * 3600;
     let day_start = local - (local % 86400);

@@ -4,8 +4,10 @@
 //!    cache_read 别名链优先正值（cache_read_input_tokens → prompt_cache_hit_tokens），
 //!    兼容嵌套 prompt_tokens_details / inputTokensDetails；
 //!    cache_write 仅认显式别名（prompt_cache_miss_tokens 是新增输入，不是写入）。
-//! ② `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\<md5(工作区)>
-//!    \<convId>\index.json` 的 `requests[]`（CodeBuddy **IDE** 侧，2026-10-06 接入）——
+//! ② `%LOCALAPPDATA%\CodeBuddyExtension\Data`（mac 为 `~/Library/Application
+//!    Support/CodeBuddyExtension/Data`，真机实测同构）下的
+//!    `<uid>\CodeBuddyIDE\<uid>\history\<md5(工作区)>\<convId>\index.json` 的
+//!    `requests[]`（CodeBuddy **IDE** 侧，2026-10-06 接入）——
 //!    见 `parse_codebuddy_index` 的字段契约与口径说明。
 //!
 //! ⚠ serde 命名约定：输出字段全部 snake_case；响应只含聚合数字，不返回消息正文/凭证。
@@ -347,7 +349,9 @@ impl DayTotals {
 /// 旧条目没有 id 列表无法判重，须强制重解析一次。
 /// 4 → 5（2026-10-10，issue #84 B1）：新增 per-id 明细 `id_stats`（部分重复时内存重建
 /// 过滤结果免重解析），旧条目没有明细须强制重解析一次补齐。
-const PARSE_REV: u32 = 5;
+/// 5 → 6（2026-11-01）：CodeBuddy IDE 源模型归属改为逐请求（messages/<id>.json 的
+/// `extra.modelId`），旧缓存按会话级 `selectedModelId` 记的旧归属须整体重算。
+const PARSE_REV: u32 = 6;
 
 /// 单文件增量缓存条目
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -456,6 +460,8 @@ fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
 // 'local-codebuddy-requests'）：
 //   %LOCALAPPDATA%\CodeBuddyExtension\Data\
 //     <uid>\CodeBuddyIDE\<uid>\history\<md5(工作区路径)>\<会话id>\index.json
+//   mac 基根：~/Library/Application Support/CodeBuddyExtension/Data/（2026-10-09
+//   真机实测同名同构，其余层级与字段契约一致）
 // 会话目录下的 messages/*.json 只有正文（无用量字段），**用量只在会话级 index.json**。
 //
 // 字段契约：
@@ -470,8 +476,10 @@ fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
 //   - `state == "running"` 跳过（进行中，usage 可能只是部分快照）；
 //   - 四类 token 全 0 跳过（对齐 WorkDaddy 的丢弃条件）；
 //   - 日期取 startedAt（<1e12 视为秒 ×1000）；
-//   - 模型取同工作区索引 conversations[].modelMap[type]（回退 modelMap.craft /
-//     selectedModelId）——会话级粒度，会话内换模型不回溯；
+//   - 模型**逐请求**取：`requests[].messages` 的消息 id 直读 `messages/<id>.json`，
+//     其中 assistant 响应 `extra.modelId` 即该请求真实模型（2026-11-01 修复：原按
+//     工作区索引 selectedModelId 整会话归属，用户切换模型后历史请求被整体改写）；
+//     读不到时才回退 conversations[].modelMap[type] / modelMap.craft / selectedModelId；
 //   - 项目维度记常量 `CodeBuddy IDE`（工作区目录名是 md5(cwd)，反查项目名需另读
 //     `%APPDATA%\CodeBuddy CN\codebuddy-sessions.vscdb`，留作后续增强）；
 //   - `usage.credit`（该请求真实扣积分）暂不并入积分统计，避免与官方积分源重复计数。
@@ -494,7 +502,89 @@ fn ms_date(value: &Value) -> Option<String> {
         .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
 }
 
-/// 会话模型：工作区索引 conversations[].modelMap[type] > modelMap.craft > selectedModelId。
+/// 模型名归一：`custom-local:<模型 id>` 是本地自定义路由前缀，底层就是同一个模型，
+/// 不归一会在趋势图里把同一模型裂成两条线（2026-11-01 本机实测存在该形态）。
+fn normalize_model_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if let Some(rest) = trimmed.strip_prefix("custom-local:") {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// 单条消息记录里的真实模型：顶层 `modelId`/`model`，或 `extra`（JSON 字符串）内同名字段。
+/// CodeBuddy IDE 在 assistant 消息的 `extra` 里落 `modelId`（2026-11-01 实测），
+/// user/工具消息不带 → None。
+fn message_model(value: &Value) -> Option<String> {
+    let pick = |v: &Value| -> Option<String> {
+        v.get("modelId")
+            .or_else(|| v.get("model"))
+            .and_then(Value::as_str)
+            .map(normalize_model_name)
+            .filter(|m| !m.is_empty())
+    };
+    if let Some(model) = pick(value) {
+        return Some(model);
+    }
+    // extra 实测为 JSON 字符串（IDE 落盘形态），兼容直接落对象的变体
+    match value.get("extra") {
+        Some(Value::String(extra)) => {
+            let parsed: Value = serde_json::from_str(extra).ok()?;
+            pick(&parsed)
+        }
+        Some(extra @ Value::Object(_)) => pick(extra),
+        _ => None,
+    }
+}
+
+/// 逐请求真实模型（2026-11-01 修复，替代会话级 `selectedModelId` 归属）：
+/// `requests[].messages` 是消息 id 列表，消息正文落 `messages/<id>.json`（文件名即 id，
+/// 无需遍历目录），assistant 响应的 `extra.modelId` 即该请求实际使用的模型。
+/// 只试有限个消息（末尾优先——助手响应在尾部；再补头部 3 条老会话兜底），
+/// 读不到返回 None 由调用方回退会话级模型。
+fn request_model(session_dir: &Path, request: &Map<String, Value>) -> Option<String> {
+    const MAX_TRIES: usize = 6;
+    let ids = request.get("messages").and_then(Value::as_array)?;
+    // 末尾 3 条优先（助手响应在尾部）；头/尾候选各自去重（尾部自身也可能含重复
+    // id——如 messages 尾部 [a, b, a]），免同一消息文件重复读盘
+    let mut candidates: Vec<&str> = Vec::new();
+    for id in ids.iter().rev().take(3) {
+        if let Some(id) = id.as_str() {
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
+        }
+    }
+    for id in ids.iter().take(3) {
+        if let Some(id) = id.as_str() {
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
+        }
+    }
+    for id in candidates.into_iter().take(MAX_TRIES) {
+        // id 直接拼文件名：白名单防 `..`/分隔符构造越界路径
+        if id.is_empty()
+            || id.len() > 64
+            || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        {
+            continue;
+        }
+        let path = session_dir.join("messages").join(format!("{id}.json"));
+        let Ok(raw) = std::fs::read(&path) else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&raw) else { continue };
+        if let Some(model) = message_model(&value) {
+            return Some(model);
+        }
+    }
+    None
+}
+
+/// 会话模型（逐请求模型不可用时的回退）：
+/// 工作区索引 conversations[].modelMap[type] > modelMap.craft > selectedModelId。
 /// `memo` 在同一轮扫描内缓存已解析的工作区索引（同一工作区多个会话共享一次读取）。
 fn conversation_model(
     memo: &mut HashMap<String, Value>,
@@ -523,20 +613,39 @@ fn conversation_model(
                 .and_then(Value::as_str)
                 .or_else(|| model_map.and_then(|m| m.get("craft")).and_then(Value::as_str))
                 .or_else(|| c.get("selectedModelId").and_then(Value::as_str))
-                .map(|s| s.trim().to_string())
+                .map(normalize_model_name)
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "未知模型".to_string())
 }
 
-/// `%LOCALAPPDATA%\CodeBuddyExtension\Data`（CodeBuddy IDE 历史根）；
-/// 缺环境变量或非 Windows 时返回 None（该源整体跳过，不影响另两路）。
+/// CodeBuddy IDE 历史根：Windows=`%LOCALAPPDATA%\CodeBuddyExtension\Data`；
+/// mac=`~/Library/Application Support/CodeBuddyExtension/Data`（2026-10-09 真机
+/// 实测同名同构：`<uid>\<product>\<workspace>\history\<ws-hash>\<session>\index.json`
+/// 七层结构与 `requests[]`/`usage` 字段契约与 Windows 完全一致）；其余平台返回
+/// None（该源整体跳过，不影响另两路）。
 fn codebuddy_ide_root() -> Option<PathBuf> {
-    let dir = std::env::var("LOCALAPPDATA").ok()?;
-    if dir.trim().is_empty() {
-        return None;
+    #[cfg(windows)]
+    {
+        let dir = std::env::var("LOCALAPPDATA").ok()?;
+        if dir.trim().is_empty() {
+            return None;
+        }
+        Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
     }
-    Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
+    #[cfg(target_os = "macos")]
+    {
+        // 与 switcher/authfile.rs::wb_auth_dir 同基根（F-75 跨平台收口）
+        let base = crate::platform::app_support_root_lossy();
+        if base.as_os_str().is_empty() {
+            return None;
+        }
+        Some(base.join("CodeBuddyExtension").join("Data"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// 收集 CodeBuddy IDE 历史下的**会话级** `index.json`。
@@ -667,10 +776,14 @@ fn parse_codebuddy_index(
             continue;
         }
         let req_type = object.get("type").and_then(Value::as_str).unwrap_or("craft");
-        let model = match workspace_dir {
-            Some(ws) => conversation_model(memo, ws, conv_id, req_type),
-            None => "未知模型".to_string(),
-        };
+        // 模型优先逐请求（message 的 extra.modelId）；读不到才回退会话级——
+        // 会话级取的是「当前选中模型」，会话内切换后整段历史都会被改写（2026-11-01 修复）
+        let model = session_dir
+            .and_then(|dir| request_model(dir, object))
+            .or_else(|| {
+                workspace_dir.map(|ws| conversation_model(memo, ws, conv_id, req_type))
+            })
+            .unwrap_or_else(|| "未知模型".to_string());
         let d = DayTotals {
             input: u.input,
             output: u.output,
@@ -751,7 +864,8 @@ fn scan_root(
     view
 }
 
-/// 扫描 CodeBuddy IDE 明细根（`%LOCALAPPDATA%\CodeBuddyExtension\Data`）：
+/// 扫描 CodeBuddy IDE 明细根（Windows=`%LOCALAPPDATA%\CodeBuddyExtension\Data`，
+/// mac=`~/Library/Application Support/CodeBuddyExtension/Data`，见 `codebuddy_ide_root`）：
 /// 会话索引 `requests[]` 与 WorkBuddy 侧合并进同一个「本地源」。
 fn scan_codebuddy_ide(
     root: &Path,
@@ -997,7 +1111,8 @@ fn aggregate_files(
 /// ② `~/.codebuddy/projects`——CodeBuddy CLI 会话 JSONL，本机实测仅有 agent 的
 ///    memory/*.md、零 jsonl（扫描保留以兼容其他环境）；
 /// ③ `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\...\`——
-///    **CodeBuddy IDE 侧**，用量在会话级 `index.json` 的 `requests[]`（见
+///    **CodeBuddy IDE 侧**（mac 基根 `~/Library/Application Support/...`，同构，
+///    见 `codebuddy_ide_root`），用量在会话级 `index.json` 的 `requests[]`（见
 ///    `parse_codebuddy_index`）。此项为本轮新增覆盖：此前误判为「IDE 侧无本地用量」
 ///    （当时只查了 messages/*.json，那里确实只有正文）。
 /// 故「本地源」现为「WorkBuddy 桌面端 + CodeBuddy IDE」口径；未走本地记录的部分
@@ -1035,7 +1150,10 @@ pub(crate) fn buddy_ai_token_stats_impl(state: &AppState, fresh: bool) -> Value 
         }
     }
     let t = Instant::now();
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    // #5（macOS 适配）：USERPROFILE 为 Windows 专属环境变量，macOS 恒不存在 →
+    // home="" → 扫描根退化为相对 CWD 的 .workbuddy-ai/projects，本地 Token 统计
+    // 静默恒零。对齐国内 workbuddy_token_stats_impl 改 crate::platform::home_dir()
+    let home = crate::platform::home_dir();
     let cutoff = cutoff_date_str();
     // 重扫体持表级互斥（对齐国内 workbuddy_token_stats_impl）：async 命令并发
     // （Tab 打开 + 手动重扫）load→scan→save 无锁会互相覆盖丢增量文件条目
@@ -1043,13 +1161,19 @@ pub(crate) fn buddy_ai_token_stats_impl(state: &AppState, fresh: bool) -> Value 
     let mut cache: HashMap<String, FileCacheEntry> =
         crate::store::db(&state.data_dir).kv_get("buddy_ai_token_stats_files");
     let mut seen: HashSet<String> = HashSet::new();
+    let scan_root_path = home.join(".workbuddy-ai").join("projects");
     let mut v = scan_root(
-        &Path::new(&home).join(".workbuddy-ai").join("projects"),
+        &scan_root_path,
         "workbuddy-ai",
         &cutoff,
         &mut cache,
         &mut seen,
     );
+    // 扫描根不存在（客户端未安装/未产生会话）→ 全零结果易被误读为「无用量」，
+    // 附 reason 字段便于排查（对齐 buddy_ai_local_scan 的 reason 口径）
+    if !scan_root_path.is_dir() {
+        v["scanned_reason"] = json!("root_missing");
+    }
     // 已删除文件的缓存条目清理（对齐国内）：否则旧 jsonl 的缓存条目永驻 kv 无限增长
     cache.retain(|k, _| seen.contains(k));
     let _ = crate::store::db(&state.data_dir).kv_set("buddy_ai_token_stats_files", &cache);
@@ -1109,7 +1233,18 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         // 最多一个 TTL）；已过期 → SWR（先回旧值 + 后台重扫，并水合为「立即过期」条目，
         // 后续轮询走上面的内存过期分支免重复读 kv）；完全没有落盘缓存 → 同步全量扫。
         let kv_cached: Value = crate::store::db(&state.data_dir).kv_get(RESULT_KV_KEY);
-        if let Some(payload) = kv_cached.get("payload").filter(|v| v.is_object()) {
+        // rev 校验（对齐文件级缓存的 rev 失效开关，文件级在 aggregate_files 判定）：
+        // 升级（PARSE_REV 变更）后旧落盘结果仍是旧口径（如会话级模型归因），直接
+        // 命中或 SWR 回旧值会让用户在 TTL+后台重扫窗口内看到修复前数据，误判修复
+        // 无效——rev 不匹配视为无缓存，跳过命中与水合走下方同步全量重扫，重扫
+        // 完成后落盘带新 rev，后续请求恢复命中路径
+        let kv_rev_ok =
+            kv_cached.get("rev").and_then(Value::as_u64) == Some(u64::from(PARSE_REV));
+        let payload_hit = kv_cached
+            .get("payload")
+            .filter(|v| v.is_object())
+            .filter(|_| kv_rev_ok);
+        if let Some(payload) = payload_hit {
             let fetched = kv_cached
                 .get("fetched_at_ms")
                 .and_then(Value::as_i64)
@@ -1146,7 +1281,9 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     // 互相覆盖 kv 条目；fresh=false 只读路径（上方缓存命中分支）不进锁，不被阻塞。
     let _guard = TOKEN_STATS_FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    // home 根按平台解析（crate::platform::home_dir）：Windows=USERPROFILE，
+    // macOS=$HOME（mac 数据根实装见 e0762e1）
+    let home = crate::platform::home_dir();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let cutoff = cutoff_date_str();
 
@@ -1159,20 +1296,21 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut merged = scan_root(
-        &Path::new(&home).join(".workbuddy").join("projects"),
+        &home.join(".workbuddy").join("projects"),
         "workbuddy",
         &cutoff,
         &mut cache,
         &mut seen,
     );
     let second = scan_root(
-        &Path::new(&home).join(".codebuddy").join("projects"),
+        &home.join(".codebuddy").join("projects"),
         "codebuddy-cli",
         &cutoff,
         &mut cache,
         &mut seen,
     );
-    // 第三路：CodeBuddy IDE 会话索引 requests[]（%LOCALAPPDATA%\CodeBuddyExtension\Data）
+    // 第三路：CodeBuddy IDE 会话索引 requests[]（Windows=%LOCALAPPDATA%\...，
+    // mac=~/Library/Application Support/...，见 codebuddy_ide_root）
     let third = codebuddy_ide_root()
         .map(|root| scan_codebuddy_ide(&root, &cutoff, &mut cache, &mut seen));
 
@@ -1258,7 +1396,9 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     }
     // 落盘结果缓存（B2，issue #84）：与进程内 RESULT_CACHE 同步写入，
     // 供重启后首个请求直接命中或 SWR 兜底，避免每次启动必然全量重扫。
+    // rev 随结果落盘：读取侧据此在升级后跳过旧口径命中（见上方 kv_rev_ok）。
     let wrapper = json!({
+        "rev": PARSE_REV,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         "payload": merged.clone(),
     });
@@ -1538,6 +1678,187 @@ mod tests {
         assert!(ms_date(&json!({})).is_none());
     }
 
+    /// 2026-11-01 修复回归：模型必须**逐请求**取 `messages/<id>.json` 的 `extra.modelId`，
+    /// 不能按会话当前的 `selectedModelId` 整段归属——用户中途切换模型后，旧请求会被
+    /// 整体改写到最后选中的模型（实测 glm 虚高 6.7 倍）。
+    #[test]
+    fn codebuddy_index_attributes_model_per_request() {
+        let root = std::env::temp_dir().join(format!(
+            "wb_stats_model_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+        let conv = "conv-per-request";
+        let conv_dir = root
+            .join("uA")
+            .join("CodeBuddyIDE")
+            .join("uA")
+            .join("history")
+            .join(ws)
+            .join(conv);
+        let msg_dir = conv_dir.join("messages");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        // 工作区索引：会话**当前**选中 glm（切换后的状态）。旧口径据此把整会话记 glm。
+        std::fs::write(
+            conv_dir.parent().unwrap().join("index.json"),
+            json!({ "conversations": [{ "id": conv, "selectedModelId": "glm-5.3-flash" }] })
+                .to_string(),
+        )
+        .unwrap();
+        let write_msg = |id: &str, model: &str| {
+            std::fs::write(
+                msg_dir.join(format!("{id}.json")),
+                json!({
+                    "id": id,
+                    // extra 是**字符串**形态的 JSON（IDE 实际落盘形态）
+                    "extra": json!({ "modelId": model }).to_string(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let ds_msg = "6c31650f92144122a8d5be2cc917bb84";
+        let glm_msg = "b0052e5476244b6e821b6e0119b8a88e";
+        write_msg(ds_msg, "deepseek-v4.1-flash");
+        write_msg(glm_msg, "glm-5.3-flash");
+        let req = |id: &str, msg: &str, ts: i64| {
+            json!({
+                "id": id, "type": "craft", "state": "complete", "startedAt": ts,
+                "messages": [msg],
+                "usage": { "inputTokens": 100, "outputTokens": 1 }
+            })
+        };
+        std::fs::write(
+            conv_dir.join("index.json"),
+            json!({ "requests": [
+                req("r1", ds_msg, 1_760_000_000_000i64),
+                req("r2", glm_msg, 1_760_000_100_000i64),
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut memo = HashMap::new();
+        let e = parse_codebuddy_index(&conv_dir.join("index.json"), &mut memo, None);
+        let sum = |key: &str| -> u64 {
+            e.by_model
+                .get(key)
+                .map(|days| days.values().map(|d| d.input).sum())
+                .unwrap_or(0)
+        };
+        assert_eq!(sum("deepseek-v4.1-flash"), 100, "切换前的请求必须留在 deepseek");
+        assert_eq!(sum("glm-5.3-flash"), 100, "切换后的请求归 glm");
+        assert_eq!(e.by_model.len(), 2, "不得整段并入选中模型: {:?}", e.by_model.keys());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 消息文件缺失（旧会话/被清理）时回退会话级模型，维持原有可用性。
+    #[test]
+    fn codebuddy_index_falls_back_to_conversation_model() {
+        let root = std::env::temp_dir().join(format!(
+            "wb_stats_model_fb_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+        let conv = "conv-fallback";
+        let conv_dir = root
+            .join("uA")
+            .join("CodeBuddyIDE")
+            .join("uA")
+            .join("history")
+            .join(ws)
+            .join(conv);
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::write(
+            conv_dir.parent().unwrap().join("index.json"),
+            json!({ "conversations": [{ "id": conv, "selectedModelId": "custom-local:deepseek-v4.1-flash" }] })
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            conv_dir.join("index.json"),
+            json!({ "requests": [{
+                "id": "r1", "type": "craft", "state": "complete", "startedAt": 1_760_000_000_000i64,
+                "messages": ["6c31650f92144122a8d5be2cc917bb84"],
+                "usage": { "inputTokens": 7, "outputTokens": 1 }
+            }] })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut memo = HashMap::new();
+        let e = parse_codebuddy_index(&conv_dir.join("index.json"), &mut memo, None);
+        assert_eq!(e.by_model.len(), 1);
+        // 回退值同样走归一：`custom-local:` 前缀不应让同一模型裂成两条线
+        assert!(e.by_model.contains_key("deepseek-v4.1-flash"), "{:?}", e.by_model.keys());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `extra` 实测为 JSON 字符串形态，但直接落对象的变体同样要能取到模型。
+    #[test]
+    fn message_model_accepts_object_extra() {
+        assert_eq!(
+            message_model(&json!({ "extra": { "modelId": "custom-local:glm-5.3-flash" } })).as_deref(),
+            Some("glm-5.3-flash")
+        );
+        // 字符串形态（IDE 实际落盘形态）与无 extra 的 user 消息
+        assert_eq!(
+            message_model(&json!({ "extra": json!({ "modelId": "auto" }).to_string() })).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(message_model(&json!({ "role": "user" })), None);
+    }
+
+    /// 尾部候选自身含重复 id（如 [a, b, a]）时仍按「尾部优先」顺序取模型、extra:null
+    /// 兼容、无模型消息 continue 不终止循环。候选去重的真实收益是免重复读盘（行为
+    /// 不可观测），本测试锁定「去重不改变取模结果」（交叉复审更名如实化）。
+    #[test]
+    fn request_model_tail_first_order_survives_duplicate_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "wb_stats_req_dedup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let msg_dir = root.join("messages");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        let write_msg = |id: &str, model: Option<&str>| {
+            let extra = model.map(|m| json!({ "modelId": m }).to_string());
+            std::fs::write(
+                msg_dir.join(format!("{id}.json")),
+                json!({ "id": id, "extra": extra }).to_string(),
+            )
+            .unwrap();
+        };
+        // 尾部 [a, b, a]：a 无模型、b 有——重复的 a 不得挤占候选位或改变顺序
+        write_msg("a1", None);
+        write_msg("b2", Some("glm-5.3-flash"));
+        let request = json!({
+            "id": "r1",
+            "messages": ["a1", "b2", "a1", "a1"],
+        });
+        let map = request.as_object().cloned().unwrap();
+        assert_eq!(
+            request_model(&root, &map).as_deref(),
+            Some("glm-5.3-flash"),
+            "尾部去重后 b2 仍在候选且命中"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 跨文件/跨 uid 的同一请求只计一次（2026-10-08 实测缺陷回归：同一批请求会以**新的
     /// 会话 id** 落到另一个 uid 的目录下）——整份重复的文件整份跳过、部分重复只补新 id，
     /// 且二次扫描（全命中增量缓存）结果一致（去重只作用于聚合层，不污染缓存）。
@@ -1610,6 +1931,27 @@ mod tests {
         assert_eq!(view2["summary"]["input"], json!(700));
         assert_eq!(view2["summary"]["calls"], json!(3));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// mac 数据根形态锁定：CodeBuddy IDE 历史根 =
+    /// `~/Library/Application Support/CodeBuddyExtension/Data`（2026-10-09 真机
+    /// 实测与 Windows `%LOCALAPPDATA%` 布局同构）。其余平台不参与本断言。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codebuddy_ide_root_resolves_app_support_on_macos() {
+        let Some(root) = codebuddy_ide_root() else {
+            // 仅 HOME 缺失/非 Unicode 时 app_support_root() 返回 Err、根合法地为
+            // None——属环境异常而非缺陷，不误报（HOME 为空串时 env::var 返回
+            // Ok("")，得到相对路径 Some，走下方主断言分支，同样不失败）
+            let home_usable = std::env::var("HOME")
+                .map(|h| !h.trim().is_empty())
+                .unwrap_or(false);
+            assert!(!home_usable, "HOME 存在时 mac 数据根必须可解析");
+            return;
+        };
+        assert!(root.ends_with(std::path::Path::new(
+            "Library/Application Support/CodeBuddyExtension/Data"
+        )));
     }
 
     /// 手动诊断（默认忽略）：在**真实** CodeBuddy IDE 目录上对比「跨文件去重前/后」，

@@ -29,8 +29,10 @@
   Pop $R9
 
   ; ---- 升级宽限等待（D2 恢复回归 + M-1 修正存活判定）----
-  ; 首轮 taskkill 后静默 1.2s 给应用退出链留时间（updater 侧 800ms 延迟退出，
-  ; 两值耦合：应用退出 < 安装器兜底强杀，调整需同步）。
+  ; 首轮已是 /F 强杀（无 WM_CLOSE 温和路径，被杀进程不走退出链）；静默 1.2s 给
+  ; 强杀生效与文件锁释放留缓冲（updater 侧 emit 后 sleep 800ms 才走退出链，两值
+  ; 互不依赖；退出链被强杀打断时，系统代理还原由下次在本应用内直开 Trae/豆包
+  ; 等客户端（未注入代理）时的 cleanup_stale_local_proxy 自愈）。
   ; 存活探测不依赖退出码——tasklist /FI 无匹配时退出码恒为 0，IntCmp 退出码判定
   ; 是死逻辑（M-1 实证）；改用 nsExec::ExecToStack 捕获 /NH 输出，取首列定长映像名
   ; StrCmp 判定（Unicode NSIS 按字符计数；无匹配时输出为 INFO 行，首列 ≠ 映像名，

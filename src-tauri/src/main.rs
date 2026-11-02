@@ -10,6 +10,7 @@ mod icube_auth;
 mod jwt;
 mod models;
 mod notify;
+mod platform;
 mod pe_version;
 mod state;
 mod store;
@@ -98,18 +99,24 @@ fn main() {
     }
 
     // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
-    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
-    if let Some(note) = commands::misc::try_migrate_legacy_task() {
-        fs_utils::app_log(&state.data_dir, &note);
+    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过。
+    // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
+    // 也不会空跑注定失败的 cmd 子进程）
+    if cfg!(windows) {
+        if let Some(note) = commands::misc::try_migrate_legacy_task() {
+            fs_utils::app_log(&state.data_dir, &note);
+        }
     }
     // 计划任务 /TR 现代化迁移（issue #112）：历史 `cmd /c set … &&` 包裹与豆包 .cmd
     // 启动器在 Task Scheduler 触发时必弹黑框（cmd.exe 是控制台程序），后台线程一次性
     // 重建为主 exe 直调（GUI 子系统，无控制台）。部分失败不置位完成标记，下次启动重试。
     // 后台执行：任务枚举 + 逐任务 XML 查询可达数秒，不阻塞启动（取代原 PS 桥启动器迁移）。
-    // 先延迟 120s 再扫描：迁移链路会 spawn cmd/schtasks 控制台程序，开机自启登录早期
-    // spawn 控制台程序可能撞系统初始化窗口期报 0xc0000142（issue #137 同类风险）；
-    // 迁移有一次性完成标记兜底，失败不置位、下次启动自动重试，故延迟无功能损害
-    {
+    // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
+    // 也不会每启动空跑注定失败的 cmd 子进程——该路径无完成标记可提前短路）。
+    // 先延迟 120s 再扫描（合并 origin/main #137 修复）：迁移链路会 spawn cmd/schtasks
+    // 控制台程序，开机自启登录早期 spawn 控制台程序可能撞系统初始化窗口期报
+    // 0xc0000142；迁移有一次性完成标记兜底，失败不置位、下次启动自动重试，故延迟无功能损害
+    if cfg!(windows) {
         let data_dir = state.data_dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(120));
@@ -152,6 +159,7 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
+            commands::env::platform_info,
             commands::env::app_locate,
             commands::env::open_doubao_app,
             commands::env::open_trae_website,
@@ -335,10 +343,13 @@ fn main() {
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
+            commands::updater::update_restart_app,
+            commands::updater::update_quit_app,
             commands::workbuddy::workbuddy_env_check,
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,
             commands::workbuddy::workbuddy_account_save,
+            commands::workbuddy::workbuddy_clear_relogin,
             commands::workbuddy::workbuddy_account_move,
             commands::workbuddy::workbuddy_groups_list,
             commands::workbuddy::workbuddy_groups_create,
@@ -445,6 +456,39 @@ fn main() {
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
+            // F-75：macOS 无边框窗口（decorations:false，前端自绘标题栏）下 tauri.conf
+            // 的 "maximized": true 不生效（Tauri v2 已知缺陷：borderless 样式忽略
+            // maximize），窗口退回 1180×760 原始尺寸显得过大。此处按所在屏幕手动
+            // 铺满可视区（下移菜单栏高度，避免自绘标题栏被系统菜单栏遮挡）；
+            // Windows 走 conf 原生最大化，不受本段影响（行为零变化）。
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(win) = app.get_webview_window("main") {
+                    let monitor = win
+                        .current_monitor()
+                        .ok()
+                        .flatten()
+                        .or_else(|| win.primary_monitor().ok().flatten());
+                    if let Some(monitor) = monitor {
+                        let mpos = monitor.position();
+                        let msize = monitor.size();
+                        let scale = monitor.scale_factor();
+                        // 菜单栏高度经验值 ~25 逻辑 px（Retina/普通屏通用近似）
+                        let menu_h = (25.0 * scale) as i32;
+                        let _ = win.hide();
+                        let _ = win.set_position(tauri::PhysicalPosition::new(
+                            mpos.x,
+                            mpos.y + menu_h,
+                        ));
+                        let _ = win.set_size(tauri::PhysicalSize::new(
+                            msize.width,
+                            msize.height - menu_h as u32,
+                        ));
+                        let _ = win.show();
+                    }
+                }
+            }
+
             let state = app.state::<AppState>();
 
             // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
@@ -490,15 +534,15 @@ fn main() {
 
             // P2（审查）：调度按 chrono::Local 触发，生效时区不可观测——TZ 被
             // 覆盖/清空时签到时刻会静默偏移，启动日志输出生效时区偏移与本地时间
+            let now = chrono::Local::now();
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
                     "生效时区: 偏移{}，本地时间 {}",
-                    chrono::Local::now().format("%:z"),
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                    now.format("%:z"),
+                    now.format("%Y-%m-%d %H:%M:%S")
                 ),
             );
-
             // issue #46：配置已声明 maximized:true，此处程序化最大化做兜底——
             // 若创建期最大化未生效或状态失同步，启动时强制重建一次
             if let Some(window) = app.get_webview_window("main") {
@@ -845,6 +889,19 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 std::process::exit(0);
             });
+        }
+        // F-75：mac 点击 Dock 图标重新打开（Reopen 变体带 #[cfg(target_os = "macos")]，
+        // Windows 编译不存在该变体，匹配须整体门控）。无边框窗口（decorations:false）
+        // 最小化后，macOS 不会自动恢复窗口——手动 unminimize + show + 置前聚焦。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if !has_visible_windows {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
         }
     });
 }

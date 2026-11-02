@@ -55,8 +55,9 @@ pub struct CaAuthority {
 
 impl CaAuthority {
     /// 按域名生成（或取缓存）TLS 服务端配置。叶子证书 CN/SAN=域名，有效期 10 年。
-    /// 审查修复：改返回 Result——畸形 host 导致的签发失败不再 per-connection panic，
-    /// 上抛由调用方记日志并关闭该连接。
+    /// Err = 签发失败（host 来自 CONNECT 目标、属任意外部输入，非法 SAN/IP 无法
+    /// 构造证书参数等）——失败不缓存，由调用方关闭该连接并记日志（审查 M2：
+    /// 原 expect 会 per-connection panic 刷日志，可被畸形 host 干扰 MITM 面）
     pub fn gen_server_config(&self, host: &str) -> Result<Arc<ServerConfig>, String> {
         if let Some(cfg) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(host) {
             return Ok(Arc::clone(cfg));
@@ -112,6 +113,8 @@ impl CaAuthority {
 /// commands::cert::cert_status 同语义）。替代 certutil 子进程：auto_start_proxy
 /// 开机自启链路登录早期会走到本探测，spawn 控制台程序可能撞系统初始化窗口期
 /// 报 0xc0000142（issue #137 同类风险清零）。
+/// 跨平台统一入口是 platform::cert_ctl::cert_query（mac 走 security find-certificate
+/// + verify-cert 信任判定），本函数仅保留 Windows 实现。
 #[cfg(target_os = "windows")]
 pub fn installed_in_windows_root() -> bool {
     root_store_has_subject("TraeDeviceProxyCA")
@@ -151,11 +154,6 @@ fn root_store_has_subject(subject: &str) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn installed_in_windows_root() -> bool {
-    false
-}
-
 /// 确保数据目录下存在可用 CA：已有则加载（兼容 Python 版 RSA CA），缺失则生成并落盘。
 /// 文件布局与 Python 版完全一致：data/certs/{ca.crt, ca.key, ca.cer}（ca.cer 为 DER，
 /// 供 certutil 安装；cert_status 靠 CN 字符串 TraeDeviceProxyCA 匹配，不可改名）。
@@ -169,6 +167,8 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
     std::fs::create_dir_all(certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
 
     let issuer = if cert_pem_path.exists() && key_pem_path.exists() {
+        // 历史版本可能以默认 0644 落盘 ca.key（审查 P1）：读取前统一收紧到 0600
+        harden_key_permissions(&key_pem_path, certs_dir);
         // 读取前 ACL 自愈（issue #14）：历史版本 harden_ca_dir 的 grant 无 (OI)(CI)
         // 继承标志，目录收紧时已有子文件的继承 ACE 被动态清空成空 DACL——任何进程
         // （含提权 certutil、Windows 证书 UI）都读不了文件。此前的自愈挂在 certutil
@@ -197,6 +197,8 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
             .map_err(|e| format!("写入 ca.crt 失败: {e}"))?;
         std::fs::write(&key_pem_path, generated.key_pem.as_bytes())
             .map_err(|e| format!("写入 ca.key 失败: {e}"))?;
+        // 审查 P1：CA 私钥 0600 落盘（写入后立即收紧，防同机其他用户/低权限进程读取）
+        harden_key_permissions(&key_pem_path, certs_dir);
         std::fs::write(&cer_der_path, generated.cert_der)
             .map_err(|e| format!("写入 ca.cer 失败: {e}"))?;
         harden_ca_dir(certs_dir);
@@ -301,15 +303,15 @@ fn self_heal_acl_if_needed(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
+        use crate::platform::cmd::sys_command;
         let readable = |p: &std::path::Path| std::fs::File::open(p).is_ok();
         if targets.iter().all(|p| readable(p)) {
             return Ok(());
         }
-        let _ = std::process::Command::new("icacls")
+        // 经 cmd.rs 收敛点构建（CREATE_NO_WINDOW 语义与原直建 CommandExt 一致）
+        let _ = sys_command("icacls")
             .arg(certs_dir)
             .args(["/reset", "/T"])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output();
         if targets.iter().all(|p| readable(p)) {
             return Ok(());
@@ -327,22 +329,44 @@ fn self_heal_acl_if_needed(
     }
 }
 
+/// ca.key 落盘权限收紧（审查 P1）：unix 以 0600 保护 CA 私钥，防同机其他用户/
+/// 低权限进程读取。仅纵深防御，失败记 app_log warning 不阻断不 panic——CA 读写
+/// 自身绝不能因权限收紧失败而卡死（与 harden_ca_dir 的 fail-open 取舍一致）。
+/// ca.crt/ca.cer 为公开物，权限不动。
+#[cfg(unix)]
+fn harden_key_permissions(key_pem_path: &std::path::Path, certs_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) =
+        std::fs::set_permissions(key_pem_path, std::fs::Permissions::from_mode(0o600))
+    {
+        // certs_dir = data_dir/certs，app_log 需要 data_dir
+        crate::fs_utils::app_log(
+            certs_dir.parent().unwrap_or(certs_dir),
+            &format!("CA 私钥权限收紧为 0600 失败（忽略，仅纵深防御）: {e}"),
+        );
+    }
+}
+
+/// 非 unix（Windows）无 POSIX 权限模型：目录 ACL 由 harden_ca_dir 收口，空实现
+#[cfg(not(unix))]
+fn harden_key_permissions(_key_pem_path: &std::path::Path, _certs_dir: &std::path::Path) {}
+
 /// 收紧 CA 目录 ACL（仅 Windows，尽力而为）：移除继承、仅当前用户完全控制，
 /// 防止同机低权限账户读取 CA 私钥。自验证失败自动 /reset 回滚（fail-open：
 /// ACL 仅纵深防御，绝不能因此破坏代理自身的 CA 读写）。
+/// F-75：Windows 专属（icacls ACL 模型）；mac Keychain 自管理不适用，空实现。
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
 fn harden_ca_dir(certs_dir: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         let user = std::env::var("USERNAME").unwrap_or_default();
         if user.is_empty() {
             return;
         }
         let run = |args: &[&str]| {
-            std::process::Command::new("icacls")
+            crate::platform::cmd::sys_command("icacls")
                 .arg(certs_dir)
                 .args(args)
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .output()
         };
         // 记录收紧前已有文件：NTFS 动态继承下 /inheritance:r 移除目录可继承 ACE
@@ -445,7 +469,7 @@ mod tests {
 
         let ca = ensure_ca(&tmp).expect("legacy PKCS#1 CA must load");
         // 签发器可用：复用 RSA CA 密钥签发叶子证书
-        let cfg = ca.gen_server_config("api.trae.cn").expect("leaf config");
+        let cfg = ca.gen_server_config("api.trae.cn").expect("legacy leaf config");
         // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
         assert!(cfg.alpn_protocols.is_empty());
         // 加载路径不得重写 CA 文件（换 CA = 强制所有用户重装证书）

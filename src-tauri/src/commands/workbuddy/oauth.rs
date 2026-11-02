@@ -67,6 +67,7 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 /// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
 /// 由系统按协议关联选默认浏览器——cmd start 依赖 shell 解析且控制台隐藏不稳定；
 /// 仅放行 http/https 且无引号空格，单参数直传无 shell 层，& / % 等保留字无需转义）
+#[cfg(windows)]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
@@ -88,6 +89,32 @@ pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
+    }
+}
+
+/// macOS：`open <url>` 走 LaunchServices，无引号转义问题（URL 校验同 Windows 分支）。
+/// 审查修复（Low）：等待退出并校验状态码（对齐 Windows 分支失败可观测口径）。
+#[cfg(target_os = "macos")]
+pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
+        return Err(format!("拒绝打开非法 URL：{url}"));
+    }
+    // 审查修复（Low）：改用带超时等待——open 异常挂起时 .output() 会无限阻塞
+    // 命令线程；10s 上限远大于常态 <100ms，超时 kill 保线程可用
+    let mut cmd = crate::platform::cmd::sys_command("open");
+    cmd.arg(url);
+    let status = crate::platform::cmd::sys_status_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开浏览器失败（open 退出码 {:?}）",
+            status.code()
+        ))
     }
 }
 
@@ -449,9 +476,10 @@ pub(super) fn oauth_flow(
     // last_daily_chat（当日打卡幂等失效→重复跑六步链）/uid/domain 等既有键——
     // 与导入路径 BL-2 同类缺陷。新键优先，旧键缺省补齐；新码未回发 rt 时保留旧 rt
     if matches!(sink, PoolSink::BuddyAi) {
-        // 审查修复（M14）：凭证读-合并-写全程持每账号刷新锁（对齐导入路径
-        // buddy_ai_account_import_creds 同款锁域）——与网关 401 自愈轮换并发时，
-        // 锁外读旧 rec 再整行 upsert 会覆盖刚轮换落库的新 rt（账号被迫重登）
+        // M4/M14 修复：凭证读-合并-写全程持每账号刷新锁（对齐导入路径
+        // buddy_ai_account_import_creds 同款锁域）——与续期/网关 401 国际档
+        // 轮换 rt 并发时，锁外读到的 stale rt 再整行 upsert 会覆盖刚轮换落库
+        // 的新 rt（账号被迫重登）。与续期/打卡写段同锁域
         let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
         let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         let existing = sink.load_token(state, &target_id);
@@ -506,10 +534,10 @@ pub(super) fn oauth_login_async(
     // 原 AppState::new() 在本线程构造全新实例，锁域互不相干 → OAuth 写池与
     // 命令/调度写池并发时失去互斥，可能整池覆盖丢账号。
     let st = app.state::<AppState>().inner().clone();
-    // 审查修复：裸 thread::spawn 线程创建失败即 panic 且发生在闸门复位之外 →
-    // OAUTH_RUNNING 永久 true、done 事件永不发出，CN/Intl 共享闸门后续登录全被拒。
-    // 改为 Builder 命名线程 + spawn 返回 io::Result：失败复位闸门并返回 Err；
-    // 线程内闸门复位统一由 OAuthGuard RAII 承担（含 panic 路径）
+    // 审查修复（闸门 RAII 化，对齐 qoder 侧）：裸 thread::spawn 线程创建失败即 panic
+    // 且发生在闸门复位之外 → OAUTH_RUNNING 永久 true、done 事件永不发出，
+    // CN/Intl 共享闸门后续登录全被拒。改为 Builder 命名线程 + spawn 返回 io::Result：
+    // 失败复位闸门并返回 Err；线程内闸门复位统一由 OAuthGuard RAII 承担（含 panic 路径）
     let spawned = std::thread::Builder::new()
         .name("wb-oauth".into())
         .spawn(move || {
@@ -538,7 +566,7 @@ pub(super) fn oauth_login_async(
             // OAUTH_RUNNING 复位由 _guard drop 承担（含 panic 路径）
         });
     if spawned.is_err() {
-        OAUTH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err("OAuth 后台线程启动失败，请重试".into());
     }
     Ok(())

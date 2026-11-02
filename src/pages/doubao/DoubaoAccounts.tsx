@@ -55,6 +55,12 @@ export default function DoubaoAccounts() {
   const switchingTo = useAppStore((s) => s.switchingTo);
   const savingLogin = useAppStore((s) => s.savingLogin);
   const proxy = useAppStore((s) => s.proxy);
+  const platform = useAppStore((s) => s.platform);
+  /** uid 自动探测来源文件提示（后端 commands/doubao.rs::detect_uid_from_public_config 按平台解析 Doubao 数据根） */
+  const publicConfigHint =
+    platform === 'macos'
+      ? '~/Library/Application Support/Doubao/public_config.json'
+      : '%APPDATA%\\Doubao\\public_config.json';
 
   const [accounts, setAccounts] = useState<DoubaoAccountView[]>([]);
   const [snapshotMetas, setSnapshotMetas] = useState<Record<string, DoubaoSnapshotMeta | null>>({});
@@ -267,7 +273,7 @@ export default function DoubaoAccounts() {
     }
   };
 
-  /** 打开「保存当前登录态」弹框：自动探测当前登录 uid（%APPDATA%\Doubao\public_config.json）预填 */
+  /** 打开「保存当前登录态」弹框：自动探测当前登录 uid（Doubao 数据目录 public_config.json，平台路径见弹框文案）预填 */
   const openSaveLoginDialog = async () => {
     setUidInput('');
     setNameInput('');
@@ -970,7 +976,7 @@ export default function DoubaoAccounts() {
           </div>
           <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
             保存时会先关闭豆包，将当前登录态白名单快照到该账号槽位后重启豆包。user_id 可在
-            <span className="mx-1 font-mono">%APPDATA%\Doubao\public_config.json</span>
+            <span className="mx-1 font-mono">{publicConfigHint}</span>
             中查看。
           </div>
           <div className="flex justify-end gap-2">
@@ -1155,6 +1161,11 @@ export default function DoubaoAccounts() {
 
 /** 豆包账号管理使用帮助（快照机制 / 保存 / 切换 / 保活 / 额度） */
 function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const platform = useAppStore((s) => s.platform);
+  const publicConfigHint =
+    platform === 'macos'
+      ? '~/Library/Application Support/Doubao/public_config.json'
+      : '%APPDATA%\\Doubao\\public_config.json';
   return (
     <Modal
       open={open}
@@ -1171,7 +1182,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             在豆包中登录某个账号后，点击右上角「保存当前登录态」。系统会自动识别当前账号 user_id
-            （读取 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">%APPDATA%\Doubao\public_config.json</code>
+            （读取 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">{publicConfigHint}</code>
             ，识别失败时可手动输入），然后关闭豆包 → 将登录核心文件白名单快照到
             <code className="mx-1 rounded bg-slate-100 px-1 dark:bg-zinc-800">data/profiles_doubao/&lt;uid&gt;/</code>
             → 重新启动豆包。每个账号的登录态独立存储，互不干扰。
@@ -1211,7 +1222,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             <li>点击目标账号行的「切换」图标</li>
-            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 可回退一代，但不在列表中显示）</li>
+            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 与 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak2</code> 可回退两代，但不在列表中显示）</li>
             <li>恢复目标账号的快照（Cookies、Local State、Local Storage、saman 账号体系等）</li>
             <li>重新启动豆包，自动以目标账号登录</li>
           </ol>

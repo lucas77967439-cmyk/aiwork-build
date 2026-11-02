@@ -859,7 +859,6 @@ mod tests {
             .map_err(|_| "解密失败：导出密码错误或文件已损坏".to_string())
     }
 
-    #[cfg(windows)]
     #[test]
     fn envelope_加解密往返() {
         let plain = br#"{"kind":"aiwork-qoder-pool","version":1,"accounts":[]}"#;
@@ -877,7 +876,6 @@ mod tests {
         assert!(envelope_data_of(&serde_json::json!({ "kind": "aiwork-qoder-pool" })).is_none());
     }
 
-    #[cfg(windows)]
     #[test]
     fn envelope_错误密码解密失败() {
         let plain = b"secret-payload";
@@ -891,7 +889,6 @@ mod tests {
         assert!(open_fast(&tampered, "correct-horse").is_err());
     }
 
-    #[cfg(windows)]
     #[test]
     fn envelope_魔数不符拒绝() {
         let mut sealed = seal_fast(b"x", "p").expect("seal");

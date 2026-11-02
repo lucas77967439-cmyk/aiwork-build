@@ -67,8 +67,8 @@ pub(crate) fn qoder_sessions_compact_days(state: &AppState) -> i64 {
 }
 
 /// 豆包保活前置检查（issue #147）：返回 Some(跳过原因) 时不应拉起客户端。
-/// ① 账号池为空 → 无可续期的豆包会话；② 六级发现找不到 Doubao.exe →
-/// 启动注定失败（避免每日失败日志与当日首败通知）
+/// ① 账号池为空 → 无可续期的豆包会话；② 六级发现找不到豆包客户端
+///（Windows Doubao.exe / macOS Doubao.app）→ 启动注定失败（避免每日失败日志与当日首败通知）
 pub fn doubao_keepalive_skip_reason(state: &AppState) -> Option<String> {
     if crate::commands::doubao::load_pool(state).accounts.is_empty() {
         return Some("无豆包账号".into());
@@ -85,7 +85,7 @@ pub fn doubao_keepalive_skip_reason(state: &AppState) -> Option<String> {
     };
     let mut sess = crate::switcher::Session::new(&args);
     if crate::switcher::locate::find_exe(&mut sess).is_none() {
-        return Some("未找到豆包客户端（Doubao.exe）".into());
+        return Some("未找到豆包客户端".into());
     }
     None
 }
@@ -147,6 +147,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
             let opts = qoder_checkin::QoderCheckinOpts::daily();
+            // CLI 独立进程无网关运行态（runtime=None）——签到拨新运行池跳过，
+            // 该进程本就无内存池；GUI 侧由调度器/UI/启动补签传入（issue #102 补缺）
             let done = qoder_checkin::run_checkin_round(state, &opts, None, &mut print_progress);
             // 审查 M-1：存在失败账号时返 Err（schtasks 退出码可见 + 通知渠道）。
             // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
@@ -196,7 +198,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "buddy-ai-checkin" => {
             match crate::commands::workbuddy::try_acquire_buddy_ai_round() {
                 Ok(_round) => {
-                    // runtime=None：CLI 独立进程无网关运行态，打卡到账仅落持久池
+                    // 审查 #4：runtime=None——CLI 独立进程无网关运行态内存池
+                    //（本进程的到账仅落持久池，运行池由 GUI 进程下次积分同步对齐）
                     let done = buddy_ai_checkin::run_checkin_round(state, None, &mut print_progress);
                     let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let already = done
@@ -239,9 +242,10 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // 豆包会话保活（schtasks 直调主 exe；原 PS 桥 KeepAlive 已 Rust 化）：
         // 进度 NDJSON 打印到 stdout（任务日志可查），终态 {"ok":bool}
         "doubao-keepalive" => {
-            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过，不拉起客户端
+            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过，不拉起客户端；
+            // 键名与调度器分支同口径（skipped_empty_pool，3.8.5 审查 M-D 对齐 #15）
             if let Some(reason) = doubao_keepalive_skip_reason(state) {
-                Ok(serde_json::json!({ "ok": true, "skipped": reason }))
+                Ok(serde_json::json!({ "ok": true, "skipped_empty_pool": reason }))
             } else {
                 let sink = crate::switcher::CliSink::new(&state.data_dir);
                 crate::switcher::run_action(
@@ -279,7 +283,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         }
         // Qoder 会话流水定时合并（调度器/CLI 共用；纯本地 SQLite 无网络，幂等）。
         // 不注册 schtasks——本地任务无「应用未启动也要跑」诉求，CLI 入口仅供手工触发/排查。
-        // 保留天数与调度器同源：读 settings.qoder_sessions_compact_days（审查 F12）
+        // 保留天数与调度器同源：读 settings.qoder_sessions_compact_days（审查 F12），
+        // 硬编码默认值会让「用户改了保留窗」后 CLI 手工触发按旧 3 天合并
         "qoder-sessions-compact" => {
             let days = qoder_sessions_compact_days(state);
             crate::store::docs::qoder_sessions_compact(&crate::store::db(&state.data_dir), days)

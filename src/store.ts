@@ -70,6 +70,8 @@ export interface LogQuery {
 
 interface AppState {
   ready: boolean;
+  /** 运行平台（F-75 M0-0.5）：init 时经 platform_info 拉取，控制 Windows 专属入口显隐与文案 */
+  platform: 'windows' | 'macos';
   view: ViewKey;
   /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
   activeApp: AppKey;
@@ -299,6 +301,7 @@ function defaultSettings(): Settings {
     qoder_credits_sync_mode: 'every_hours',
     qoder_credits_sync_hours: '2',
     qoder_token_renew_enabled: true,
+    qoder_token_renew_interval_hours: 6,
     qoder_sessions_compact_enabled: true,
     qoder_sessions_compact_days: '3',
     qoder_sessions_compact_hhmm: '04:30',
@@ -309,6 +312,9 @@ function defaultSettings(): Settings {
 let logsPollInflight = false;
 // 日志查询并发序号（最新请求胜出）：手动刷新与轮询并发时，旧响应直接丢弃
 let logsReqSeq = 0;
+// 账号列表并发序号（最新请求胜出，审查修复 M2）：refreshAccounts 被捕获事件/
+// 签到完成/页面挂载等多源高频并发触发，先发后至的旧列表不得覆盖新数据
+let accountsReqSeq = 0;
 // 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
 let lastLogsErrToastAt = 0;
 // F5：签到看门狗定时器（模块级，store 单例持有）
@@ -340,8 +346,14 @@ function armCheckinWatchdog() {
   }, CHECKIN_WATCHDOG_MS);
 }
 
+/** BuddyAI Tab 可见性「用户已显式决定」标记（审查修复 #10，localStorage）：
+ *  store init 的一次性自动放开与设置面板手动开关共用——标记落盘后自动逻辑永久退避 */
+export const BUDDY_AI_VIS_DECIDED_KEY = 'buddy_ai_vis_decided';
+
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
+  // 初始兜底用 UA 猜测（mac = "Macintosh; Intel Mac OS X"），platform_info 成功后覆盖
+  platform: /Mac/i.test(navigator.userAgent) ? 'macos' : 'windows',
   view: 'dashboard',
   activeApp: 'trae',
   env: null,
@@ -381,6 +393,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     // 幂等锁：仅首次执行注册，后续调用直接复用（审查修复 P1-16）
     if (initStarted) return;
     initStarted = true;
+    // F-75 M0-0.5：平台标志先行拉取（失败保持默认 windows，不阻塞启动）
+    try {
+      const p = await api.platform.info();
+      set({ platform: p.os });
+    } catch {
+      /* ignore：保持默认 */
+    }
     unsubs = await setupListeners({
       onProxyLog: (line) =>
         set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),
@@ -483,16 +502,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       onDeviceResetProgress: (line) =>
         set((s) => ({ deviceResetProgress: [...s.deviceResetProgress.slice(-99), line] })),
       onDeviceResetDone: (e) => {
+        // 层级数按平台分派（mac 5 层 / Windows 6 层，与 Settings.tsx 文案同口径）
+        const layers = get().platform === 'macos' ? '5 层' : '6 层';
         set((s) => ({
           deviceResetActive: false,
           deviceResetProgress: [
             ...s.deviceResetProgress.slice(-99),
-            e.success ? '[完成] 6 层设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
+            e.success ? `[完成] ${layers}设备标识重置成功` : '[失败] 设备标识重置未完成，请查看日志',
           ],
         }));
         get().pushToast(
           e.success ? 'success' : 'error',
-          e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
+          e.success ? `${layers}设备标识重置完成` : '设备标识重置失败，请查看日志',
         );
       },
       onProfileProgress: (line) =>
@@ -513,6 +534,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
         void get().refreshProfiles();
       },
+    }).catch((e) => {
+      // 审查修复 M3：监听注册失败时复位幂等锁，允许重试——否则 initStarted
+      // 恒为 true，任何重试调用直接 return，ready 永远 false，应用卡死在未就绪态
+      initStarted = false;
+      throw e;
     });
     await Promise.all([
       get().refreshEnv(),
@@ -560,6 +586,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch {
       /* 静默失败 */
     }
+    // BuddyAI Tab 一次性自动放开（审查修复 #10）：buddy_ai_visible 此前仅能手动勾选，
+    // 装了国际客户端的用户默认看不到入口。首次使用（localStorage 无 decided 标记，
+    // 视为用户从未显式决定过）时经现有 env locate 探测国际客户端（workbuddy_ai /
+    // codebuddy_ai，与 BuddyAiTopBar 同款调用），任一安装即自动放开显示；未安装仅落
+    // 标记（本机只探测一次，避免每次启动重复探测开销）。用户在设置面板显式切换过开关
+    // 同样落标记（onChange 写入），自动逻辑此后永久退避、不与用户显式选择打架。
+    // 失败静默，不阻塞启动
+    void (async () => {
+      try {
+        if (localStorage.getItem(BUDDY_AI_VIS_DECIDED_KEY)) return;
+        if (!get().settingsLoaded) return;
+        const [wb, cb] = await Promise.all([
+          api.env.locate('workbuddy_ai').catch(() => null),
+          api.env.locate('codebuddy_ai').catch(() => null),
+        ]);
+        // 探测期间用户可能在设置面板显式切换过开关（onChange 同步落 decided 标记，
+        // 开启与关闭都算）：以其选择为准，自动逻辑退避不覆盖。审查修复（Medium）：
+        // 原仅回读 settings.buddy_ai_visible===true 挡「显式开启」，显式关闭仍会被
+        // 下方 saveSettings 翻回 true。重读 decided 后到 saveSettings 间仍有毫秒级
+        // 窗口（一次性启动逻辑，用户最终一次保存会再覆盖，不再加重）
+        if (localStorage.getItem(BUDDY_AI_VIS_DECIDED_KEY)) return;
+        // 探测完成即落标记：无论是否安装，本机只自动探测一次
+        localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
+        if (wb?.exe || cb?.exe) {
+          await get().saveSettings({ buddy_ai_visible: true }).catch(() => {});
+        }
+      } catch {
+        /* 静默失败：下次启动满足条件时重试 */
+      }
+    })();
   },
 
   setView: (v) => set({ view: v }),
@@ -807,11 +863,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   refreshAccounts: async () => {
+    // 并发序号（审查修复 M2，同 logsReqSeq 最新胜出模式）：旧响应直接丢弃，
+    // 防「刚捕获的账号闪没」
+    const seq = ++accountsReqSeq;
     try {
       const accounts = await api.accounts.list();
-      set({ accounts });
+      if (seq === accountsReqSeq) set({ accounts });
     } catch (err) {
-      get().pushToast('error', `读取账号失败：${String(err)}`);
+      if (seq === accountsReqSeq) {
+        get().pushToast('error', `读取账号失败：${String(err)}`);
+      }
     }
   },
   refreshGroups: async () => {
@@ -831,8 +892,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       // 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见；
       // buddy-ai（国际版）不参与固定应用（脏值回退 trae，与后端 state.rs 归一口径一致）
-      // 审查修复（L33）：hidden_apps 白名单对齐后端 state.rs 口径——仅 4 键且不含
-      // buddy-ai（其可见性走独立 opt-in buddy_ai_visible，不进隐藏列表）
+      // hidden_apps 白名单对齐后端（state.rs:377，审查修复 L33）：仅 4 键且不含
+      // buddy-ai——其可见性走独立 opt-in 开关 buddy_ai_visible，不进隐藏列表
       const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
       const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
       if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
@@ -860,10 +921,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       settings.buddy_ai_catalog_sync_enabled = settings.buddy_ai_catalog_sync_enabled !== false;
       if (!settings.buddy_ai_catalog_sync_hhmm?.trim()) settings.buddy_ai_catalog_sync_hhmm = '05:55';
-      // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
-      // 审查 #7 修复：图标白名单对齐后端 state.rs 口径含 buddy-ai（应用显示面板行首
-      // 入口放行自定义图标；原沿用 hidden_apps 的 validApps 缺 buddy-ai，每次刷新
-      // 都把 buddy-ai 自定义图标清除并随 saveSettings 写回丢失）
+      // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）。
+      // 图标清理用独立白名单（审查修复 #7）：buddy-ai 的自定义图标合法——后端 state.rs:388
+      // 的 retain 同样放行 'buddy-ai'；原复用上方 hidden_apps 的 validApps 会在每次
+      // settingsGet 后剥除 buddy-ai 图标并随保存写回丢失
       const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
@@ -1128,13 +1189,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().pushToast('info', '正在启动代理以续期 JWT…');
         await get().startProxy();
       }
+      // 代理在跑才注入端口：切换后 TRAE 以 --proxy-server 重启（Electron 单实例，
+      // 切换流程会先关闭旧进程保证参数生效），客户端流量经 MITM，新 JWT 被自动捕获；
+      // 代理未跑（启动失败等）则退化为普通切换，不带参数
+      const proxy = get().proxy;
+      const proxyPort = proxy?.running && proxy.port ? proxy.port : undefined;
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
       // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       // issue #44 遗留项：纳入切换状态机——进度面板与 90s 看门狗均依赖 switchingTo
       // 非空；终态由 switch-done 事件统一复位（含失败 toast）。busy 已在探测前置位，
       // 此处仅续写进度流（switchProgress 不可重置，会抹掉探测行）
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId, undefined, true);
+      await api.switchAccount(userId, undefined, true, proxyPort);
     } catch (err) {
       set({ switchingTo: null, renewPending: null });
       get().pushToast('error', `续期失败：${String(err)}`);
@@ -1144,7 +1210,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ deviceResetActive: true, deviceResetProgress: [] });
     try {
       await api.resetDeviceIds(targetApp);
-      get().pushToast('info', '正在执行 6 层设备标识重置（Trae）…');
+      get().pushToast(
+        'info',
+        `正在执行 ${get().platform === 'macos' ? '5 层' : '6 层'}设备标识重置（Trae）…`,
+      );
     } catch (err) {
       set({ deviceResetActive: false });
       get().pushToast('error', `设备标识重置失败：${String(err)}`);
@@ -1216,8 +1285,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 全量发送会把那些字段回滚成旧值
       await api.misc.settingsSet(patch);
     } catch (err) {
-      // 回滚到修改前的值，避免 UI 显示与后端不一致
-      set({ settings: current });
+      // 字段级回滚（C3 审查修复）：只还原本次 patch 涉及的字段，且以最新 state
+      // 为基做函数式合并——整表回滚会把保存期间其他通道刚写入的字段一并回滚
+      set((s) => {
+        const revert: Partial<Settings> = {};
+        for (const k of Object.keys(patch) as Array<keyof Settings>) {
+          (revert as Record<string, unknown>)[k] = current[k];
+        }
+        return { settings: { ...(s.settings ?? defaultSettings()), ...revert } };
+      });
       get().pushToast('error', `保存设置失败：${String(err)}`);
       // rethrow：让调用方 catch 感知失败，避免误弹「已保存」成功提示
       throw err;

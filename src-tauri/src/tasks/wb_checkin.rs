@@ -532,8 +532,14 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 }
             }
             None => {
-                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
-                if fail_reason == Some(wb_common::RefreshFail::Auth) {
+                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）。
+                // NoRefreshToken 亦属凭证永久失效（401 后无 refreshToken 可刷，永不自愈），
+                // 一并标记避免后续轮次反复白打 401。
+                // 审查 #1：message 按 fail_reason 差异化——原实现恒报「需重新登录」，
+                // 而 scheduler 的 failed_permanent 按消息含「需重新登录」关键字统计，
+                // 网络/忙碌/响应异常等瞬时态会被误判当日闭合不再重试。
+                let fail = fail_reason.unwrap_or(wb_common::RefreshFail::Network);
+                if matches!(fail, wb_common::RefreshFail::Auth | wb_common::RefreshFail::NoRefreshToken) {
                     // issue #118：透传上游 error/error_description，便于区分会话失效与账号封禁
                     let mut reason = format!("签到 refresh 失败: {message}");
                     if let Some(d) = fail_detail.as_deref() {
@@ -542,12 +548,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     wb_common::mark_needs_relogin(state, &aid, &reason);
                 }
                 kind = "fail".into();
-                message = match fail_detail.as_deref() {
-                    Some(d) => format!(
-                        "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
-                        wb_common::refresh_fail_hint(d)
-                    ),
-                    None => "登录态失效且刷新失败，需重新登录".into(),
+                message = match fail {
+                    // 永久失效（含「需重新登录」关键字 → 调度器闭合当日，符合事实）；
+                    // issue #118：Auth 分支透传上游错误详情（NoRefreshToken 无上游详情可透传）
+                    wb_common::RefreshFail::Auth => match fail_detail.as_deref() {
+                        Some(d) => format!(
+                            "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
+                            wb_common::refresh_fail_hint(d)
+                        ),
+                        None => "登录态失效且刷新失败，需重新登录".into(),
+                    },
+                    wb_common::RefreshFail::NoRefreshToken => "无刷新凭证，需重新登录".into(),
+                    // 瞬时态（消息不含关键字 → 进入 30 分钟重试队列）
+                    wb_common::RefreshFail::Network => "刷新失败（网络异常），稍后自动重试".into(),
+                    wb_common::RefreshFail::Busy => "他方进程刷新中，稍后自动重试".into(),
+                    wb_common::RefreshFail::BadResponse => "刷新响应异常，稍后自动重试".into(),
                 };
                 reward = None;
             }
@@ -708,6 +723,10 @@ where
                 reason.push_str(&format!("；上游: {d}（{}）", wb_common::refresh_fail_hint(d)));
             }
             wb_common::mark_needs_relogin(state, acct_id, &reason);
+            // main 侧 M16：auth_dead 内构造登录态失效文案并直接 return（覆盖 HEAD 侧
+            // M6 意图——NoRefreshToken 已含于 auth_dead 同样标 needs_relogin，且原
+            // else if 分支在 auth_dead 判定下不可达；瞬时失败文案以 refresh 真实
+            // 失败原因 fail_detail 呈现，替代 HEAD 侧误用首次 401 消息 {msg} 的写法）
             let msg_fail = match fail_detail.as_deref() {
                 Some(d) => format!(
                     "登录态失效且刷新失败；上游: {d}（{}）",
@@ -878,7 +897,11 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
     let mut skipped = 0usize;
     for t in tasks {
         let Some(obj) = t.as_object() else { continue };
-        if !py_truthy(obj.get("has_reward")) && fs_utils::dig(t, &["hasReward"]).is_none() {
+        if !py_truthy(obj.get("has_reward"))
+            && fs_utils::dig(t, &["hasReward"])
+                .map(|v| !py_truthy(Some(v)))
+                .unwrap_or(true)
+        {
             continue;
         }
         // accept_status：顶层缺省时 dig 兜底；空值归一 ""（对齐 python `or ""` + str()）

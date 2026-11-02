@@ -45,9 +45,32 @@ pub const CLIENT_USER_AGENT: &str = "Qoder";
 /// 网关域 1.1.38）区分——两个域的 COSY 协议版本互不通用。
 pub const CLIENT_COSY_VERSION: &str = "0.4.3";
 
-/// 客户端 openapi 域机器 OS 标识（同抓包实测 `cosy-machineos: x86_64_win32`；
-/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）
-pub const CLIENT_MACHINE_OS: &str = "x86_64_win32";
+/// 客户端 openapi 域机器 OS 标识（Windows 抓包实测 `cosy-machineos: x86_64_win32`；
+/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）。按编译目标平台区分
+///（审查 2026-10-07：原常量硬编码 win32 值，macOS 构建会把 Windows 标识发给
+/// 服务端）；macOS 分支按 Qoder 网关命名惯例推断，待真机抓包验证后对齐客户端
+/// 形态。其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）。
+pub fn client_machine_os() -> &'static str {
+    #[cfg(windows)]
+    {
+        "x86_64_win32"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64_darwin"
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            "x86_64_darwin"
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "unknown_os"
+    }
+}
 
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
@@ -368,26 +391,24 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             .cloned()
             .ok_or_else(|| "token_store 内部错误：目标行缺失".to_string())?
     };
-    // 审查修复（M22）：vault 收敛（secure_store_for_save）会把敏感字段明文写入
-    // vault——若此刻 DB 已被其他进程改成不识别的 version，vault 之后的闸门 #2
-    // 才早退会留下「vault 有凭证、DB 无行」的半迁移态孤儿记录。vault 写入前
-    // 重读 DB 复查 version，不识别直接早退（零写入）；vault 之后的 fresh 重载
-    // 与闸门 #2 保留（继续护住 H-1 行级合并的收窄窗口，判定口径与之一致）
-    {
-        let pre = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-        if pre
-            .as_object()
-            .and_then(|o| o.get("version"))
-            .map(|v| v.as_i64() != Some(1))
-            .unwrap_or(false)
-        {
+    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
+    // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行
+    //（审查 H-1 第②步 + P2 修复；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
+    // version 闸门（审查 L 修复，前移；对齐 main 侧 M22 意图）：在 vault 收敛
+    //（慢 IO）**之前**判定——原位置在 vault 写入之后，版本不识别时 vault 已被
+    // 收敛成半迁移态，拒绝写入留下「vault 有凭证、DB 无行」的孤儿 vault 记录。
+    // 直接读 kv qoder_tokens_meta 判定（非 1 拒写；缺失视为初始库放行，与
+    // qoder_token_store_load 口径一致；qoder_token_store_load 合成 version 亦源于此 kv）
+    let cur_version = crate::store::db(&state.data_dir)
+        .kv_get_raw("qoder_tokens_meta")
+        .and_then(|v| v.parse::<i64>().ok());
+    if let Some(v) = cur_version {
+        if v != 1 {
             return Err("token_store 版本不识别，拒绝写入".to_string());
         }
     }
-    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；故落库不使用上面的
-    // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
-    // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」
-    //（审查 H-1 第②步；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
+    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
+    // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行。
     // vault 写失败（issue #153 修复 1）：数据库保持原状，不落 fresh 表——
     // 此时 store 里的敏感字段尚未占位化（secure_store_for_save 在 ns_set 失败时
     // 早退，占位循环未执行），若继续落库会把明文凭证写进 SQLite，恰与红线相反
@@ -396,39 +417,37 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             &state.data_dir,
             &format!("[qoder] vault 写入失败，token store 未落库（id={id}，凭据未持久化）: {e}"),
         );
-        return Err(format!("Qoder 凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"));
+        return Err(format!(
+            "Qoder 凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"
+        ));
     }
-    let mut fresh = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if !fresh.is_object() {
-        fresh = serde_json::json!({});
-    }
-    {
-        let obj = fresh.as_object_mut().unwrap();
-        match obj.get("version") {
-            Some(v) if v.as_i64() != Some(1) => {
-                return Err("token_store 版本不识别，拒绝写入".to_string());
+    // 落库改逐行 UPSERT（审查 P2 跨进程 last-writer-wins 修复，方案 A）：原
+    // 「重读整表 → 仅目标行替换 → qoder_token_store_save 整表 rows_replace」已把
+    // 覆盖窗口从「vault 全程」收窄到数毫秒，但窗口内他进程对**其他账号行**的写入
+    // 仍被 DELETE 全表 + 重插吞掉；逐行 upsert 仅覆盖目标 pk 行。配合本轮修复
+    // remove_token（row_delete）/ clear_device_flow_creds（row_get+row_upsert）
+    // 同步行级化，运行时三条写路径（save/remove/clear）均不再存在整表覆盖窗口
+    // ——唯一保留整表替换的是启动迁移 migrate_token_store（一次性幂等收敛、
+    // 需整表占位化，非并发写路径）。
+    // 保持不变：vault 写入口径（secure_store_for_save 整库收敛）、行占位化、
+    // 锁序（refresh_lock → TOKEN_STORE_LOCK，未引入新锁）、进程内并发防护。
+    //（version 闸门已前移至 vault 写入之前，见上方注释）
+    // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**克隆的
+    // 明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，且
+    // token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。落库前必须与
+    // secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，明文唯一驻留地
+    // 是 vault（vault 写失败已在上方提前返回，不会走到本处）
+    let mut row = target;
+    if let Some(rm) = row.as_object_mut() {
+        for k in TOKEN_SENSITIVE_KEYS {
+            if rm.contains_key(k) {
+                rm.insert(k.to_string(), serde_json::json!(""));
             }
-            _ => {}
-        }
-        obj.insert("version".into(), serde_json::json!(1));
-        if let Some(t) = obj.entry("tokens").or_insert_with(|| serde_json::json!({})).as_object_mut() {
-            // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**
-            // 克隆的明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，
-            // 且 token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。
-            // 落库前必须与 secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，
-            // 明文唯一驻留地是 vault；vault 失败时同样落占位行（重新登录可恢复）
-            let mut row = target;
-            if let Some(rm) = row.as_object_mut() {
-                for k in TOKEN_SENSITIVE_KEYS {
-                    if rm.contains_key(k) {
-                        rm.insert(k.to_string(), serde_json::json!(""));
-                    }
-                }
-            }
-            t.insert(id.to_string(), row);
         }
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)
+    crate::store::docs::qoder_token_store_row_upsert(&crate::store::db(&state.data_dir), id, &row)?;
+    crate::store::db(&state.data_dir).kv_set_raw("qoder_tokens_meta", "1")?;
+    Ok(())
 }
 
 /// 删除 token store 记录（账号移除时同步清理 vault 凭证）。
@@ -436,15 +455,11 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
 /// 避免「库里还在、密钥已删」的悬挂态（重导同账号可复用既有凭证恢复）。
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // 凭证红线（审查 P0 修复）：此处只需摘行，必须读 DB 原始表（占位形态）——
-    // 不可走 load_token_store（vault 回填后的明文整表写回，会把其余账号的
-    // 明文凭证重新落库）
-    let mut store =
-        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
-        t.remove(id);
-    }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    // 行级删除（本轮审查修复）：原「load 整表 → 摘行 → rows_replace 整表」在他进程
+    // 并发 save 其他账号行时，会把刚 upsert 的行随 DELETE 全表一起吞掉
+    //（last-writer-wins 窗口）；row_delete 仅移除目标 pk 行，与 save_token_store
+    // 的行级 upsert 同口径。vault 清理仍滞后于 DB 删除成功（审查 L 顺序不变）
+    crate::store::docs::qoder_token_store_row_delete(&crate::store::db(&state.data_dir), id)?;
     crate::vault::ns_remove(&state.data_dir, "qoder", id);
     Ok(())
 }
@@ -468,20 +483,20 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
             }
         }
     }
-    // DB 行：与 remove_token 同口径读原始占位表（防明文整表写回），目标行移除字段
-    let mut store =
-        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if let Some(rec) = store
-        .get_mut("tokens")
-        .and_then(Value::as_object_mut)
-        .and_then(|t| t.get_mut(id))
-        .and_then(Value::as_object_mut)
-    {
+    // DB 行：行级读改写（本轮审查修复，与 remove_token/save_token_store 同口径）：
+    // row_get 单行读（占位形态，vault 不参与）→ 移除设备流字段 → row_upsert 仅
+    // 覆盖目标 pk 行，不再经整表 rows_replace 吞掉他进程并发写入的其他账号行
+    let Some(mut row) =
+        crate::store::docs::qoder_token_store_row_get(&crate::store::db(&state.data_dir), id)?
+    else {
+        // 行不存在（未入池/已移除）：DB 侧无可清字段（vault 侧已处理）
+        return Ok(());
+    };
+    if let Some(rec) = row.as_object_mut() {
         rec.remove("refresh_token");
         rec.remove("refresh_expires_at_ms");
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
-    Ok(())
+    crate::store::docs::qoder_token_store_row_upsert(&crate::store::db(&state.data_dir), id, &row)
 }
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
@@ -490,29 +505,70 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
 /// 实测与 proxy 抓包 12:35 逐字节一致）：服务端按此三元组做设备指纹分桶——
 /// campaigns 列表的 CLAIMABLE 过滤与 claim 的风控前置拦截（盲发 503
 /// RISK_DEPENDENCY_UNAVAILABLE）都以真值为准；machine_id 截断派生值不被信任。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NativeRiskIdentity {
     pub machine_token: String,
     pub machine_type: String,
     pub machine_code: String,
 }
 
+// 手写脱敏 Debug（审查 2026-10-07，对齐上方 QoderCreds 惯例：derive(Debug) 会把
+// machine_token 全量打进日志——触犯「凭证不入日志」红线）：token/code 掩码仅显
+// **（空则空串便于排障），machine_type 为种类枚举非凭证、保留明文
+impl std::fmt::Debug for NativeRiskIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mask = |s: &str| if s.is_empty() { "" } else { "**" };
+        f.debug_struct("NativeRiskIdentity")
+            .field("machine_token", &mask(&self.machine_token))
+            .field("machine_type", &self.machine_type)
+            .field("machine_code", &mask(&self.machine_code))
+            .finish()
+    }
+}
+
 /// Qoder 主客户端（"Qoder CN" 0.4.3，Electron，userData=com.qodercn.app.stable）
-/// 随包分发的原生身份工具：`resources\umid\runtime-info.exe`（配 sgsdk.dll）。
+/// 随包分发的原生身份工具：Windows 形态 `resources\umid\runtime-info.exe`
+/// （配 sgsdk.dll）；macOS 形态 bundle 内 `Contents/Resources/umid/runtime-info`
+/// （无 .exe 后缀，双根探测与 commands/qoder/common.rs 的 mac_app_bases 同源）。
 /// 客户端桥以 `spawn(exe, [env, "--account-stdin"])` + stdin `{account}.` 调用；
 /// 实测无参直跑同样输出真值且与账号参数无关（机器恒定，exit 0 瞬时返回）。
 fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let p = std::path::Path::new(&local)
-        .join("Programs")
-        .join("Qoder CN")
-        .join("resources")
-        .join("umid")
-        .join("runtime-info.exe");
-    if p.is_file() {
-        Some(p)
-    } else {
+    #[cfg(target_os = "macos")]
+    {
+        // mac 适配（2026-10-07）：/Applications、~/Applications 双根下 Qoder CN.app
+        // bundle 内探测；未随包分发/未安装时返回 None，调用方走派生 fallback。
+        let mut bases = vec![std::path::PathBuf::from("/Applications")];
+        let home = crate::platform::home_dir();
+        if !home.as_os_str().is_empty() {
+            bases.push(home.join("Applications"));
+        }
+        for base in bases {
+            let p = base
+                .join("Qoder CN.app")
+                .join("Contents")
+                .join("Resources")
+                .join("umid")
+                .join("runtime-info");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
         None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        let p = std::path::Path::new(&local)
+            .join("Programs")
+            .join("Qoder CN")
+            .join("resources")
+            .join("umid")
+            .join("runtime-info.exe");
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
     }
 }
 
@@ -537,51 +593,149 @@ fn parse_runtime_info_stdout(s: &str) -> Option<NativeRiskIdentity> {
     one(s).or_else(|| s.split('.').next().and_then(one))
 }
 
-/// 解析本机原生风控身份真值（OnceLock 缓存：真值机器恒定，进程内至多 spawn 一次）。
-/// 失败（客户端未安装/执行失败/解析失败）返回 None，调用方走派生 fallback。
+/// runtime-info 单次执行超时上限（实测 exit 0 瞬时返回，3s 已极宽裕；防子进程
+/// 卡死拖住 build_auth_headers 热路径）
+const NATIVE_RISK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 瞬时失败冷却窗口：spawn 非零开销且本函数处于请求热路径，失败后 60s 内不再重试
+const NATIVE_RISK_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`wait_output_limited`] 的单次执行结果分类：决定失败是否可缓存
+enum RuntimeInfoOutcome {
+    Identity(NativeRiskIdentity),
+    /// 确定性缺失（工具未随包分发/路径非法）：机器现状，可缓存终态至进程重启
+    DeterministicNone,
+    /// 瞬时失败（执行出错/超时/非 0 退出/解析失败）：不缓存，冷却后重试
+    TransientNone,
+}
+
+/// 带 3s 上限的子进程执行：轮询 try_wait 超时则 kill+收尸返回 None（原生
+/// `cmd.output()` 无超时，工具卡死会无限阻塞热路径）。输出为 KB 级 JSON，
+/// 不撑 pipe 缓冲，先等退出再 read_to_end 无死锁风险。
+fn wait_output_limited(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            // try_wait 自身出错（进程句柄异常等）：按瞬时失败处理，不缓存；
+            // 与超时路径对称 kill+wait 收尸，防止子进程残留（审查 2026-10-07）
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    // 退出后再收尾读取：管道已关闭，read_to_end 立即返回
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_end(&mut stdout);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_end(&mut stderr);
+    }
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// 执行一次 runtime-info 并按失败性质分类（见 [`RuntimeInfoOutcome`]）。
+fn run_runtime_info_once(exe: &std::path::Path) -> RuntimeInfoOutcome {
+    let Some(exe_str) = exe.to_str() else {
+        return RuntimeInfoOutcome::DeterministicNone;
+    };
+    // 收敛经 platform::cmd::sys_command（CREATE_NO_WINDOW 圈进该模块，
+    // 禁止散写 CommandExt——AGENT.md 子进程红线）
+    let mut cmd = crate::platform::cmd::sys_command(exe_str);
+    let Some(out) = wait_output_limited(&mut cmd, NATIVE_RISK_WAIT_TIMEOUT) else {
+        return RuntimeInfoOutcome::TransientNone;
+    };
+    if !out.status.success() {
+        return RuntimeInfoOutcome::TransientNone;
+    }
+    match parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout)) {
+        Some(n) => RuntimeInfoOutcome::Identity(n),
+        None => RuntimeInfoOutcome::TransientNone,
+    }
+}
+
+/// 解析本机原生风控身份真值（终态 OnceLock 缓存 + 瞬时失败冷却，审查 2026-10-07
+/// 重写）：真值机器恒定，`Some` 与「确定性缺失」（客户端未装/路径非法）永久缓存；
+/// 执行出错/超时/非 0 退出/解析失败属瞬时态，不进缓存——仅记 60s 冷却，避免一次
+/// 调度抖动把本该可用的真值固化成 None 直到进程重启。冷却内或他线程 spawn 中
+/// 返回 None，调用方走派生 fallback。
 pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
-    static CACHE: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
-    // 审查修复：降级路径（原生真值不可得 → 调用方走 machine_id 派生 fallback /
-    // 独立风控桶）此前零观测；OnceLock 语义使本日志进程内至多落一次
-    const FALLBACK_NOTE: &str =
-        "原生风控身份解析失败（设备头走 machine_id 派生 fallback，风控身份独立桶）";
-    CACHE
-        .get_or_init(|| {
-            let Some(exe) = runtime_info_exe_path() else {
-                crate::fs_utils::app_log_default(&format!(
-                    "{FALLBACK_NOTE}: 未找到客户端 runtime_info 可执行文件"
-                ));
-                return None;
-            };
-            let mut cmd = std::process::Command::new(&exe);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                // CREATE_NO_WINDOW：Tauri GUI 进程内 spawn 不得闪控制台窗（项目惯例）
-                cmd.creation_flags(0x0800_0000);
+    static FINAL: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
+    static LAST_FAIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    // spawn 闸门：并发调用时仅一线程真正执行，其余直接走派生 fallback（比
+    // OnceLock get_or_init 阻塞排队更稳，避免冷却判过后排队线程重复 spawn）
+    static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    if let Some(cached) = FINAL.get() {
+        return cached.as_ref();
+    }
+    let cooling = LAST_FAIL
+        .lock()
+        .map(|g| g.map(|t| t.elapsed() < NATIVE_RISK_RETRY_COOLDOWN).unwrap_or(false))
+        .unwrap_or(false);
+    if cooling {
+        return None;
+    }
+    let Ok(_gate) = SPAWN_GATE.try_lock() else {
+        return None;
+    };
+    // 双检：排队等闸门期间可能已被他线程写入终态
+    if let Some(cached) = FINAL.get() {
+        return cached.as_ref();
+    }
+
+    let outcome = match runtime_info_exe_path() {
+        Some(exe) => run_runtime_info_once(&exe),
+        None => RuntimeInfoOutcome::DeterministicNone,
+    };
+    match outcome {
+        RuntimeInfoOutcome::Identity(n) => {
+            let _ = FINAL.set(Some(n));
+            FINAL.get().and_then(|o| o.as_ref())
+        }
+        RuntimeInfoOutcome::DeterministicNone => {
+            // 审查 L：降级事实落日志（进程生命周期一次）——派生 fallback 会被服务端
+            // 分入独立风控桶（模块头注释），直接后果是 campaigns 恒空 / claim 盲发
+            // 503；此前零观测，排障只能从「空活动列表」侧面推断
+            static DEGRADE_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if DEGRADE_LOGGED.set(()).is_ok() {
+                crate::fs_utils::app_log_default(
+                    "[Qoder风控] 原生风控身份不可用（客户端未装在固定根/bundle 缺 runtime-info），已降级 machine_id 派生指纹",
+                );
             }
-            let Ok(out) = cmd.output() else {
-                crate::fs_utils::app_log_default(&format!("{FALLBACK_NOTE}: runtime_info 执行失败"));
-                return None;
-            };
-            if !out.status.success() {
-                crate::fs_utils::app_log_default(&format!(
-                    "{FALLBACK_NOTE}: runtime_info 退出码非 0（{:?}）",
-                    out.status.code()
-                ));
-                return None;
+            let _ = FINAL.set(None);
+            None
+        }
+        RuntimeInfoOutcome::TransientNone => {
+            if let Ok(mut g) = LAST_FAIL.lock() {
+                *g = Some(std::time::Instant::now());
             }
-            match parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout)) {
-                Some(id) => Some(id),
-                None => {
-                    crate::fs_utils::app_log_default(&format!(
-                        "{FALLBACK_NOTE}: runtime_info 输出解析不出三键"
-                    ));
-                    None
-                }
-            }
-        })
-        .as_ref()
+            None
+        }
+    }
 }
 
 /// 将原生真值三键写入请求头：替换同名既有键（build_auth_headers 先行透传的
@@ -597,6 +751,40 @@ fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdenti
             Some(slot) => slot.1 = v.to_string(),
             None => h.push((k.to_string(), v.to_string())),
         }
+    }
+}
+
+/// 本机主机名（Cosy-MachineHostname 取值）：Windows 走 COMPUTERNAME 环境变量
+/// （与客户端同源）；macOS 走 libc::gethostname(3)——GUI 进程普遍无
+/// HOSTNAME 环境变量，且客户端 Electron os.hostname() 即 gethostname(3) 同源
+/// （区别于 commands/oauth.rs 设备注册域的 scutil ComputerName，彼处取的是
+/// 用户可见名）。取不到时回退 "PC"（与派生 fallback 同款兜底，宁降级不崩溃）。
+/// 三平台门控（审查 2026-10-07 对齐本文件 CrossProcLock 模式）：libc 依赖仅声明
+/// 于 Cargo.toml 的 macOS target 段，显式 macos 门控保「其他平台可编译」约定
+///（同 CrossProcLock stub 的 CI 单测先例）。
+fn local_hostname() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 256];
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if ok == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        "PC".to_string()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // 其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）
+        "PC".to_string()
     }
 }
 
@@ -630,12 +818,11 @@ fn extend_device_headers_with(
     let has = |h: &[(String, String)], k: &str| {
         h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
     };
-    // issue #116：计算机名真值经 ASCII 净化后再入头
-    let hostname =
-        sanitize_header_ascii(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string()));
+    // issue #116：计算机名真值（跨平台取值，见 local_hostname）经 ASCII 净化后再入头
+    let hostname = sanitize_header_ascii(&local_hostname());
     for (k, v) in [
         ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
-        ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
+        ("Cosy-MachineOS", client_machine_os().to_string()),
         ("Cosy-MachineHostname", hostname),
     ] {
         if !has(h, k) {
@@ -660,7 +847,7 @@ fn extend_device_headers_with(
 }
 
 /// 见 [`extend_device_headers_with`]：真值经 [`resolve_native_risk_identity`]
-/// 解析并缓存，调用开销≈0
+/// 解析并缓存终态（瞬时失败有 60s 冷却），稳态调用开销≈0
 pub fn extend_client_device_headers(h: &mut Vec<(String, String)>, creds: &QoderCreds) {
     extend_device_headers_with(h, creds, resolve_native_risk_identity());
 }
@@ -828,7 +1015,10 @@ fn apply_refresh_response(out: &mut QoderCreds, body: &serde_json::Value, now_ms
     }
     out.expires_at_ms = Some(
         i_of(fs_utils::dig(body, &["expiresIn", "expires_in"]))
-            .map(|e| now_ms + normalize_expires_in(e))
+            // 溢出硬化（审查 P2）：normalize_expires_in(i64::MAX) 封顶 i64::MAX 后朴素
+            // 相加仍会溢出——saturating_add 封顶，下游 clamp_expires_at 将超界值钳为
+            // 「无过期信息」（保守走刷新路径）
+            .map(|e| now_ms.saturating_add(normalize_expires_in(e)))
             .or_else(|| {
                 let s = s_of(fs_utils::dig(body, &["expires_at", "expiresAt"]));
                 chrono::DateTime::parse_from_rfc3339(&s)
@@ -846,7 +1036,7 @@ fn apply_refresh_response(out: &mut QoderCreds, body: &serde_json::Value, now_ms
         body,
         &["refresh_token_expires_in", "refreshTokenExpiresIn"],
     )) {
-        out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
+        out.refresh_expires_at_ms = Some(now_ms.saturating_add(normalize_expires_in(e)));
     } else {
         let s = s_of(fs_utils::dig(
             body,
@@ -971,7 +1161,10 @@ pub(crate) fn normalize_expires_in(e: i64) -> i64 {
     if e > 2_592_000 {
         e
     } else {
-        e * 1000
+        // 溢出硬化（审查 P2）：畸形负极端值（如 i64::MIN）×1000 会溢出——debug 构建
+        // panic、release 回绕为正。saturating_mul 封顶后调用方 clamp_expires_at 对
+        // 非正值一律视为「无过期信息」（保守走刷新路径），语义不变
+        e.saturating_mul(1000)
     }
 }
 
@@ -1045,7 +1238,8 @@ pub fn exchange_job_token(
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let expires_at_ms = i_of(fs_utils::dig(&b, &["expires_in", "expiresIn"]))
                         .map(normalize_expires_in)
-                        .map(|e| now_ms + e);
+                        // 溢出硬化（审查 P2，与 refresh_token_once_ex 同款口径）
+                        .map(|e| now_ms.saturating_add(e));
                     let refresh_token = s_of(fs_utils::dig(&b, &["refresh_token", "refreshToken"]));
                     fs_utils::app_log(
                         data_dir,
@@ -1095,8 +1289,8 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/vault_down/fresh/
-/// expired_needs_relogin/refreshed/refreshed_unsaved/refresh_failed/auth_dead/
-/// pat_rejected/refresh_busy。
+/// near_expiry_no_refresh/expired_needs_relogin/refreshed/refreshed_unsaved/
+/// refresh_failed/auth_dead/pat_rejected/refresh_busy。
 /// vault_down（issue #153 修复 2）：vault 系统性故障（DPAPI/快照/锁）导致凭证
 /// 读出为空，与「确实无凭证」区分——暂态语义，调用方不得据此永久禁用账号。
 /// refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用当前
@@ -1151,7 +1345,8 @@ pub fn ensure_fresh(
         let Some(_cross_guard) = cross_refresh_guard(state, acct_id) else {
             return (creds, false, "refresh_busy");
         };
-        // 持锁后二次检查（对齐 H-1 进程内锁语义）：等锁期间他进程可能已换好落库
+        // 持锁后二次检查（对齐 H-1 进程内锁语义）：等锁期间他进程可能已换好落库；
+        // now_ms 重取（3.8.5 审查 L4：跨进程锁等待最长 5s，复用锁前时刻会临界偏差）
         let creds = effective_creds(state, acct_id);
         if creds.access_token.is_empty() {
             // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds
@@ -1161,6 +1356,7 @@ pub fn ensure_fresh(
             }
             return (creds, false, "no_credential");
         }
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let need = creds.access_token.starts_with("pt-")
             || creds
                 .expires_at_ms
@@ -1205,6 +1401,14 @@ pub fn ensure_fresh(
             if remain_h > lazy_hours as f64 {
                 return (creds, false, "fresh");
             }
+            if remain_h > 0.0 {
+                // 临期但仍有效（2026-10-05 审查修复）：无刷新令牌无法续期，但当前
+                // token 未过期、本轮请求（签到/余额/网关）可正常工作——放行并如实
+                // 标注，不再误判「已过期」整轮跳过丢一次可成功的签到；调用方传
+                // i64::MAX（恒刷路径）时 remain_h > lazy_hours 恒假，全新凭证同样
+                // 落此分支如实上报（续期命令据此提示「仍有效但无法自动续期」）
+                return (creds, false, "near_expiry_no_refresh");
+            }
         } else {
             // 无 expires_at 也无 refresh_token：无法判定新鲜度也无法刷新，按需重登
             return (creds, false, "expired_needs_relogin");
@@ -1224,7 +1428,8 @@ pub fn ensure_fresh(
     let Some(_cross_guard) = cross_refresh_guard(state, acct_id) else {
         return (creds, false, "refresh_busy");
     };
-    // 持锁后二次检查：等锁期间他进程可能已刷新落库，直接复用新令牌
+    // 持锁后二次检查：等锁期间他进程可能已刷新落库，直接复用新令牌；
+    // now_ms 重取（3.8.5 审查 L4：同上，锁等待后旧时刻临界偏差）
     let creds = effective_creds(state, acct_id);
     if creds.access_token.is_empty() {
         // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds 会
@@ -1234,6 +1439,7 @@ pub fn ensure_fresh(
         }
         return (creds, false, "no_credential");
     }
+    let now_ms = chrono::Utc::now().timestamp_millis();
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
         if remain_h > lazy_hours as f64 {
@@ -1327,7 +1533,12 @@ pub fn sync_pool_expiry(state: &AppState, aid: &str, creds: &QoderCreds) {
         }
     }
     if changed {
-        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+        if let Err(e) = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool)
+        {
+            // 回写失败不可静默（审查 2026-10-05）：过期时间/登录态丢失会导致调度
+            // 口径滞后，落日志便于事后排查（调用方为调度通道，无法再上抛）
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] 池回写失败: {e}"));
+        }
     }
 }
 
@@ -1353,7 +1564,11 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
         }
     }
     if changed {
-        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+        // 回写失败落日志（审查 2026-10-05，sync_pool_expiry 同款）；成功日志保留其后
+        if let Err(e) = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool)
+        {
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] 池回写失败: {e}"));
+        }
         fs_utils::app_log(
             &state.data_dir,
             &format!("[qoder] 账号 {acct_id} 已标记需重新登录（{reason}）"),
@@ -1389,24 +1604,28 @@ pub struct CrossProcLock {
 
 /// 跨进程锁获取失败原因（可观测：创建失败 ≠ 真被占用——2026-10-04 排查教训：
 /// 锁名误用多段路径时 CreateMutexW 恒报 ERROR_PATH_NOT_FOUND(3)，旧实现一律
-/// 误报「另一进程正在执行」，调度器每分钟空转 skip 且刷新永不执行）
+/// 误报「另一进程正在执行」，调度器每分钟空转 skip 且刷新永不执行）。
+/// 跨平台（审查 2026-10-05）：Windows=CreateMutexW/WaitForSingleObject 错误码，
+/// macOS=flock(2) errno（CreateFailed/WaitFailed 携带 raw_os_error）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrossProcLockFail {
-    /// CreateMutexW 失败（内核错误码）——锁机制本身不可用，非他方占用
+    /// 锁创建失败（Win32 err / errno）——锁机制本身不可用，非他方占用
     CreateFailed(u32),
     /// 对方持有中，等待 wait_ms 超时——真占用，幂等跳过无损失
     Busy,
-    /// WaitForSingleObject 系统级失败（内核错误码）
+    /// 锁等待系统级失败（Win32 err / errno）
     WaitFailed(u32),
 }
 
 impl CrossProcLockFail {
     /// 人类可读描述（调用方拼进 skip 日志，便于一眼区分误报与真占用）
     pub fn describe(&self) -> String {
+        // 错误码语义标签随平台（Win32 GetLastError / POSIX errno）
+        let label = if cfg!(windows) { "Win32" } else { "errno" };
         match self {
-            Self::CreateFailed(e) => format!("锁创建失败（Win32 err={e}，非他方占用）"),
+            Self::CreateFailed(e) => format!("锁创建失败（{label} err={e}，非他方占用）"),
             Self::Busy => "他方进程持有中（等待超时）".to_string(),
-            Self::WaitFailed(e) => format!("锁等待系统失败（Win32 err={e}）"),
+            Self::WaitFailed(e) => format!("锁等待系统失败（{label} err={e}）"),
         }
     }
 }
@@ -1487,11 +1706,113 @@ impl Drop for CrossProcLock {
     }
 }
 
-/// 非 Windows 平台占位（本项目仅 Windows 发布，保 CI 单测可编译）
-#[cfg(not(windows))]
+/// macOS 实装（审查 2026-10-05）：flock(2) 锁文件，对齐 Windows 命名 Mutex 的
+/// 「进程崩溃由 OS 回收」语义——fd 关闭（Drop/进程退出）即自动释放。锁文件
+/// `data_dir/conf/crossproc_{ns}_{safe_scope}.{hash16}`，hash16 沿用 data_dir 短哈希
+/// 隔离（便携版多数据目录互不误伤）；scope 白名单外字符替换为 `_`（Windows 锁名
+/// 单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）。等待策略：
+/// LOCK_EX|LOCK_NB 每 25ms 轮询至 wait_ms 超时（WaitForSingleObject 的最小等价物）。
+/// 平台语义差异（审查提示）：flock 不可重入（同线程二次获取即 EWOULDBLOCK），
+/// 且按 open file description 在同进程跨线程同样互斥——与 Windows Mutex 的
+/// 「同线程可重入」不同；新增调用方不得嵌套获取同名锁（现有各 ns/scope 无嵌套）。
+#[cfg(target_os = "macos")]
+pub struct CrossProcLock {
+    /// 持有锁文件句柄：Drop 关闭 fd 即释放 flock
+    _file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl CrossProcLock {
+    /// 尝试在 wait_ms 内获取 flock；成功返回 Some(guard)，失败返回 None + 具体原因
+    /// （Busy=他方持有超时，CreateFailed=锁文件创建失败，WaitFailed=flock 系统错误）
+    pub fn try_acquire(
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本（审查 2026-10-07 补齐，对齐 Windows impl 同名方法签名）：
+    /// main 合并引入的调用点（checkin_results/wb_common）直接使用 4 参
+    /// try_acquire_ns，macOS 缺实现会在 mac 目标下 E0599 编译失败。ns 进锁文件名：
+    /// qoder/wb 域同名 scope 锁互不串扰；ns/scope 白名单外字符替换为 `_`
+    ///（单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）
+    ///
+    /// 锁文件名 v2（ns 前缀）；v1（旧版 macOS 实装）为 `crossproc_{scope}.{hash16}`。
+    /// v1↔v2 升级并存窗口内新旧版本进程同名 scope 互斥失效，后果为可自愈的
+    /// AuthDead 误标（refresh 域）/ 幂等重放（checkin 域）；fd-based flock，
+    /// 旧锁文件残留无害
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        use std::os::unix::io::AsRawFd;
+        let safe = |s: &str| {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+                .collect::<String>()
+        };
+        let mut h = Sha256::new();
+        h.update(data_dir.to_string_lossy().as_bytes());
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let lock_dir = data_dir.join("conf");
+        if let Err(e) = std::fs::create_dir_all(&lock_dir) {
+            return (
+                None,
+                Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+            );
+        }
+        let path =
+            lock_dir.join(format!("crossproc_{}_{}.{}", safe(ns), safe(scope), &hex[..16]));
+        // truncate(false)：多进程并发打开同一锁文件，截断会互相破坏 fd 偏移语义
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    None,
+                    Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+                );
+            }
+        };
+        // 轮询至 deadline（wait_ms=0 仅试一次，与 Windows WAIT_TIMEOUT 语义对齐）
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return (Some(Self { _file: file }), None);
+            }
+            let err = std::io::Error::last_os_error();
+            // WouldBlock（EWOULDBLOCK/EAGAIN）= 他方持有中 → 可等待重试；
+            // 其余 errno = 系统级失败
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return (
+                    None,
+                    Some(CrossProcLockFail::WaitFailed(err.raw_os_error().unwrap_or(0) as u32)),
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                return (None, Some(CrossProcLockFail::Busy));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+/// 其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct CrossProcLock;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl CrossProcLock {
     pub fn try_acquire(
         data_dir: &std::path::Path,
@@ -1752,6 +2073,20 @@ mod tests {
         let exp = now + normalize_expires_in(86_400_000);
         let hours = (exp - now) as f64 / 3_600_000.0;
         assert!((hours - 24.0).abs() < 0.01, "24h 窗口");
+    }
+
+    /// P2 溢出硬化：畸形大/小 expires_in 不得 panic / 回绕——服务端脏数据经
+    /// saturating_mul/saturating_add 封顶后，由 clamp_expires_at 钳为「无过期信息」
+    ///（保守走刷新路径），不再有 debug 构建算术溢出 panic 面
+    #[test]
+    fn normalize_expires_in_saturates_on_overflow() {
+        // i64::MAX：走「>30d 阈值判毫秒原样」分支，恒等返回不回绕为负
+        assert_eq!(normalize_expires_in(i64::MAX), i64::MAX);
+        // i64::MIN：秒级分支 saturating_mul 封顶为 i64::MIN（原 e*1000 debug 下 panic）
+        assert_eq!(normalize_expires_in(i64::MIN), i64::MIN);
+        // 正常边界回归：阈值内秒级 ×1000、超阈值毫秒原样（对齐既有测试口径）
+        assert_eq!(normalize_expires_in(86_400), 86_400_000);
+        assert_eq!(normalize_expires_in(2_592_001), 2_592_001);
     }
 
     /// Q1：刷新失败状态分类——429（限流）/408（超时）为可恢复暂态归 Transient，

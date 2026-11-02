@@ -468,7 +468,7 @@ export default function QoderAccounts() {
       } else if (r.found) {
         pushToast('info', r.reason || '已发现 IDE 登录态，无需变更');
       } else {
-        pushToast('warn', r.reason || '未在 Qoder IDE 本地存储发现登录态');
+        pushToast('warn', r.reason || '未在 Qoder CN IDE 本地存储发现登录态');
       }
       void refresh();
     } catch (err) {
@@ -514,6 +514,8 @@ export default function QoderAccounts() {
     if (!editing || editBusy) return;
     setEditBusy(true);
     try {
+      // 空名 → undefined（不修改 nickname）：后端 Some("") 会把昵称清空为空串，
+      // 对齐 Buddy/Doubao 账号编辑「留空即保持原名」的既有语义
       await api.qoder.accountSave(editing.id, editName.trim() || undefined, editNote);
       pushToast('success', '已保存');
       setEditing(null);
@@ -551,7 +553,7 @@ export default function QoderAccounts() {
     setSnapBusy(a.id);
     try {
       await api.profiles.backup(a.id, targetApp);
-      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照（${targetApp === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}）…`);
+      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照（${targetApp === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}）…`);
     } catch (err) {
       setSnapBusy(null);
       pushToast('error', `备份失败：${String(err)}`);
@@ -592,7 +594,7 @@ export default function QoderAccounts() {
       } else if (t.kind === 'restore') {
         setSnapBusy(t.slot);
         await api.profiles.restore(t.slot, snapTarget);
-        pushToast('info', `正在恢复「${t.name || t.slot}」的快照到 ${snapTarget === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}…`);
+        pushToast('info', `正在恢复「${t.name || t.slot}」的快照到 ${snapTarget === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}…`);
       } else {
         setSnapBusy(t.slot);
         await api.profiles.delete(t.slot, snapTarget);
@@ -656,7 +658,8 @@ export default function QoderAccounts() {
         filters: [{ name: 'JSON', extensions: ['json'] }],
       });
       if (!filePath) {
-        // 取消保存对话框视同关闭弹框：清空密码残留，避免下次导出被预填（审查 F2 同语义）
+        // 取消保存对话框：凭据确认子弹框已先关闭，仅清空密码残留避免下次导出
+        // 被预填（审查 F2 同语义）；导出弹框保持打开供用户重试
         setExportPwd('');
         setExportPwd2('');
         return;
@@ -797,7 +800,7 @@ export default function QoderAccounts() {
               className="btn-outline"
               disabled={scanningIde || oauthRunning}
               onClick={() => void scanIde()}
-              title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
+              title="解密 IDE 本地存储登录态（Windows: Local State+DPAPI / macOS: 钥匙串 Safe Storage）发现并导入当前登录账号"
             >
               {scanningIde ? <Loader2 size={15} className="animate-spin" /> : <ScanSearch size={15} />} 扫描本地账号
             </button>
@@ -943,12 +946,12 @@ export default function QoderAccounts() {
                         <span className="font-medium">{a.nickname || a.id}</span>
                         {/* 客户端当前登录标记：本机 auth.v1.dat/state.vscdb 解密 uid 与池匹配（对齐 Trae 双徽标） */}
                         {liveLogins?.work && (a.id === liveLogins.work || a.uid === liveLogins.work) && (
-                          <Badge tone="violet" title="当前 Qoder Work 客户端登录的账号">
+                          <Badge tone="violet" title="当前 Qoder CN 客户端登录的账号">
                             Work 登录中
                           </Badge>
                         )}
                         {liveLogins?.ide && (a.id === liveLogins.ide || a.uid === liveLogins.ide) && (
-                          <Badge tone="brand" title="当前 Qoder IDE 客户端登录的账号">
+                          <Badge tone="brand" title="当前 Qoder CN IDE 客户端登录的账号">
                             IDE 登录中
                           </Badge>
                         )}
@@ -995,8 +998,11 @@ export default function QoderAccounts() {
                           void api.qoder.accountMove(a.id, gid).then(() => {
                             setAccounts((prev) => prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)));
                             reloadGroups();
-                            // 审查修复（L38）：行内分组调整成功补可见反馈（原先仅失败有提示）
-                            pushToast('success', `「${a.nickname || a.id}」分组已调整`);
+                            // Low 修复（审查 L38）：写操作成功可见反馈（原先仅失败有提示）
+                            pushToast(
+                              'success',
+                              gid ? `「${a.nickname || a.id}」分组已调整` : `「${a.nickname || a.id}」已移出分组`,
+                            );
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
                       />
@@ -1024,16 +1030,16 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
                         <button
-                          className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${busy && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          title="切换此账号到…（Qoder Work / Qoder IDE 双目标）"
-                          disabled={busy}
+                          className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(busy || snapBusy != null) && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          title="切换此账号到…（Qoder CN / Qoder CN IDE 双目标）"
+                          disabled={busy || snapBusy != null}
                           onClick={(e) => openAppMenu(a, 'switch', e)}
                         >
                           {switchingTo === a.id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
                         <button
                           className={`btn-ghost !p-2 ${snapBusy === a.id ? 'text-amber-500' : ''} ${(snapBusy != null || busy) && snapBusy !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          title="保存当前登录态到该账号槽位（Qoder Work / Qoder IDE 双目标）"
+                          title="保存当前登录态到该账号槽位（Qoder CN / Qoder CN IDE 双目标）"
                           disabled={snapBusy != null || busy}
                           onClick={(e) => openAppMenu(a, 'save', e)}
                         >
@@ -1098,8 +1104,8 @@ export default function QoderAccounts() {
             </div>
             <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
               {([
-                { app: 'QoderWork' as const, label: 'Qoder Work', desc: 'Qoder Work 桌面客户端', Icon: AppWindow },
-                { app: 'Qoder' as const, label: 'Qoder IDE', desc: 'Qoder CN IDE 桌面客户端', Icon: TerminalSquare },
+                { app: 'QoderWork' as const, label: 'Qoder CN', desc: 'Qoder CN 桌面客户端', Icon: AppWindow },
+                { app: 'Qoder' as const, label: 'Qoder CN IDE', desc: 'Qoder CN IDE 桌面客户端', Icon: TerminalSquare },
               ]).map((opt) => (
                 <button
                   key={opt.app}
@@ -1107,9 +1113,12 @@ export default function QoderAccounts() {
                     const { id, kind } = appMenu;
                     setAppMenu(null);
                     const target = accounts.find((x) => x.id === id);
-                    if (kind === 'switch') {
+                    if (!target) {
+                      // 菜单打开到点击之间账号可能被删除/列表已刷新（对齐 BuddyAccounts 门禁）
+                      pushToast('warn', '账号信息已变化，请刷新列表后重试');
+                    } else if (kind === 'switch') {
                       void switchTo(id, opt.app);
-                    } else if (target) {
+                    } else {
                       void backupSnapshot(target, opt.app);
                     }
                   }}
@@ -1196,7 +1205,7 @@ export default function QoderAccounts() {
         onClose={() => {
           if (!snapBusy) setShowSnapshots(false);
         }}
-        title={snapTarget === 'Qoder' ? '登录态快照 · Qoder IDE' : '登录态快照 · Qoder Work'}
+        title={snapTarget === 'Qoder' ? '登录态快照 · Qoder CN IDE' : '登录态快照 · Qoder CN'}
         footer={
           <div className="flex w-full items-center justify-between">
             <button
@@ -1225,7 +1234,7 @@ export default function QoderAccounts() {
                   void refreshSnapshots(t);
                 }}
               >
-                {t === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}
+                {t === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}
               </button>
             ))}
           </div>
@@ -1234,14 +1243,14 @@ export default function QoderAccounts() {
             <span>
               {snapTarget === 'Qoder'
                 ? '快照保存于 data/profiles_qoder/<账号 id>/，含 IDE 登录态与本地存储；恢复到客户端时自动注入该账号绑定的设备指纹。建议先在 IDE 登录目标账号后，于账号池点击「备份」保存其登录态。'
-                : '快照保存于 data/profiles_qoder_work/<账号 id>/，为「以 Work 打开/切换 Work」准备的登录态副本；切回 IDE 不受影响。可在账号池「以…打开」菜单选择 Qoder Work 备份。'}
+                : '快照保存于 data/profiles_qoder_work/<账号 id>/，为「以 Qoder CN 打开/切换 Qoder CN」准备的登录态副本；切回 IDE 不受影响。可在账号池「以…打开」菜单选择 Qoder CN 备份。'}
             </span>
           </div>
           {snapshotSlots.length === 0 ? (
             <p className="py-4 text-center text-xs text-slate-400">
               {snapTarget === 'Qoder'
                 ? '暂无快照。在账号池操作列点击「备份」为当前 IDE 登录态建档。'
-                : '暂无 Qoder Work 快照。在账号行「保存当前登录态到…」菜单选择 Qoder Work 建档。'}
+                : '暂无 Qoder CN 快照。在账号行「保存当前登录态到…」菜单选择 Qoder CN 建档。'}
             </p>
           ) : (
             <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
@@ -1274,7 +1283,7 @@ export default function QoderAccounts() {
                         <td className="px-3 py-1.5">
                           <div className="flex justify-end gap-1">
                             <button
-                              title="恢复（将该槽位快照恢复到 Qoder IDE，覆盖当前登录态）"
+                              title="恢复（将该槽位快照恢复到 Qoder CN IDE，覆盖当前登录态）"
                               className="btn-ghost !p-2 text-sky-500"
                               disabled={snapBusy != null}
                               onClick={() => restoreSnapshot(p.slot, label)}
@@ -1334,7 +1343,7 @@ export default function QoderAccounts() {
           {confirmTarget?.kind === 'restore' && (
             <>
               确认将账号「{confirmTarget.name || confirmTarget.slot}」的快照恢复到
-              {snapTarget === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}？
+              {snapTarget === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}？
               <div className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                 当前{snapTarget === 'Qoder' ? ' IDE' : ' Work'}登录态将被覆盖。
               </div>
@@ -1738,7 +1747,8 @@ export default function QoderAccounts() {
         </div>
       </Modal>
 
-      {/* 分组管理弹窗（对齐 BuddyAccounts：复用 GroupsModal，强加 Buddy 分组体系） */}
+      {/* 分组管理弹窗（对齐 BuddyAccounts：复用 GroupsModal，强加 Buddy 分组体系）；
+          F14：四回调失败 toast 后 rethrow，由 GroupsModal 统一捕获防 unhandled rejection */}
       <GroupsModal
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
@@ -1747,41 +1757,41 @@ export default function QoderAccounts() {
         onCreate={async (name, color) => {
           try {
             await api.qoder.groups.create(name, color);
+            reloadGroups();
           } catch (err) {
             pushToast('error', `新建分组失败：${String(err)}`);
             throw err; // rethrow 供 GroupsModal 按失败处理（不清空表单/不关弹框）
           }
-          reloadGroups();
         }}
         onRename={async (id, name) => {
           try {
             await api.qoder.groups.update(id, { name });
+            reloadGroups();
           } catch (err) {
             pushToast('error', `重命名失败：${String(err)}`);
             throw err;
           }
-          reloadGroups();
         }}
         onRecolor={async (id, color) => {
           try {
             await api.qoder.groups.update(id, { color });
+            reloadGroups();
           } catch (err) {
             pushToast('error', `修改颜色失败：${String(err)}`);
             throw err;
           }
-          reloadGroups();
         }}
         onDelete={async (id) => {
           try {
             await api.qoder.groups.remove(id);
+            // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
+            setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
+            if (filter === id) setFilter('all');
+            reloadGroups();
           } catch (err) {
             pushToast('error', `删除分组失败：${String(err)}`);
             throw err;
           }
-          // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
-          setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
-          if (filter === id) setFilter('all');
-          reloadGroups();
         }}
       />
 

@@ -39,10 +39,6 @@ fn now_str() -> String {
 fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     crate::vault::dpapi::unprotect(data)
 }
-#[cfg(not(windows))]
-fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
-    Err("仅支持 Windows".into())
-}
 
 /// Local State → os_crypt.encrypted_key（base64，DPAPI 包裹）→ AES-256 密钥
 #[cfg(windows)]
@@ -110,6 +106,7 @@ pub(crate) fn read_active_profile_name(user_data: &Path) -> Option<String> {
 }
 
 /// 复制 Cookies 库到临时目录后读取（规避客户端运行时文件锁）；返回临时目录路径
+#[cfg(windows)] // 仅 read_profile_target_cookies（Windows DPAPI 链）消费；mac 走 chromium.rs
 fn copy_cookies_db(prof: &Path) -> Result<(PathBuf, PathBuf), String> {
     let mut db = prof.join("Network").join("Cookies");
     if !db.exists() {
@@ -233,8 +230,9 @@ fn read_multi_sids(user_data: &Path) -> HashMap<String, String> {
         .to_string();
     let mut out = HashMap::new();
     if let Some(i) = ent.find("x-tt-multi-sids") {
-        // 对齐 python：跳过 18 字节（15 字符键 + `":"`），取至下一引号
-        let after = &ent[(i + "x-tt-multi-sids\":\"".len()).min(ent.len())..];
+        // 对齐 python：跳过 18 字节（15 字符键 + `":"`），取至下一引号；
+        // get 切片防畸形输入越界（审查 P3）
+        let after = ent.get((i + "x-tt-multi-sids\":\"".len()).min(ent.len())..).unwrap_or("");
         let val = after.split('"').next().unwrap_or("");
         let decoded = urlencoding::decode(val).unwrap_or_default();
         for pair in decoded.split('|') {
@@ -381,7 +379,10 @@ fn parse_sid_guard(value: &str) -> Option<String> {
 pub fn probe_slot_session(user_data: &Path, uid: &str, url: &str) -> Value {
     let agent = probe_agent();
     let sid = if uid.is_empty() { String::new() } else { read_multi_sids(user_data).get(uid).cloned().unwrap_or_default() };
+    // cookie 解密兜底仅 Windows 接线——mac 构建下两变量无二次赋值，抑制 unused_mut
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut source = "local_state_multi_sids";
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut sid = sid;
     if sid.is_empty() {
         // 兜底：cookie 解密（仅 ASCII 明文可用；密文为客户端级二次加密，不可验证）
@@ -415,15 +416,15 @@ pub fn probe_slot_session(user_data: &Path, uid: &str, url: &str) -> Value {
 /// 实测：桌面客户端 cookie 值为客户端级二次加密的密文（解出非 ASCII），不能当 sessionid 用
 fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
     let mut sources: Vec<Value> = Vec::new();
-    let diagnose = |label: &str, ud: &Path, sources: &mut Vec<Value>, logs: &mut Vec<String>| {
+    let diagnose = |label: &str, _ud: &Path, sources: &mut Vec<Value>, logs: &mut Vec<String>| {
         #[cfg(windows)]
-        let res = read_doubao_cookies(ud).map(|c| {
+        let res = read_doubao_cookies(_ud).map(|c| {
             let ascii_n = c.values().filter(|v| v.is_ascii()).count();
             (c.len(), Some(ascii_n), c.keys().cloned().collect::<Vec<_>>())
         });
         #[cfg(not(windows))]
         let res: Result<(usize, Option<usize>, Vec<String>), String> =
-            Err("仅支持 Windows".into());
+            Err("macOS 暂不支持 cookie 直读，请使用 MITM 捕获".into());
         match res {
             Err(e) => {
                 logs.push(format!("{label} 解密失败：{e}"));
@@ -444,8 +445,8 @@ fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
         }
     };
 
-    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let ud = PathBuf::from(localappdata).join("Doubao").join("User Data");
+    // 单一事实源（合并审查 #1：Windows 带 User Data 层，mac 直挂 Doubao 根）
+    let ud = crate::switcher::profile::doubao_data_dir();
     if ud.exists() {
         diagnose("live", &ud, &mut sources, logs);
     }

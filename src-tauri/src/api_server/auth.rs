@@ -11,9 +11,15 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - 仅 /health 豁免且仅限环回监听（响应已收敏为 status/running 存活布尔，完整
-///   诊断在需鉴权的 /status）；/healthz 不豁免——其 503 体含
-///   reason=no healthy account，非环回走 Key 鉴权（fail-closed）
+/// - /healthz 跳过鉴权仅限**环回监听**（响应仅 status/solo_available/
+///   wb_available 布尔 + 503 时通用 reason 字符串，无账号数/模型/密钥等敏感
+///   信息，供定位探活/看门狗直接探测；非环回监听时不豁免，与 /health 及
+///   ensure_bind_auth_policy「非环回必须有启用 Key」的 fail-closed 口径一致，
+///   防止局域网探测账号池健康状态）
+/// - /health 跳过鉴权仅限**环回监听**（响应已收敏为 status/running 存活布尔，
+///   完整诊断在需鉴权的 /status；非环回监听时不豁免，与其他端点一致走 Key
+///   鉴权 fail-closed，与 ensure_bind_auth_policy「非环回必须有启用 Key」的
+///   启动门禁口径一致）
 /// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
@@ -27,19 +33,22 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
-        // 环回豁免与 bind 物理同源（2026-10-12 审查 M3）：按实际绑定 host 判定，
-        // 不重读配置——改配置未重启时不会误用新配置值放行（fail-open）。非环回
-        // 监听时 /health 不豁免，与其他端点一致走 Key 鉴权（fail-closed；
-        // 响应本身已收敏为存活布尔，见 routes::health）
-        let host = state
-            .listen_host
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if super::server::is_loopback_host(&host) {
-            return next.run(request).await;
+    // 健康探针路径免鉴权：/healthz 与 /health 均收敏为布尔，环回监听下豁免，
+    // 非环回须带 Key（fail-closed）——探活/看门狗均为本机进程，环回限定不影响功能
+    match request.uri().path() {
+        "/healthz" | "/health" => {
+            // 环回豁免与 bind 物理同源（2026-10-12 审查 M3）：按实际绑定 host 判定，
+            // 不重读配置——改配置未重启时不会误用新配置值放行（fail-open）
+            let host = state
+                .listen_host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if super::server::is_loopback_host(&host) {
+                return next.run(request).await;
+            }
         }
+        _ => {}
     }
 
     // 请求体预检（issue #21）：Content-Length 超过网关上限时在 body 提取器之前

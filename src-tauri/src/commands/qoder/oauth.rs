@@ -27,15 +27,21 @@ impl Drop for OAuthGuard {
     }
 }
 
-/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
-/// 由系统按协议关联选默认浏览器——explorer.exe 直开在部分受限/精简环境下会被
-/// 拒绝或无窗口；URL 先经 https/http 前缀 + 引号/空格校验，单参数传递无 shell
-/// 层，& / % 等保留字无需转义）
-#[cfg(windows)]
-fn open_in_browser(url: &str) -> Result<(), String> {
+/// URL 白名单校验（https/http 前缀 + 拒绝引号/空格——防参数注入，跨平台共用）
+fn validate_open_url(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
+    Ok(())
+}
+
+/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
+/// 由系统按协议关联选默认浏览器——explorer.exe 直开在部分受限/精简环境下会被
+/// 拒绝或无窗口；URL 先经 validate_open_url 校验，单参数传递无 shell 层，
+/// & / % 等保留字无需转义）
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    validate_open_url(url)?;
     let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
     let result = unsafe {
@@ -56,14 +62,39 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
-/// 非 Windows 占位（explorer/creation_flags 为 Windows 专属，逐函数门控
-/// 对齐 common.rs is_running 惯例）
-/// macOS 适配预留：用 `open <url>` 子进程（Command::new("open").arg(url)）等价替换，
-/// URL 校验逻辑（https/http 前缀 + 引号/空格拒绝）跨平台保留；Linux 分支可顺手
-/// 用 `xdg-open`，三平台收敛为 cfg 分支同签名函数，调用方 qoder_oauth_login 零改动
-#[cfg(not(windows))]
+/// macOS 实装（2026-10-05 合并审查）：`open <url>` 走 LaunchServices 默认浏览器，
+/// 与 Windows explorer 直开同语义；URL 校验逻辑跨平台共用，调用方 qoder_oauth_login 零改动。
+/// 审查 #9：改走 sys_command 收口（对齐 workbuddy/cert/env 同款）——保持命令构建
+/// 单一来源，平台附加标志（如 Windows CREATE_NO_WINDOW）变更时此处自动跟随
+#[cfg(target_os = "macos")]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    validate_open_url(url)?;
+    // 审查修复（Low）：等待 `open` 退出并校验状态码——LaunchServices 层失败
+    // （无默认浏览器/无 URL handler）只反映在退出码里，spawn 即 Ok 会漏报
+    //（对齐 Windows 分支 ShellExecuteW ≤32 失败可观测口径；open 通常 <100ms 返回）
+    // 审查修复（Low）：改用带超时等待——open 异常挂起时 .output() 会无限阻塞
+    // 命令线程；10s 上限远大于常态 <100ms，超时 kill 保线程可用
+    let mut cmd = crate::platform::cmd::sys_command("open");
+    cmd.arg(url);
+    let status = crate::platform::cmd::sys_status_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开浏览器失败（open 退出码 {:?}）",
+            status.code()
+        ))
+    }
+}
+
+/// 其余平台占位（无统一系统浏览器打开入口，维持拒绝）
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_in_browser(_url: &str) -> Result<(), String> {
-    Err("打开浏览器仅支持 Windows".into())
+    Err("打开浏览器暂不支持该平台".into())
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, message: &str, auth_url: Option<&str>) {
@@ -103,6 +134,11 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
     } else {
         qoder_oauth::DeviceFlow::new()
     };
+    // SSO 基址覆盖可观测性（审查修复 中-1）：env 覆盖生效（http 附加告警）/
+    // 非法回退均落日志——官方端点轮换排障与 env 注入发现都依赖此线索
+    if let Some(note) = &flow.sso_base_note {
+        fs_utils::app_log(&state.inner().data_dir, note);
+    }
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 登录页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {

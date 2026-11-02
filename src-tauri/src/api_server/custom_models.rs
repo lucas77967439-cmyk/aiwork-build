@@ -170,8 +170,11 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     if m.name.is_empty() {
         return Err("模型名称不能为空".into());
     }
+    // 审查修复（A5）：scheme 不区分大小写（RFC 3986）——`HTTPS://a.com` 合法，
+    // 原实现对大写 scheme 误拒；校验用小写副本，存储保留用户书写原样
+    let lower_url = m.base_url.to_ascii_lowercase();
     if m.base_url.is_empty()
-        || (!m.base_url.starts_with("http://") && !m.base_url.starts_with("https://"))
+        || (!lower_url.starts_with("http://") && !lower_url.starts_with("https://"))
     {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
@@ -274,14 +277,8 @@ mod tests {
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Fixture {
-            let dir = std::env::temp_dir().join(format!(
-                "twa_custom_{}_{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
+            // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+            let dir = crate::fs_utils::test_temp_dir("twa_custom");
             std::fs::create_dir_all(dir.join("data")).unwrap();
             Fixture(dir)
         }
@@ -362,12 +359,14 @@ mod tests {
         assert_eq!(chat_url("https://api.openai.com/v1/"), "https://api.openai.com/v1/chat/completions");
     }
 
-    /// 校验：空名称 / 非法 base_url 拒绝
+    /// 校验：空名称 / 非法 base_url 拒绝；大写 scheme 合法（A5：scheme 不区分大小写）
     #[test]
     fn t04_validation() {
         let f = Fixture::new();
         assert!(upsert(&f.0, CustomModel { name: "".to_string(), base_url: "https://a.com".into(), ..Default::default() }).is_err());
         assert!(upsert(&f.0, CustomModel { name: "x".into(), base_url: "ftp://a.com".into(), ..Default::default() }).is_err());
+        // A5 审查修复：大写 scheme 不再误拒（RFC 3986 scheme 大小写不敏感）
+        assert!(upsert(&f.0, CustomModel { name: "up".into(), base_url: "HTTPS://a.com".into(), ..Default::default() }).is_ok());
     }
 
     /// P1：同名不同 base_url 多条 upsert 成功（上游组）；find_enabled_all 全量返回；
@@ -434,6 +433,17 @@ mod tests {
         assert!(
             upsert(&f.0, CustomModel { name: "m".into(), base_url: "HTTPS://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).is_err(),
             "大小写/默认端口变体须命中查重"
+        );
+        // macos_main 补充：scheme 不匹配的默认端口（http 服务的 :443）是显式
+        // 非默认端口，与 https://a.com 不同上游，放行
+        assert!(
+            upsert(&f.0, CustomModel { name: "m".into(), base_url: "http://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).is_ok(),
+            "scheme 不匹配的默认端口不剥"
+        );
+        // macos_main 补充：:4430 等 443 前缀端口不受 strip_suffix 误剥影响
+        assert!(
+            upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com:4430".into(), api_key: "k1".into(), ..Default::default() }).is_ok(),
+            "443 前缀端口不误剥"
         );
     }
 }

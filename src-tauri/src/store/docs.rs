@@ -383,14 +383,18 @@ mod tests {
 
         // 原语直测：整表替换 + kv 键覆盖，同事务内双双生效
         let rows = vec![("k2".to_string(), json!({ "id": "k2", "name": "n2", "key": "sk-2" }))];
-        s.rows_replace_with_kv("api_keys", &rows, "probe_key", "v1").unwrap();
+        s.rows_replace_with_kv("api_keys", &rows, "probe_key", Some("v1")).unwrap();
         let all = s.rows_all("api_keys").unwrap();
         assert_eq!(all.len(), 1, "整表替换生效");
         assert_eq!(all[0].0, "k2");
         assert_eq!(s.kv_get_raw("probe_key").as_deref(), Some("v1"));
 
+        // kv_content 为 None：仅整表替换，kv 不动
+        s.rows_replace_with_kv("api_keys", &rows, "probe_key", None).unwrap();
+        assert_eq!(s.kv_get_raw("probe_key").as_deref(), Some("v1"), "None 不写 kv");
+
         // 白名单守门与 rows_replace 同口径：非法表名直接拒绝
-        assert!(s.rows_replace_with_kv("not_a_table", &rows, "probe_key", "v2").is_err());
+        assert!(s.rows_replace_with_kv("not_a_table", &rows, "probe_key", Some("v2")).is_err());
     }
 
     /// qoder_sessions_compact 全链路（会话聚合修复后口径）：按 (date, uid, preview)
@@ -1258,9 +1262,9 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             (uid, Value::Object(obj))
         })
         .collect();
-    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    // M4/M7：行表 + updated_at 元数据同事务落库（防两事务间崩溃/竞争留下分叉）
     let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace_with_kv("remaining_credits", &rows, "remaining_credits_updated_at", &kv)
+    s.rows_replace_with_kv("remaining_credits", &rows, "remaining_credits_updated_at", Some(&kv))
 }
 
 // ── 冷却状态（account_cooldowns.json → account_cooldowns 表）─────────────────
@@ -1289,9 +1293,9 @@ pub fn account_cooldowns_save(s: &Store, f: &AccountCooldownsFile) -> Result<(),
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    // M4/M7：行表 + updated_at 元数据同事务落库
     let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace_with_kv("account_cooldowns", &rows, "account_cooldowns_updated_at", &kv)
+    s.rows_replace_with_kv("account_cooldowns", &rows, "account_cooldowns_updated_at", Some(&kv))
 }
 
 // ── 套餐身份（pay_status.json → pay_status 表）───────────────────────────────
@@ -1318,9 +1322,9 @@ pub fn pay_status_save(s: &Store, f: &crate::commands::trae_apps::PayStatusFile)
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
+    // M4/M7：行表 + updated_at 元数据同事务落库
     let kv = serde_json::to_string(&f.updated_at).map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace_with_kv("pay_status", &rows, "pay_status_updated_at", &kv)
+    s.rows_replace_with_kv("pay_status", &rows, "pay_status_updated_at", Some(&kv))
 }
 
 // ── API Key（api_keys.json → api_keys 表 + kv 鉴权开关）──────────────────────
@@ -1345,13 +1349,13 @@ pub fn api_keys_save(s: &Store, f: &ApiKeysFile) -> Result<(), String> {
         .map(|k| serde_json::to_value(k).map(|v| (k.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    // 审查修复（M7）：行表与鉴权开关同事务写入（最敏感分叉点——崩溃后可能
-    // 出现「Key 已换而开关未改」的陈旧鉴权状态）
+    // M4/M7：Key 注册表与鉴权开关 kv 同事务落库（最敏感分叉点——崩溃后可能
+    // 出现「Key 已换而开关未改」的陈旧鉴权状态，鉴权语义与注册表不一致）
     s.rows_replace_with_kv(
         "api_keys",
         &rows,
         "api_keys_auth_disabled",
-        if f.auth_disabled { "true" } else { "false" },
+        Some(if f.auth_disabled { "true" } else { "false" }),
     )
 }
 
@@ -1377,8 +1381,13 @@ pub fn custom_models_save(s: &Store, f: &CustomModelsFile) -> Result<(), String>
         .map(|m| serde_json::to_value(m).map(|v| (m.id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    // 审查修复（M7）：行表与 updated_at 元数据同事务写入，消除崩溃/竞争分叉窗口
-    s.rows_replace_with_kv("custom_models", &rows, "custom_models_updated_at", &f.updated_at.to_string())
+    // M4/M7：行表 + updated_at 元数据同事务落库
+    s.rows_replace_with_kv(
+        "custom_models",
+        &rows,
+        "custom_models_updated_at",
+        Some(&f.updated_at.to_string()),
+    )
 }
 
 // ── 豆包账号池（doubao_accounts.json → doubao_accounts 表）───────────────────
@@ -1404,10 +1413,10 @@ pub fn doubao_pool_save(s: &Store, pool: &crate::commands::doubao::DoubaoAccount
         .map(|a| serde_json::to_value(a).map(|v| (a.user_id.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
-    // 审查修复（M7）：行表与 keepalive 元数据同事务写入，消除崩溃/竞争分叉窗口
-    let kv = serde_json::to_string(&json!({ "last_keepalive_at": pool.last_keepalive_at }))
-        .map_err(|e| format!("序列化失败: {e}"))?;
-    s.rows_replace_with_kv("doubao_accounts", &rows, "doubao_pool_meta", &kv)
+    // M4/M7：行表 + keepalive 元数据同事务落库
+    let meta = json!({ "last_keepalive_at": pool.last_keepalive_at });
+    let kv = serde_json::to_string(&meta).map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace_with_kv("doubao_accounts", &rows, "doubao_pool_meta", Some(&kv))
 }
 
 // ── WorkBuddy 账号池（workbuddy_accounts.json → wb_accounts 表，Value 语义）──
@@ -1843,12 +1852,12 @@ pub fn qoder_sessions_compact(s: &Store, before_days: i64) -> Result<(usize, usi
              FROM qoder_sessions q
              WHERE q.date < ?1
              GROUP BY q.date, q.uid, q.preview
-             HAVING SUM(request_id NOT GLOB 'agg:*') > 0",
+             HAVING SUM(request_id NOT GLOB '[aA][gG][gG]:*') > 0",
             [&cutoff],
         )?;
         let deleted = tx.execute(
             "DELETE FROM qoder_sessions
-             WHERE date < ?1 AND request_id NOT GLOB 'agg:*'",
+             WHERE date < ?1 AND request_id NOT GLOB '[aA][gG][gG]:*'",
             [&cutoff],
         )?;
         tx.commit()?;
@@ -2296,6 +2305,25 @@ pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String
         s.kv_set_raw("qoder_tokens_meta", &v.to_string())?;
     }
     Ok(())
+}
+
+/// 单行 UPSERT（qoder_tokens 表；审查 P2 跨进程 last-writer-wins 修复）：整表
+/// rows_replace 为「DELETE 全表 + 重插」，他进程在窗口内并发写入的其他账号行会被
+/// 整体吞掉；逐行 upsert（INSERT ... ON CONFLICT(pk) DO UPDATE）仅覆盖目标 pk 行，
+/// 跨进程并发保存互不丢行。version 闸门与 qoder_tokens_meta 维护仍由调用方负责
+pub fn qoder_token_store_row_upsert(s: &Store, id: &str, row: &Value) -> Result<(), String> {
+    s.row_upsert("qoder_tokens", id, row)
+}
+
+/// 单行读取（qoder_tokens 表；行级读改写原语配套，防整表 load→replace 覆盖窗口）
+pub fn qoder_token_store_row_get(s: &Store, id: &str) -> Result<Option<Value>, String> {
+    s.row_get("qoder_tokens", id)
+}
+
+/// 单行删除（qoder_tokens 表；remove_token 消费——仅移除目标 pk 行，不经整表
+/// rows_replace，防吞掉他进程并发写入的其他账号行）
+pub fn qoder_token_store_row_delete(s: &Store, id: &str) -> Result<(), String> {
+    s.row_delete("qoder_tokens", id)
 }
 
 // ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──

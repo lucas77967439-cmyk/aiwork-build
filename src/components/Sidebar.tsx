@@ -78,7 +78,7 @@ const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
 export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
-  { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（IDE / Work / CLI）' },
+  { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（Qoder CN IDE / Qoder CN / CLI）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
   { key: 'buddy-ai', label: 'BuddyAI', icon: Globe, title: 'Buddy 国际版（buddy-ai 独立池）' },
 ];
@@ -145,7 +145,8 @@ export default function Sidebar({
     if (!settings) return;
     const next = nextTheme(settings.theme);
     try {
-      // 审查修复（L34）：saveSettings 即 patch 语义，只提交 theme 字段，不回传整份 settings 快照（patch 纪律）
+      // Low 修复（patch 纪律，审查 L34）：只发主题字段——saveSettings 即 patch 语义，
+      // 原整份 settings 快照回传，会用陈旧快照静默覆盖面板打开期间他端已落库的其他设置
       await saveSettings({ theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
     } catch {

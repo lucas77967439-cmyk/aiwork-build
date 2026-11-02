@@ -304,9 +304,10 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(r: &mut R, mut buf: BytesMut) -
         let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| format!("非法 chunk size: {size_str}"))?;
         if size == 0 {
-            // 审查修复（L6）：终结块后的 trailer 段必须消费完再返回——否则残留在
-            // socket 的 trailer 字节会被 keep-alive 下一请求当响应行解析，连接错位。
-            // 逐行 split 消费直至空行；EOF 视为段结束（body 已完整，宽松对齐既有容错）
+            // 审查修复（L6）：终结块后的 CRLF 与可选 trailer 行必须消费完再返回——
+            // 原实现直接返回，keep-alive 复用连接时残留字节会被下一请求解析为
+            // 请求行 → 解析错误断连。逐行消费直至空行；EOF 视为段结束（body 已
+            // 完整，宽松对齐既有容错）；trailer 段超 1MB 视为异常，报错断连
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.split_to(pos + 1);
@@ -475,6 +476,8 @@ pub fn update_account_jwt(ctx: &ProxyCtx, user_id: &str, jwt_full: &str) -> &'st
 /// 并发读（签到/另一次捕获）会看到半更新数据）。
 /// 语义对齐 Python 两函数合用：JWT exp 防降级（skipped 不阻塞 refresh 更新）、
 /// refresh 同值 unchanged、追加账号时两者一并写入。
+/// 锁序：持 ACCOUNTS_LOCK 期间嵌套获取 ACCOUNT_COOLDOWNS_LOCK（clear_cooldown）
+/// 为全库唯一嵌套点，单向无死锁（详见 clear_cooldown 内锁序声明）。
 fn update_account_jwt_and_refresh(
     ctx: &ProxyCtx,
     user_id: &str,
@@ -592,6 +595,14 @@ fn write_accounts(ctx: &ProxyCtx, cfg: &serde_json::Value) -> Result<(), String>
 /// Python 版实为 NameError 空转，此处为真实修复）
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
     // SQLite 化（P3）：冷却状态经 store 读写
+    // C4（审查）：整表 load→save 持 ACCOUNT_COOLDOWNS_LOCK——与签到
+    // save_cooldown/手动清理命令并发时防整表覆盖丢条目（与 accounts.rs 修复同构）。
+    // 锁序声明：唯一嵌套调用点 update_account_jwt_and_refresh 持 ACCOUNTS_LOCK
+    // 后进入本函数，锁序恒为 ACCOUNTS_LOCK → ACCOUNT_COOLDOWNS_LOCK（全库无反向
+    // 获取路径，无死锁）；其余调用点（签到/手动清理/解冻回写）均作叶子锁使用
+    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&ctx.data_dir));
     if cd.cooldowns.remove(user_id).is_some() {
         cd.updated_at = Some(crate::fs_utils::now_iso());
@@ -743,10 +754,17 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         return;
     }
     *cache = Some(captured.clone());
-    // 凭证收敛（审查 P1-7）：抓包凭证 → vault（ns "doubao"/"captured"），明文禁入
-    // SQLite；vault 失败仅记日志（内存缓存保当次会话可用，下次抓包重试写入）
-    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao", "captured", &captured) {
-        ctx.log.log(&format!("  [doubao] 抓包凭证入 vault 失败（仅本次内存缓存可用）: {e}"));
+    // 凭证只进 vault（审查 P2 红线：session_id/sid_guard/ttwid 属会话凭证，
+    // 不得明文落 kv）——快照写入 vault ns `doubao_captured`，读取方统一走
+    // vault::doubao_captured_get（vault 优先 → 旧 kv 回退一次）；历史 kv 明文行
+    // 由 vault::migrate_ns_on_startup 启动时收敛进 vault 并清空。
+    // vault 写失败仅记日志放弃本次持久化（内存 cache 仍在），绝不回退明文落盘。
+    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao_captured", "credentials", &captured) {
+        ctx.log.log(&format!("  [doubao] 凭证快照写入 vault 失败（本次不落盘）: {e}"));
+        // 终审修复：vault 系统性故障时若保留内存 cache，identical 短路会让后续
+        // 相同凭证的抓包永不重试落盘，重启后凭证彻底丢失——回滚 cache 为 None，
+        // 下次抓包自然重写（内存 cache 只是加速层，持久化失败即视为「未捕获」）
+        *cache = None;
     }
     ctx.log.log(&format!(
         "  [doubao] 抓到会话凭证: sessionid={} 字符{}{}{}",

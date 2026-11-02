@@ -6,7 +6,8 @@
 //!
 //! 红线对齐：
 //! - 前端零改动：NDJSON 行 `{stage,status,message,time}` 与 `*-done {success,raw}`
-//!   语义逐字段兼容，全部 stage 消息文案逐字保留；
+//!   语义逐字段兼容，全部 stage 消息文案逐字保留（3.6.5 起 backup 消息随 .bak2
+//!   两代轮转更新文案——前端仅透传展示、无精确匹配，已核实）；
 //! - 快照数据零迁移：profiles*/<slot>{,.bak,.bak2} 结构、current_account.txt、
 //!   meta.json、snapshot_meta.json 格式不变，新旧版本快照互认（.bak2 与
 //!   <slot>.meta.json 身份 sidecar 为新增，旧版本可无视）；
@@ -315,10 +316,12 @@ impl ProgressSink for CliSink {
 // ── 通用小工具 ──────────────────────────────────────────────────────────────
 
 /// glob 通配匹配（PS -like 语义：仅 `*` 通配，大小写不敏感——如 *Doubao* 须命中 doubao.lnk）
+#[cfg_attr(not(windows), allow(dead_code))] // Windows 六级发现消费；测试跨平台复用
 pub fn glob_match_ci(pattern: &str, text: &str) -> bool {
     glob_match_ci_inner(pattern, text)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // 同上：Windows 生产链专用
 fn glob_match_ci_inner(pattern: &str, text: &str) -> bool {
     let p = pattern.to_lowercase();
     let t = text.to_lowercase();
@@ -441,10 +444,12 @@ fn fatal_line(msg: &str) -> String {
 ///
 /// 必须在 stop_app 之后（日志已完整落盘）、backup_current 之前（后者内部
 /// rotate_bak 会覆盖槽位，拦截必须发生在任何写操作前）调用。探测与目标不符 →
-/// 重启客户端还原现场并拒绝，绝不 rotate。
+/// 拒绝，绝不 rotate；被 stop 的客户端由调用方外层 Err 分支统一拉回，且按
+/// `was_running` 门控（原本没开的不拉起）——守卫内不重启（审查复审修复：
+/// 守卫内 start_app + 外层 Err 分支 start_app 会双重 spawn 客户端）。
 /// L2 保存身份守卫（SaveCurrentLogin/BackupCurrent 流内，stop 后执行）：探测客户端
-/// 当前登录账号，与目标槽位不一致 → 拒绝保存并重启客户端还原现场，防 A 的登录态
-/// 覆盖污染 B 的槽位（icube 布局 1335/4487 同型事故）。
+/// 当前登录账号，与目标槽位不一致 → 拒绝保存，防 A 的登录态覆盖污染 B 的槽位
+///（icube 布局 1335/4487 同型事故）；客户端还原现场由外层 Err 分支负责。
 /// live 探测按布局分派（2026-10-02 审查重构）：
 /// - icube：命令层预探测优先（Qoder 保存链 vscdb secret://userInfo 解密传入，唯一
 ///   可靠源）；空则日志探测回退——仅 Trae（Qoder 池 id 为 qd-<hex> 形态，
@@ -677,6 +682,19 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     }
 
     let mut sess = Session::new(&args);
+
+    // F-75 M0-0.6 mac 灰度门控：档案表 mac_supported=false 的应用域，mac 版数据布局
+    // 未经 M-1 侦察确认，切换/备份/恢复全链路直接拒绝（Windows 恒放行，行为零变化）。
+    // 不用 #[cfg] 门控是为让字段在 Windows 构建也有消费方（无 dead_code 警告）。
+    if !sess.prof.mac_supported && crate::platform::is_macos() {
+        let msg = format!(
+            "{} 的 macOS 版数据布局尚未侦察确认，切换/备份/恢复暂不可用（macOS 支持域按应用逐步放开）",
+            sess.prof.app_name
+        );
+        sink.step("fatal", StepStatus::Error, &msg);
+        return Err(fatal_line(&msg));
+    }
+
     sink.step(
         "init",
         StepStatus::Info,
@@ -693,20 +711,21 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     let r = match args.action {
         Action::Switch => switch_flow(&mut sess, uid.trim(), args.expected_current_uid.trim(), sink),
         Action::SaveCurrentLogin => {
+            let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
             // 审查修复（W10）：save/backup 失败 `?` 直接传播会把停在关机状态的
-            // 客户端丢给用户——失败时先尽力拉回客户端再传播原始错误
+            // 客户端丢给用户——失败时先尽力拉回客户端再传播原始错误；
+            // 还原现场按 was_running 门控（原本没开的不拉起，审查硬约束）
             match save_identity_guard(&mut sess, uid.trim(), sink)
                 .and_then(|()| backup_current(&sess, uid.trim(), sink))
             {
                 Ok(()) => {
                     set_current_account(&sess, uid.trim());
-                    // 审查修复：保存已完成，重启失败仅 Warn 提醒手动打开后照常 done
-                    // 收尾——不回滚、不整体报错（报错会诱导用户重试造成重复 save/backup；
-                    // 与失败分支的还原现场 Warn 处理对称）
+                    // 审查修复：保存已完成，重启失败不应整体报错（Err 会诱导用户重试
+                    // 造成重复保存）——与失败分支同款 Warn 提示后照常收尾
                     if let Err(se) = proc::start_app(&mut sess, sink) {
                         sink.step(
-                            "start",
+                            "guard",
                             StepStatus::Warn,
                             &format!("客户端重启失败，请手动打开: {se}"),
                         );
@@ -716,12 +735,14 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
                 Err(e) => {
                     // W10：save/backup 失败（含守卫拒绝）时把被 stop 的客户端拉回；
                     // 还原现场统一在此收敛，避免与守卫内部双重 spawn。失败仅 Warn
-                    if let Err(se) = proc::start_app(&mut sess, sink) {
-                        sink.step(
-                            "guard",
-                            StepStatus::Warn,
-                            &format!("客户端重启失败，请手动打开: {se}"),
-                        );
+                    if was_running {
+                        if let Err(se) = proc::start_app(&mut sess, sink) {
+                            sink.step(
+                                "guard",
+                                StepStatus::Warn,
+                                &format!("客户端重启失败，请手动打开: {se}"),
+                            );
+                        }
                     }
                     Err(e)
                 }
@@ -730,18 +751,19 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::BackupCurrent => {
             // 审查修复：与 SaveCurrentLogin 对齐——先关客户端再读 auth/leveldb/vscdb，
             // 防止文件锁下拷贝静默缺文件生成"看似成功"的坏快照；备份完成后拉回
+            let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
-            // 审查修复（W10）：同上，失败时先尽力拉回客户端再传播原始错误
+            // 审查修复（W10）：同上，失败时先尽力拉回客户端再传播原始错误；
+            // 还原现场按 was_running 门控（原本没开的不拉起，审查硬约束）
             match save_identity_guard(&mut sess, uid.trim(), sink)
                 .and_then(|()| backup_current(&sess, uid.trim(), sink))
             {
                 Ok(()) => {
                     set_current_account(&sess, uid.trim());
-                    // 审查修复：同 SaveCurrentLogin——备份已完成，重启失败仅 Warn
-                    // 提醒手动打开后照常 done 收尾，不回滚、不整体报错
+                    // 审查修复：备份已完成，重启失败不整体报错——同款 Warn 提示后照常收尾
                     if let Err(se) = proc::start_app(&mut sess, sink) {
                         sink.step(
-                            "start",
+                            "guard",
                             StepStatus::Warn,
                             &format!("客户端重启失败，请手动打开: {se}"),
                         );
@@ -750,12 +772,14 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
                 }
                 Err(e) => {
                     // W10：同 SaveCurrentLogin，还原现场统一在此收敛（含守卫拒绝）
-                    if let Err(se) = proc::start_app(&mut sess, sink) {
-                        sink.step(
-                            "guard",
-                            StepStatus::Warn,
-                            &format!("客户端重启失败，请手动打开: {se}"),
-                        );
+                    if was_running {
+                        if let Err(se) = proc::start_app(&mut sess, sink) {
+                            sink.step(
+                                "guard",
+                                StepStatus::Warn,
+                                &format!("客户端重启失败，请手动打开: {se}"),
+                            );
+                        }
                     }
                     Err(e)
                 }
@@ -769,10 +793,14 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             restore_profile(&mut sess, uid.trim(), sink)?;
             apply_fingerprint_override(&sess, sink);
             set_current_account(&sess, uid.trim());
-            // 审查修复（L11）：恢复已完成，start_app 失败不应 `?` 整体报错掩盖恢复
-            // 成果——对齐 SaveCurrentLogin/BackupCurrent Ok 分支：Warn 提示手动打开
+            // L 修复：恢复已完成，重启失败不应整体报错（Err 会诱导用户重试造成
+            // 重复恢复）——与 SaveCurrentLogin/BackupCurrent 同款 Warn 后照常收尾
             if let Err(se) = proc::start_app(&mut sess, sink) {
-                sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
+                sink.step(
+                    "guard",
+                    StepStatus::Warn,
+                    &format!("客户端重启失败，请手动打开: {se}"),
+                );
             }
             done(
                 sink,
@@ -835,7 +863,10 @@ fn post_restore_missing(sess: &Session) -> Vec<String> {
                 m.push("（快照为空或损坏，0 项恢复）".to_string());
             } else {
                 for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
-                    if !sess.prof.data_dir.join(f).exists() {
+                    // 清单为 Windows 反斜杠形态：join 前必须组件化——mac 上 join 整串会把
+                    // 反斜杠当作字面文件名，校验恒失败 → 恒回滚 last 槽 =「无论怎么切换
+                    // 都是最后一个登录的账号」（2026-09-20 mac 实测根因，switcher.log 佐证）
+                    if !sess.prof.data_dir.join(icube::rel_path(f)).exists() {
                         m.push(f.to_string());
                     }
                 }
@@ -986,8 +1017,8 @@ fn switch_flow(
             sink.step("fatal", StepStatus::Error, &msg);
             return Err(fatal_line(&msg));
         };
-        sess.bootstrap_uid = Some(bootstrap_uid);
         sess.bootstrap_done = true;
+        sess.bootstrap_uid = Some(bootstrap_uid);
     }
     proc::stop_app(sess, sink)?;
 
@@ -1018,6 +1049,21 @@ fn switch_flow(
         }
     }
 
+    // 会话已死守卫（2026-10-30）：客户端本次启动若被服务端注销会话，会自行登出——
+    // 此时现场虽"被写过"（vscdb/auth mtime 变化），登录态其实已是空的；把当前态回写
+    // 账号槽会把该账号快照写成未登录（实测 橡皮3 槽位因此丢了 accessToken 键）。
+    // 命中时只保留 last 备份，账号槽保持原样。
+    // 仅 authfile 布局（WorkBuddy / CodeBuddy）：Trae/Qoder 的日志是 VS Code 形态，
+    // 同一批标记词可能来自无关请求，误判会白白跳过写回。
+    // 残余误报面（合并审查记录）：此处锚点传 None = 不按本次客户端启动时间过滤日志，
+    // 而 WorkBuddy 客户端日志跨启动累积——上一次会话遗留的登出标记（如上次启动后曾
+    // 手动登出再登录）会让本次正常会话也被判「会话已死」而跳过回写。后果有限：仅
+    // 本次现场不入账号槽（last 备份完好、下次切换可回退），手动重登兜底不受影响。
+    // 不按启动时间锚定是因为 WB 日志缺少可靠的启动边界标记，宁可保守误跳过（代价是
+    // 多一次「重新保存」），也不把登出态写进账号槽（会丢 accessToken，恢复成本高）。
+    let live_session_dead = sess.prof.layout == Layout::Authfile
+        && authfile::client_log_says_session_dead(&sess.prof.data_dir, None);
+
     // 防误覆盖守卫：仅当桌面端检测到的当前登录（expected_uid）与标记文件一致时才
     // 回写账号槽。不一致/未检测到 = 客户端很可能已手动重登或处于未登录态，此时把
     // "当前态"刷进标记槽会把错误内容覆盖掉该账号的快照（实测 B 被覆盖根因），
@@ -1028,16 +1074,21 @@ fn switch_flow(
             // 旧逻辑只写 last、跳过账号槽，导致 X 的登录态永远存不进它自己的快照。
             // 这里在「探测到的实际登录 ≠ 标记 ≠ 本次目标」且 X 的槽位已存在时，
             // 把当前现场回写到 X 的槽位（身份来自 stop 后权威探测；未入池/无槽位仍走原跳过逻辑）。
-            let detected_slot = (!expected_uid.is_empty()
-                && expected_uid != uid
+            // 现场探测值同样拼路径写盘，先过 uid 白名单（与迁移 src 同标准），
+            // 非法值回落下方跳过分支，不再触碰文件系统
+            let detected_uid = expected_uid.trim();
+            let detected_slot = (!detected_uid.is_empty()
+                && detected_uid != uid
                 && !not_logged_in
-                && (sess.prof.profiles_dir.join(&expected_uid).is_dir()
+                && !live_session_dead
+                && crate::fs_utils::ensure_uid_safe(detected_uid).is_ok()
+                && (sess.prof.profiles_dir.join(detected_uid).is_dir()
                     || sess
                         .prof
                         .profiles_dir
-                        .join(format!("{expected_uid}.bak"))
+                        .join(format!("{detected_uid}.bak"))
                         .is_dir()))
-            .then(|| expected_uid.clone());
+            .then(|| detected_uid.to_string());
             if let Some(slot) = detected_slot {
                 backup_current(sess, &slot, sink)?;
                 sink.step(
@@ -1045,6 +1096,15 @@ fn switch_flow(
                     StepStatus::Ok,
                     &format!(
                         "检测到客户端实际登录为 {slot}（原标记为 {cur}），已把当前登录态回写到该账号槽位"
+                    ),
+                );
+            } else if live_session_dead {
+                sink.step(
+                    "backup",
+                    StepStatus::Warn,
+                    &format!(
+                        "客户端本次启动已自行登出（登录会话被服务端注销），已跳过回写账号 {cur} 的槽位\
+                         （当前态仍备份到 last）；请重新登录该账号后「保存当前登录态」"
                     ),
                 );
             } else {
@@ -1101,13 +1161,21 @@ fn switch_flow(
         restore_profile(sess, "last", sink).map_err(|re| {
             format!("恢复账号 {uid} 登录态失败（{e}），且回滚到切换前状态也失败: {re}")
         })?;
-        // 审查修复（L11）：回滚已完成，start_app 失败不应 `?` 短路丢失回滚上下文
-        //——Warn 后继续原 fatal 收尾（回滚结果不掩盖，失败详情仍然可见）
-        if let Err(se) = proc::start_app(sess, sink) {
-            sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
-        }
+        // L 修复（L11）：回滚已完成，重启失败不应 `?` 短路丢失回滚上下文——
+        // Warn 后继续原 fatal 收尾，重启结果并入提示（回滚成果不掩盖）
+        let restart_note = match proc::start_app(sess, sink) {
+            Ok(()) => "并重启客户端".to_string(),
+            Err(se) => {
+                sink.step(
+                    "restore",
+                    StepStatus::Warn,
+                    &format!("客户端重启失败，请手动打开: {se}"),
+                );
+                "，但客户端重启失败（请手动打开）".to_string()
+            }
+        };
         let msg = format!(
-            "恢复账号 {uid} 登录态失败，已回滚到切换前状态并重启客户端；请重试或重新「保存当前登录态」: {e}"
+            "恢复账号 {uid} 登录态失败，已回滚到切换前状态{restart_note}；请重试或重新「保存当前登录态」: {e}"
         );
         sink.step("fatal", StepStatus::Error, &msg);
         return Err(fatal_line(&msg));
@@ -1166,13 +1234,20 @@ fn switch_flow(
             ),
         );
         restore_profile(sess, "last", sink)?;
-        // 审查修复（L11）：回滚已完成，start_app 失败不应 `?` 短路丢失回滚上下文
-        //——Warn 后继续原 fatal 收尾（回滚结果不掩盖，失败详情仍然可见）
-        if let Err(se) = proc::start_app(sess, sink) {
-            sink.step("start", StepStatus::Warn, &format!("客户端重启失败，请手动打开: {se}"));
-        }
+        // L 修复（L11）：同上——回滚已完成，重启失败不应 `?` 短路丢失回滚上下文，
+        // 重启结果并入提示后继续原 fatal 收尾
+        let restart_note = if proc::start_app(sess, sink).is_err() {
+            sink.step(
+                "restore",
+                StepStatus::Warn,
+                "客户端重启失败，请手动打开",
+            );
+            "（客户端重启失败，请手动打开）"
+        } else {
+            ""
+        };
         let msg = format!(
-            "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请在客户端手动登录账号 {uid}\
+            "账号 {uid} 的快照无效（{}），已回滚到切换前状态{restart_note}。请在客户端手动登录账号 {uid}\
              （登录成功后点「保存当前登录态」重建快照；勿再「切换」到该账号，会重复此错误）；\
              若重新保存后仍报此错，可能是 {} 新版登录态布局变化，请携带日志反馈",
             missing.join("；"),
@@ -1181,9 +1256,12 @@ fn switch_flow(
         sink.step("fatal", StepStatus::Error, &msg);
         return Err(fatal_line(&msg));
     }
-    // QoderWork 软校验：Cookies 缺失（快照为「启动过但未登录」态）不回滚，如实告知
+    // QoderWork 软校验：Cookies 缺失（快照为「启动过但未登录」态）不回滚，如实告知。
+    // 3.8.5 审查修复（M-C1）：Cookies 路径必须走 electron_root::cookies_path 平台
+    // 分派（Windows 在 Network/ 内、mac 直挂数据根）——此前硬编码 Network/Cookies
+    // 在 macOS 恒缺失，每次切换 QoderWork 都误报本 Warn
     if sess.prof.layout == Layout::ElectronRoot
-        && !sess.prof.data_dir.join("Network").join("Cookies").exists()
+        && !electron_root::cookies_path(&sess.prof.data_dir).exists()
     {
         sink.step(
             "restore",
@@ -1196,6 +1274,8 @@ fn switch_flow(
     set_current_account(sess, uid);
     // baseline：start 前的最新会话，供切换后身份确认只认「比它更新的会话」
     let baseline = icube::newest_session_dir(&sess.prof.data_dir);
+    // 启动锚点：切换确认只认这之后写入的客户端日志（防读到上一次运行的登出记录）
+    let launched_at = std::time::SystemTime::now();
     proc::start_app(sess, sink)?;
 
     // Trae 登录身份确认（2026-10-14 合并版实测增强）：合并版客户端启动即产生新
@@ -1256,7 +1336,7 @@ fn switch_flow(
     //（switcher.log 实测 4/4 超时）；Reverted = live 身份被客户端回退到旧账号（信号④），
     // 同样如实告知
     if sess.prof.layout == Layout::Authfile {
-        match authfile::confirm_switch(sess, uid, sink) {
+        match authfile::confirm_switch(sess, uid, sink, launched_at) {
             authfile::VerifyResult::Timeout => {
                 return done(
                     sink,
@@ -1374,6 +1454,7 @@ mod tests {
             data_dir: base.clone(),
         };
         // 一致：Ok + detected_live_uid 记录（backup 流随后据此回写来源标记）
+        // 守卫内不再拉起客户端（还原现场由外层 Err 分支负责，本测试不触发）
         let mut sess = Session::new(&args);
         save_identity_guard(&mut sess, "qd-x", &MemSink::new()).unwrap();
         assert_eq!(sess.detected_live_uid.as_deref(), Some("qd-x"));
@@ -1398,14 +1479,7 @@ mod tests {
     /// sidecar detectedUid ≠ 槽位 → 污染自愈指引（切换是死循环）；其余 → 通用文案
     #[test]
     fn save_reject_message_三类场景分流() {
-        let base = std::env::temp_dir().join(format!(
-            "sw-reject-msg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir("sw-reject-msg");
         let _ = std::fs::remove_dir_all(&base);
         let profiles = base.join("data").join("profiles");
         std::fs::create_dir_all(&profiles).unwrap();
@@ -1602,14 +1676,7 @@ mod tests {
     /// bootstrap 测试用 Session：全部 IO 路径注入纳秒级临时目录（store db、
     /// profiles_dir、auth 文件均不触碰真实机器路径）
     fn bootstrap_session(tag: &str, app: TargetApp) -> Session {
-        let base = std::env::temp_dir().join(format!(
-            "sw-boot-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let base = crate::fs_utils::test_temp_dir(&format!("sw-boot-{tag}"));
         let _ = std::fs::remove_dir_all(&base);
         let args = RunArgs {
             action: Action::Switch,

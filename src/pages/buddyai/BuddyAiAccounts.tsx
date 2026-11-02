@@ -179,8 +179,8 @@ export default function BuddyAiAccounts() {
       if (e.payload.auth_url) setOauthAuthUrl(e.payload.auth_url);
     });
     const unDone = listen<WbOauthDone>('buddy-ai-oauth-done', (e) => {
-      // 审查修复（L26）：done 即定局（成功或失败均已展示），撤销看门狗，
-      // 避免 310s 后「登录超时」覆盖已展示的结果信息
+      // 审查修复（L26 / Low 修复）：done 即定局（成功或失败均已展示），撤销看门狗——
+      // 原 310s 定时器在结果信息已展示后仍会触发，把结果覆盖成「登录超时」误导排查
       if (watchdog) clearTimeout(watchdog);
       watchdog = undefined;
       setOauthBusy(false);
@@ -260,8 +260,9 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        // 审查修复（L25）：完成 toast 由 store 全局监听统一发（onSwitchDone），
-        // 页面级只负责解锁与刷新，避免双 toast
+        // M9 修复（审查 L25）：成功/失败完成 toast 由 store 全局监听统一推送
+        // （onSwitchDone），页面级只负责解锁与刷新，避免双 toast；与国内
+        // BuddyAccounts 口径一致
         void refresh();
       }),
     );
@@ -270,8 +271,7 @@ export default function BuddyAiAccounts() {
         if (!swBusyRef.current) return;
         setSwBusy(false);
         swBusyRef.current = false;
-        // 审查修复（L25）：完成 toast 由 store 全局监听统一发（onSaveLoginDone），
-        // 页面级只负责解锁与刷新，避免双 toast
+        // M9 修复（审查 L25）：同上，完成 toast 由 store 全局监听统一发（onSaveLoginDone）
         void refresh();
       }),
     );
@@ -374,7 +374,10 @@ export default function BuddyAiAccounts() {
         return;
       }
       await api.misc.writeTextFile(filePath, JSON.stringify(payload, null, 2));
-      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${exportWithCreds ? '（凭证已 AES-256-GCM 加密，请牢记导出密码）' : ''}`);
+      // 加密提示按后端实际返回形态判定：池内无任何凭证时后端原样明文导出（无 encrypted 字段），
+      // 勾选「含凭证」但实际无凭证时不应误导用户「已加密」
+      const sealed = payload.encrypted === true;
+      pushToast('success', `已导出 ${exportedCount} 个账号到 ${filePath}${sealed ? '（凭证已 AES-256-GCM 加密，请牢记导出密码）' : ''}`);
       setExportOpen(false);
     } catch (err) {
       pushToast('error', `导出失败：${String(err).slice(0, 160)}`);

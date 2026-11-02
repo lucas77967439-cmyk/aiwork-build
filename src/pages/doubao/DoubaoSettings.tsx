@@ -11,6 +11,8 @@ export default function DoubaoSettings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册入口按平台标志隐藏（mac 由内置调度器覆盖）
+  const platform = useAppStore((s) => s.platform);
 
   const [locate, setLocate] = useState<AppLocate | null>(null);
   const [path, setPath] = useState('');
@@ -55,14 +57,16 @@ export default function DoubaoSettings() {
     }
   };
 
-  // 应用内调度器 doubao-keepalive 开关（issue #147）：不影响已注册的 Windows 计划任务
+  // 应用内调度器 doubao-keepalive 开关（issue #147）；Windows 计划任务仅该平台存在，提示按平台条件显示
   const toggleKeepalive = async (v: boolean) => {
     setKeepaliveEnabled(v);
     try {
       await saveSettings({ doubao_keepalive_enabled: v });
       pushToast(
         'success',
-        v ? '已开启：应用内调度恢复每日会话续期' : '已关闭：应用内调度不再每日拉起豆包执行续期（不影响已注册的 Windows 计划任务）',
+        v
+          ? '已开启：应用内调度恢复每日会话续期'
+          : `已关闭：应用内调度不再每日拉起豆包执行续期${platform === 'windows' ? '（不影响已注册的 Windows 计划任务）' : ''}`,
       );
     } catch (err) {
       setKeepaliveEnabled(!v);
@@ -77,7 +81,9 @@ export default function DoubaoSettings() {
       await saveSettings({ doubao_quota_enabled: v });
       pushToast(
         'success',
-        v ? '已开启：应用内调度恢复每日额度巡检' : '已关闭：应用内调度不再执行每日额度巡检（不影响已注册的 Windows 计划任务）',
+        v
+          ? '已开启：应用内调度恢复每日额度巡检'
+          : `已关闭：应用内调度不再执行每日额度巡检${platform === 'windows' ? '（不影响已注册的 Windows 计划任务）' : ''}`,
       );
     } catch (err) {
       setQuotaEnabled(!v);
@@ -123,8 +129,12 @@ export default function DoubaoSettings() {
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
     }
-    void refreshTaskStatus();
-    void refreshQuotaTaskStatus();
+    // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
+    // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
+    if (platform === 'windows') {
+      void refreshTaskStatus();
+      void refreshQuotaTaskStatus();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled]);
 
@@ -138,7 +148,7 @@ export default function DoubaoSettings() {
         await saveSettings({ doubao_path: r.exe });
         pushToast('success', `已自动定位豆包（${r.source === 'settings' ? '手动指定' : r.source === 'registry' ? '注册表' : r.source === 'default' ? '默认路径' : '进程反查'}）`);
       } else {
-        pushToast('info', '未检测到豆包安装，请手动指定 Doubao.exe 路径');
+        pushToast('info', '未检测到豆包安装，请手动指定豆包客户端路径');
       }
     } catch (err) {
       pushToast('error', `检测失败：${String(err)}`);
@@ -188,9 +198,10 @@ export default function DoubaoSettings() {
   };
 
   const registerTask = async () => {
-    // 审查修复（L39）：收紧为合法 HH:MM（小时 00-23、分钟 00-59），防止 99:99 之类通过校验后注册成功却永不触发
-    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(taskTime)) {
-      pushToast('warn', '时间格式应为 HH:MM');
+    // Low 修复（审查 L39）：收紧为合法时刻（原 `^\d{2}:\d{2}$` 放行 99:99，
+    // 任务注册成功但永不触发）——小时 00-23、分钟 00-59
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(taskTime)) {
+      pushToast('warn', '时间格式应为合法的 HH:MM（00:00–23:59）');
       return;
     }
     try {
@@ -213,9 +224,9 @@ export default function DoubaoSettings() {
   };
 
   const registerQuotaTask = async () => {
-    // 审查修复（L39）：同上收紧为合法 HH:MM
-    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(quotaTaskTime)) {
-      pushToast('warn', '时间格式应为 HH:MM');
+    // Low 修复（审查 L39）：同上收紧为合法时刻
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(quotaTaskTime)) {
+      pushToast('warn', '时间格式应为合法的 HH:MM（00:00–23:59）');
       return;
     }
     try {
@@ -273,7 +284,7 @@ export default function DoubaoSettings() {
 
         <div className="space-y-2 text-xs text-slate-500">
           <p>
-            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? '%LOCALAPPDATA%\\Doubao\\User Data'}</code>
+            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? (platform === 'macos' ? '~/Library/Application Support/Doubao' : '%LOCALAPPDATA%\\Doubao\\User Data')}</code>
             {locate?.version ? ` · 版本 ${locate.version}` : ''}
           </p>
         </div>
@@ -282,7 +293,9 @@ export default function DoubaoSettings() {
           <input
             value={path}
             onChange={(e) => setPath(e.target.value)}
-            placeholder="Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）"
+            placeholder={platform === 'macos'
+              ? 'Doubao.app 完整路径（如 /Applications/Doubao.app）'
+              : 'Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）'}
             className="input flex-1 font-mono text-xs"
           />
           <button onClick={() => void detect()} disabled={detecting} className="btn-outline shrink-0">
@@ -294,7 +307,7 @@ export default function DoubaoSettings() {
         </div>
 
         <p className="mt-2 text-xs text-slate-400">
-          自动检测顺序：手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查。
+          自动检测顺序：手动指定 → {platform === 'macos' ? '应用 bundle 定位' : '注册表卸载键'} → 默认路径 → 运行进程反查。
         </p>
       </div>
 
@@ -326,8 +339,8 @@ export default function DoubaoSettings() {
             </button>
           </div>
 
-          {/* 定时任务 */}
-          <div className="flex flex-wrap items-center gap-2">
+          {/* 定时任务（schtasks 仅 Windows；mac 隐藏，保活由内置调度器 + 手动巡检覆盖） */}
+          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <span className="shrink-0 text-slate-500">每日任务</span>
             <input
               value={taskTime}
@@ -360,8 +373,8 @@ export default function DoubaoSettings() {
             <span>
               <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日调度（每日 09:20 启动豆包续期）</span>
               <span className="mt-0.5 block leading-relaxed">
-                关闭后应用内调度器不再执行会话每日续期（不再拉起客户端）；与上方「每日任务」（Windows 计划任务）相互独立。
-                无豆包账号或未找到豆包客户端时自动跳过，不记失败、不推送通知。
+                {/* macOS 兼容：「每日任务」schtasks 卡仅 Windows 渲染，跨平台引用不可见元素会误导 */}
+                {`关闭后应用内调度器不再执行会话每日续期（不再拉起客户端）${platform === 'windows' ? '；与上方「每日任务」（Windows 计划任务）相互独立' : ''}。无豆包账号或未找到豆包客户端时自动跳过，不记失败、不推送通知。`}
               </span>
             </span>
           </label>
@@ -375,7 +388,8 @@ export default function DoubaoSettings() {
             <button onClick={() => void runRenew(true)} disabled={running} className="btn-outline shrink-0">
               <RefreshCw size={14} /> Cookie 诊断
             </button>
-            <span className="text-slate-400">每日保活任务见上方「每日任务」</span>
+            {/* 指向 schtasks 卡的提示仅 Windows 显示（mac 该卡隐藏，巡检本身即兜底） */}
+            {platform === 'windows' && <span className="text-slate-400">每日保活任务见上方「每日任务」</span>}
           </div>
 
           {/* 巡检结果 */}
@@ -471,8 +485,8 @@ export default function DoubaoSettings() {
             </button>
           </div>
 
-          {/* 每日额度巡检任务 */}
-          <div className="flex flex-wrap items-center gap-2">
+          {/* 每日额度巡检任务（schtasks 仅 Windows；mac 隐藏） */}
+          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <span className="shrink-0 text-slate-500">每日巡检</span>
             <input
               value={quotaTaskTime}
@@ -505,8 +519,8 @@ export default function DoubaoSettings() {
             <span>
               <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日巡检调度（每日 09:30）</span>
               <span className="mt-0.5 block leading-relaxed">
-                关闭后应用内调度器不再定时批量巡检额度；与上方「每日巡检」（Windows 计划任务）相互独立。
-                无豆包账号时自动跳过。
+                {/* macOS 兼容：「每日巡检」schtasks 卡仅 Windows 渲染，同上 */}
+                {`关闭后应用内调度器不再定时批量巡检额度${platform === 'windows' ? '；与上方「每日巡检」（Windows 计划任务）相互独立' : ''}。无豆包账号时自动跳过。`}
               </span>
             </span>
           </label>

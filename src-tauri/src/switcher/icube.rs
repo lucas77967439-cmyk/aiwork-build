@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+use std::path::PathBuf;
+
 use super::copy;
 use super::{ProgressSink, Session, StepStatus};
 
@@ -48,6 +50,38 @@ pub(crate) const TRAE_ICUBE_ITEMS: &[Item] = &[
     Item::Dir("Session Storage"),                   // 9.
 ];
 
+/// mac 专属快照项（F-75 M-1 侦察 ①，2026-09-20 真机实测）：mac Trae CN / TRAE SOLO CN
+/// 数据目录无 `Network/` 子目录，Chromium 根级文件放在数据根而非 `Network/` 下：
+/// - `Cookies` + `Cookies-journal`（登录 Cookies，Windows 在 Network/ 下）
+/// - `Network Persistent State`（Chromium 网络持久状态，Windows 在 Network/ 下）
+///（Windows 的 `Dir("Network")` 项在 mac 由存在性检查自然跳过，无需删除）。
+#[cfg(target_os = "macos")]
+const ICUBE_ITEMS_MAC: &[&str] = &["Cookies", "Cookies-journal", "Network Persistent State"];
+
+#[cfg(not(target_os = "macos"))]
+const ICUBE_ITEMS_MAC: &[&str] = &[];
+
+/// 快照相对路径组件化（F-75 M-1 侦察修复）：ICUBE_ITEMS 沿用 Windows 反斜杠常量
+/// 形态，mac 上 `PathBuf::join("User\\globalStorage\\storage.json")` 会把整串当作
+/// 单个文件名组件导致恒 miss——统一按 '\\' 切分组件逐级 join（Windows join 结果
+/// 与原样一致，行为零变化；与 trae_apps.rs v2.7 组件化修复同思路）。
+/// mod.rs 的恢复后校验（verify_restore）同样复用本函数。
+pub(super) fn rel_path(rel: &str) -> PathBuf {
+    rel.split('\\').fold(PathBuf::new(), |p, c| p.join(c))
+}
+
+/// 快照项全集（相对路径）：per-profile 白名单（F-80 M3 档案化：TRAE_ICUBE_ITEMS /
+/// QODER_IDE_ITEMS 由 AppProfile.icube_items 指向）+ 平台专属项（mac 根级 Cookies 等）。
+/// mac 项对所有 icube 布局档案（含 Qoder IDE，同为 VSCode fork）统一追加：
+/// 备份/恢复同源对称（存在性检查自然跳过未命中项），同机快照无跨平台污染。
+fn all_items(prof: &super::AppProfile) -> Vec<&'static str> {
+    prof.icube_items
+        .iter()
+        .map(|i| i.rel())
+        .chain(ICUBE_ITEMS_MAC.iter().copied())
+        .collect()
+}
+
 /// Qoder CN IDE 白名单（F-80 M3 实测 2026-09-27：%APPDATA%\QoderCN）：与 TRAE 同构
 /// 的 VSCode fork——根级 machineid/Local State/Preferences + User\globalStorage 登录
 /// 真源（storage.json/state.vscdb±边车）。差异点：无 aha、无 Partitions、无
@@ -86,8 +120,8 @@ pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Resu
     std::fs::create_dir_all(&dest).map_err(|e| format!("创建快照目录失败: {e}"))?;
 
     let mut copied = 0usize;
-    for item in sess.prof.icube_items {
-        if copy::copy_snapshot_item(&src.join(item.rel()), &dest.join(item.rel())) {
+    for rel in all_items(&sess.prof) {
+        if copy::copy_snapshot_item(&src.join(rel_path(rel)), &dest.join(rel_path(rel))) {
             copied += 1;
         }
     }
@@ -134,9 +168,9 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
     // 对称恢复：槽位有的项覆盖，槽位没有的项删除现场残留——恢复后 Live 恒等于槽位
     // 内容，不携带上一账号的残留（如槽位缺 state.vscdb.backup 而现场有旧账号的）
     let mut restored = 0usize;
-    for item in sess.prof.icube_items {
-        let src_item = src.join(item.rel());
-        let dst_item = dest.join(item.rel());
+    for rel in all_items(&sess.prof) {
+        let src_item = src.join(rel_path(rel));
+        let dst_item = dest.join(rel_path(rel));
         if src_item.exists() {
             if copy::copy_snapshot_item(&src_item, &dst_item) {
                 restored += 1;
@@ -221,38 +255,55 @@ pub(crate) fn read_snapshot_sidecar(profiles_dir: &Path, slot: &str) -> (Option<
 
 /// 标记「切换到该账号时客户端未确认登录（超时/身份不符）」——账号列表红色徽标的数据源。
 /// sidecar 不存在（无快照）时静默跳过；成功切换或重新保存登录态时由 clear/backup 清除。
+/// 3.8.5 审查修复（复审 M1，对齐 electron_root 同型修复）：主槽 sidecar 缺失时
+/// 回退写 `{slot}.bak.meta.json`——rotate_bak 只轮转槽目录不轮转 sidecar，主槽
+/// 无快照而 .bak 存在时（切换实际经 .bak 恢复），此前标记恒丢失、徽标漏报
+///（读取侧 accounts.rs 已有 .bak 回退，此处补齐写入侧闭环）。
 pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
-    let path = profiles_dir.join(format!("{slot}.meta.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let candidates = [
+        profiles_dir.join(format!("{slot}.meta.json")),
+        profiles_dir.join(format!("{slot}.bak.meta.json")),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "verifyFailedAtMs".into(),
+            serde_json::json!(chrono::Utc::now().timestamp_millis()),
+        );
+        let _ = std::fs::write(&path, v.to_string());
         return;
-    };
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    obj.insert(
-        "verifyFailedAtMs".into(),
-        serde_json::json!(chrono::Utc::now().timestamp_millis()),
-    );
-    let _ = std::fs::write(&path, v.to_string());
+    }
 }
 
 /// 清除切换验证失败标记（切换到该账号并确认登录，或重新保存快照时调用）。
+/// 主槽与 .bak 回退 sidecar 都清（哪份被恢复过就清哪份，双写幂等），
+/// 对齐 mark 的回退链。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
-    let path = profiles_dir.join(format!("{slot}.meta.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    if obj.remove("verifyFailedAtMs").is_some() {
-        let _ = std::fs::write(&path, v.to_string());
+    let candidates = [
+        profiles_dir.join(format!("{slot}.meta.json")),
+        profiles_dir.join(format!("{slot}.bak.meta.json")),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        if obj.remove("verifyFailedAtMs").is_some() {
+            let _ = std::fs::write(&path, v.to_string());
+        }
     }
 }
 
@@ -315,6 +366,9 @@ pub(crate) fn probe_live_uid(app_data_dir: &Path) -> LiveUidProbe {
 /// `uid=<10~20 位数字>`。会话目录名固定 15 字符且字典序=时间序，只看最新会话
 /// （当前客户端这次运行）；最新会话无 uid 记录则返回 None——绝不回捞旧会话，
 /// 旧会话的 uid 可能是切换前的账号，误报比不报更危险（调用方 fail-open）。
+/// 注意：mac 数据根（~/Library/Application Support/Trae CN）2026-10-09 真机
+/// 实测同构：`logs/yyyymmddThhmmss/` 会话目录与 `dynamicConfig.log` 均存在，
+/// 且含 `uid=<16 位数字>` 请求 URL，本函数在 mac 同样生效（原仅 Windows 实测）。
 pub fn detect_live_uid(app_data_dir: &Path) -> Option<String> {
     match probe_live_uid(app_data_dir) {
         LiveUidProbe::Uid(uid) => Some(uid),
@@ -480,14 +534,8 @@ mod tests {
     }
 
     fn session(tag: &str) -> Session {
-        let data = std::env::temp_dir().join(format!(
-            "sw-icube-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let data = crate::fs_utils::test_temp_dir(&format!("sw-icube-{tag}"));
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
@@ -566,14 +614,8 @@ mod tests {
 
     #[test]
     fn detect_live_uid_最新会话与guid_ouid边界检查() {
-        let appdata = std::env::temp_dir().join(format!(
-            "sw-icube-detect-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        // 计数器防 CI 同微秒撞名（原 subsec_nanos 在 macOS 粒度仅 ~1µs）
+        let appdata = crate::fs_utils::test_temp_dir("sw-icube-detect");
         let _ = std::fs::remove_dir_all(&appdata);
         let logs = appdata.join("logs");
         // 次新会话：另一账号的 uid（不应被采纳）

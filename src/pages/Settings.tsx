@@ -19,6 +19,8 @@ export default function Settings() {
   const deviceResetActive = useAppStore((s) => s.deviceResetActive);
   const deviceResetProgress = useAppStore((s) => s.deviceResetProgress);
   const toast = useAppStore((s) => s.pushToast);
+  // F-75 M0-0.5/M2-2.4：Windows 专属入口（schtasks 注册等）按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
 
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
@@ -38,7 +40,8 @@ export default function Settings() {
 
   useEffect(() => {
     void refreshSettings();
-    void query();
+    // F-75 审查修复 #4：schtasks 状态查询仅 Windows 发起（mac 调用会报错误弹 toast）
+    if (platform === 'windows') void query();
   }, [refreshSettings]);
 
   // settings 加载/变化时同步 form：仅初始化与「用户未编辑且与最新值有差异」两种情形
@@ -67,7 +70,15 @@ export default function Settings() {
     if (!form) return;
     setSaving(true);
     try {
-      await withMinDelay(saveSettings(form));
+      // 只发脏字段 patch（store.saveSettings 契约：后端 settings_set 为真 patch 语义，
+      // 全量发送会把编辑期间经其他通道（如系统设置弹框）刚保存的字段回滚成旧值）
+      const patch: Partial<SettingsType> = {};
+      (Object.keys(form) as (keyof SettingsType)[]).forEach((k) => {
+        if (JSON.stringify(form[k]) !== JSON.stringify(settings?.[k])) {
+          (patch as Record<string, unknown>)[k as string] = form[k];
+        }
+      });
+      await withMinDelay(saveSettings(patch));
       baselineRef.current = form; // 保存成功后以提交内容为新基线，恢复对外部变化的跟随
       toast('success', '配置已保存');
     } catch {
@@ -158,7 +169,12 @@ export default function Settings() {
         update('trae_cn_path', r.exe);
         toast('success', `已自动定位并填入 Trae 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
       } else {
-        toast('info', '未检测到 Trae，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）');
+        toast(
+          'info',
+          platform === 'macos'
+            ? '未检测到 Trae，请手动指定 .app 应用路径（如 /Applications/Trae CN.app）'
+            : '未检测到 Trae，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）',
+        );
       }
     } catch (e) {
       toast('error', `检测失败：${String(e)}`);
@@ -215,7 +231,7 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">应用环境</h3>
           <p className="mb-3 text-xs text-slate-400">
-            Trae 客户端的安装路径，用于「打开应用」与「切换账号」时定位 exe；留空将自动探测。
+            Trae 客户端的安装路径，用于「打开应用」与「切换账号」时定位客户端；留空将自动探测。
           </p>
           <div className="space-y-3 text-sm">
             <div>
@@ -225,14 +241,20 @@ export default function Settings() {
                   type="text"
                   value={form.trae_cn_path ?? ''}
                   onChange={(e) => update('trae_cn_path', e.target.value.trim() || null)}
-                  placeholder="默认 C:\Users\你\AppData\Local\Programs\Trae CN\Trae CN.exe"
+                  placeholder={
+                    platform === 'macos'
+                      ? '默认 /Applications/Trae CN.app'
+                      : '默认 C:\\Users\\你\\AppData\\Local\\Programs\\Trae CN\\Trae CN.exe'
+                  }
                   className="input flex-1"
                 />
                 <button onClick={detectTraeCn} disabled={detectingCn} className="btn-outline shrink-0">
                   <Search size={15} /> {detectingCn ? '检测中…' : '自动检测'}
                 </button>
               </div>
-              <p className="mt-1 text-xs text-slate-400">Trae 客户端（Trae CN）的 exe 路径。</p>
+              <p className="mt-1 text-xs text-slate-400">
+                {platform === 'macos' ? 'Trae 客户端（Trae CN）的 .app 应用路径。' : 'Trae 客户端（Trae CN）的 exe 路径。'}
+              </p>
             </div>
           </div>
 
@@ -272,10 +294,11 @@ export default function Settings() {
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
+          <h3 className="mb-1 font-medium">{platform === 'windows' ? '6 层设备标识重置' : '设备标识重置（mac 5 层）'}</h3>
           <p className="mb-3 text-xs text-slate-500">
-            一次性重置 Trae 应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。
+            {platform === 'windows'
+              ? '一次性重置 Trae 应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。'
+              : '一次性重置 Trae 应用的设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ webview 追踪数据（mac 无注册表 MachineGuid 层，自动跳过）。用于账号隔离与防关联，执行前请先关闭对应应用。'}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <button
@@ -283,7 +306,7 @@ export default function Settings() {
               disabled={deviceResetActive}
               className="btn-outline"
             >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : platform === 'windows' ? '执行 6 层重置' : '执行重置（mac 5 层）'}
             </button>
             {deviceResetActive && (
               <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
@@ -341,8 +364,10 @@ export default function Settings() {
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
             应用内置 Rust 定时调度器：应用运行期间每日到点自动签到（晚于该时刻启动会自动补跑，无需管理员权限），
-            触发时刻随底部「保存设置」生效。下方可注册 Windows 计划任务作为兜底，注册时间复用同一时刻，
-            在应用未启动时直接运行签到（注册/删除需要管理员权限）。
+            触发时刻随底部「保存设置」生效。
+            {platform === 'windows'
+              ? '下方可注册 Windows 计划任务作为兜底，注册时间复用同一时刻，在应用未启动时直接运行签到（注册/删除需要管理员权限）。'
+              : 'macOS 无系统级计划任务注册，配合「开机自启 + 静默签到」即可覆盖每日定时签到。'}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <label className="label !mb-0">每日触发时刻</label>
@@ -377,7 +402,7 @@ export default function Settings() {
               秒（多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭）
             </span>
           </div>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
+          <div className={`mt-3 flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <button onClick={register} disabled={busyTask} className="btn-outline">
               <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
             </button>
@@ -388,7 +413,7 @@ export default function Settings() {
               <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
             </button>
           </div>
-          {taskInfo && (
+          {platform === 'windows' && taskInfo && (
             <pre
               className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
                 taskInfo.startsWith('❌')
@@ -502,7 +527,7 @@ export default function Settings() {
       <Modal
         open={confirmResetDevice}
         onClose={() => setConfirmResetDevice(false)}
-        title="确认执行 6 层设备标识重置"
+        title={platform === 'windows' ? '确认执行 6 层设备标识重置' : '确认执行设备标识重置（mac 5 层）'}
         footer={
           <>
             <button className="btn-outline" onClick={() => setConfirmResetDevice(false)}>取消</button>
@@ -521,7 +546,8 @@ export default function Settings() {
               <li>② storage.json telemetry</li>
               <li>③ storage.json aha.device</li>
               <li>④ TinyStorage</li>
-              <li>⑤ 注册表 MachineGuid</li>
+              {/* ⑤ MachineGuid 为 Windows 注册表层（mac 自动跳过该层，不误导） */}
+              {platform === 'windows' && <li>⑤ 注册表 MachineGuid</li>}
               <li>⑥ webview 追踪数据</li>
             </ul>
             <p className="mt-2 text-xs text-amber-500">建议先关闭 TRAE 再执行。</p>

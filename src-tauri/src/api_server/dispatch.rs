@@ -32,11 +32,9 @@ use crate::tasks::qoder_upstream;
 pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
-
-/// 池固定序（A2 共享常量）：候选序尾部补全与统一目录显示层兜底回退共用同一
-/// 顺序，杜绝两处字面量漂移（unified_catalog 曾按 sources 插入序回退，buddy-ai
-/// 被插在 trae 之前与默认候选序不一致）。默认 priority 下尾部补全结果
-/// [buddy, trae, qoder, buddy-ai, custom] 与既有行为零差异；custom 保持尾部兜底位。
+/// A2 审查修复：固定候选序共享常量（与缺省 priority 序对齐的尾部补全序）。
+/// dispatch 尾部补全与 unified_catalog 显示层「无显式序命中」回退共用——
+/// 此前显示层按 sources 插入序（trae→buddy→…）回退，与调度侧固定序漂移。
 pub const POOL_FIXED_ORDER: [TargetPool; 5] = [
     TargetPool::Buddy,
     TargetPool::Trae,
@@ -126,7 +124,8 @@ pub struct DispatchPolicy {
     /// 池间调度策略（缺省 smart）
     #[serde(default)]
     pub strategy: DispatchStrategy,
-    /// 池优先级顺序数组（取值 `trae` / `buddy`；priority 模式或 smart 并列时生效）
+    /// 池优先级顺序数组（取值 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`；
+    /// priority 模式或 smart 并列时生效，缺省序尾部补全循环追加 buddy-ai/custom）
     #[serde(default = "default_priority")]
     pub priority: Vec<String>,
     /// 模型级覆盖（键为 canonical_id，值同为优先级数组），优先于 priority；
@@ -220,7 +219,7 @@ pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), Strin
 // ==================== 选池决策（§4.3/§4.4） ====================
 
 /// 调度错误（错误矩阵 §4.3，由端点按客户端协议映射响应格式）
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DispatchError {
     /// 仅 Buddy 源模型且 wb_enabled=false（保持现有 wb_upstream_disabled 语义）
     WbDisabled,
@@ -235,8 +234,16 @@ pub enum DispatchError {
     /// 响应层硬编码 "buddy"，buddy-ai/qoder 的模型级 429 在用量看板与
     /// app_log 中归因失真
     ModelCooling(i64, TargetPool),
-    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
-    NoHealthy(TargetPool),
+    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却。附带本轮实际候选序
+    /// （issue #159 归因增强，合并审查 Medium 修复）——503 归因注记「前置池
+    /// 因模型冷却被跳过」必须按实际序判断，按 POOL_FIXED_ORDER 硬编码在前缀
+    /// 锁定/Key 绑定/per_model 场景会虚假归因（不在候选序里的池被注记
+    /// skipped）或漏归因（真实前置池不在固定序前缀里）。两处构造点同在
+    /// resolve_target ④ 段 order 变量作用域（提前终止在循环迭代借用中需
+    /// clone，循环尾 move），零重算成本。
+    /// （原独立 NoHealthy(TargetPool) 变体已并入本变体：生产构造点全部携带
+    /// 实际候选序，旧变体仅测试直调残留，成为 dead code 警告源）
+    NoHealthyWithOrder(TargetPool, Vec<TargetPool>),
 }
 
 /// 选池结果
@@ -281,6 +288,10 @@ struct ModelSources {
     /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）；含 Intl 静态
     /// 目录折入（buddy_intl_only 区分来源域）
     buddy: Option<(String, Option<String>)>,
+    /// BuddyAi 域最终模型（issue #19）：CN 收录模型的 Intl 目录降级候选——目标池
+    /// 为 BuddyAi 时最终模型取本值（候选按 Intl 目录取，上游必存在该 id）；None =
+    /// Intl 专属折入（无降级语义），回落 buddy.0（两域同值）
+    buddy_intl_final: Option<String>,
     /// Intl 专属标记（审查修复）：buddy 源来自 Intl 静态目录而非 CN 目录——
     /// Buddy(CN) 池不服务该模型（available 门控），仅 buddy-ai 池可取号
     buddy_intl_only: bool,
@@ -484,40 +495,42 @@ pub fn resolve_target(
                 // buddy-ai 池上游不存在（审查修复）
                 let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
                 let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
-                // 审查 #19：双收录模型可能落 buddy-ai 池（Intl 上游）——降级候选出自
-                // CN 目录，若候选 id 不在 Intl 目录，降级后发往 buddy-ai 池上游不存在。
-                // buddy_in_both 时候选取 CN∩Intl 交集；单收录保持 CN 目录候选不变。
-                // Intl 收录过滤以国际档开启为前提（对齐 Intl 折入门控口径）：国际档
-                // 关闭时 buddy-ai 池不可用、请求必落 Buddy CN 池，CN 专属低价候选
-                // （如 hy4-preview 0.00，Intl 目录未收录）不得被排除（t38/t38a 回归锁定）
-                let in_wl_intl = |m: &str| {
-                    in_wl(m)
-                        && (!buddy_ai_enabled
-                            || !buddy_in_both
-                            || super::wb_catalog::find(&intl_catalog, m).is_some())
-                };
-                let final_model = if !buddy_intl_only
-                    && state
+                // issue #19 修复：降级候选按目标池对应域目录取——BuddyAi 池上游按
+                // Intl 目录提供模型（CN 目录候选 id 在 Intl 上游可能不存在，双收录
+                // 模型的廉价候选常为 CN 专属 id），Buddy 池仍用 CN 目录；两域候选
+                // 均过白名单过滤，候选不存在时回落原模型（不降级）
+                //（合并说明：main 侧「CN∩Intl 交集过滤」方案与本「分域取候选」方案
+                // 同修 #19，本方案每池候选出自自身域目录、覆盖更优，保留本侧结构）
+                let bg_on = state
                     .wb_bg_downgrade
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    && wb_model_route::is_background_task(body)
-                {
-                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl_intl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else if !buddy_intl_only
-                    && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                    && wb_model_route::is_background_task(body);
+                let longctx_on = state
+                    .wb_longctx_downgrade
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
                     && wb_model_route::estimate_input_tokens(body)
-                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
-                {
-                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl_intl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else {
-                    r.model.clone()
+                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD;
+                let domain_candidate = |intl_domain: bool| -> Option<String> {
+                    let dom = if intl_domain {
+                        intl_catalog.as_slice()
+                    } else {
+                        catalog.as_slice()
+                    };
+                    if bg_on {
+                        wb_model_route::cheapest_catalog_model_filtered(dom, &in_wl)
+                    } else if longctx_on {
+                        wb_model_route::flash_catalog_model_filtered(dom, &in_wl)
+                    } else {
+                        None
+                    }
                 };
-                (final_model, r.effort_hint.clone())
+                let cn_final = domain_candidate(false).unwrap_or_else(|| r.model.clone());
+                let intl_final = domain_candidate(true).unwrap_or_else(|| r.model.clone());
+                ((cn_final, r.effort_hint.clone()), intl_final)
             })
-            .or(intl_hit);
+            .map(|(hit, intl_final)| (Some(hit), Some(intl_final)))
+            .unwrap_or((intl_hit, None));
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）。
@@ -542,7 +555,7 @@ pub fn resolve_target(
     // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
     let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
         .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
-    let trae_final = if buddy_hit.is_none() {
+    let trae_final = if buddy_hit.0.is_none() {
         if in_trae(model) {
             // 整名命中：真模型名透传，不做任何后缀剥离
             (model.to_string(), None, false)
@@ -587,13 +600,22 @@ pub fn resolve_target(
         .get(&canonical)
         .and_then(|l| l.enabled)
         .map_or(false, |e| !e);
+    // v3 第四源：custom 上游组（P1 find_enabled_all，仅 enabled；提前求值供
+    // Trae 透传判定与 sources 填充共用，保证两处口径同源）
+    let custom_group = super::custom_models::find_enabled_all(&state.data_dir, model);
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
-    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
+    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）。
+    // 审查修复（H-1）：custom 组命中的模型同样不再无条件透传 Trae——纯
+    // custom 模型（无同名 trae/buddy/qoder 源）为唯一源直达（见下方 v3 注释），
+    // 否则 Priority 策略下 Trae 排在 custom 之前，自建中转模型会被截胡打到
+    // Trae 上游报「模型不存在」；Smart 下仅靠「Trae 未声明倍率后置」侥幸正确
     let trae_hit = !trae_model_disabled
-        && ((buddy_hit.is_none() && qoder_hit.is_none())
+        && ((buddy_hit.0.is_none() && qoder_hit.is_none() && custom_group.is_empty())
             || trae_list.iter().any(|m| canonical_id(&m.id) == canonical));
     let sources = ModelSources {
-        buddy: buddy_hit,
+        buddy: buddy_hit.0,
+        // issue #19：BuddyAi 域降级候选随源携带（按目标池取域）
+        buddy_intl_final: buddy_hit.1,
         // 审查修复：Intl 专属模型源（CN 目录未命中、Intl 目录命中）
         buddy_intl_only,
         // 审查修复（第2项）：CN+Intl 双收录判定随源携带
@@ -604,7 +626,7 @@ pub fn resolve_target(
         // v3 第四源：custom 上游组（P1 find_enabled_all，与 buddy/qoder 判定并列
         // 全量收集后按序筛选同构；命中信息由执行路径重新按 data_dir 读取一致性
         // 由 config_cache 5s TTL 保证，此处仅做源存在性与健康判定）
-        custom: super::custom_models::find_enabled_all(&state.data_dir, model),
+        custom: custom_group,
     };
 
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -735,11 +757,14 @@ pub fn resolve_target(
             .filter_map(|s| TargetPool::parse(s))
             .collect()
     };
-    // per_model / 绑定序可能只写了部分池：其余可用源按 POOL_FIXED_ORDER 追加尾部，
-    // 保证多源回退有序（issue #90 修复③a：前缀锁定 = 单池候选，不追加。
-    // v3：custom 尾部兜底位——默认候选序 = [buddy, trae, qoder, buddy-ai, custom]，
-    // 与 unified_catalog 显示层兜底回退同源 A2）
+    // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
+    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加。v3：custom 尾部兜底位——
+    // 默认候选序 = [buddy, trae, qoder, custom]）
     if forced_pool.is_none() {
+        // 尾部补全固定序与缺省 priority 序对齐（[buddy, trae, qoder, buddy-ai,
+        // custom]）——审查修复：旧序把 buddy-ai 插在 trae 之前，Key 绑定 custom
+        // 等部分序回退时 buddy-ai 会先于 trae/qoder 接管，与默认候选序口径不一
+        // （A2 审查修复：序抽 POOL_FIXED_ORDER 共享常量，与显示层回退同源）
         for p in POOL_FIXED_ORDER {
             if !order.contains(&p) {
                 order.push(p);
@@ -754,7 +779,7 @@ pub fn resolve_target(
         && policy.per_model.get(&canonical).is_none()
         && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
     {
-        order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
+        order = smart_pool_order(state, &order, &canonical, &catalog, &intl_catalog, &sources);
     }
 
     let preferred = order
@@ -826,15 +851,21 @@ pub fn resolve_target(
                         // 本就按池独立（CN=wb 视图 / Intl=intl 视图 / qoder 独立表）
                         (TargetPool::Buddy, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::wb(state.clone());
-                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
-                                .unwrap_or(0);
+                            let secs = super::wb_route::model_cooling_remaining(
+                                &view,
+                                &final_buddy_model(TargetPool::Buddy, &sources),
+                            )
+                            .unwrap_or(0);
                             DispatchError::ModelCooling(secs, TargetPool::Buddy)
                         }
                         // buddy-ai 模型级冷却同构映射（独立冷却表：同名模型跨区不混轮）
                         (TargetPool::BuddyAi, FallbackReason::ModelCooldown) => {
                             let view = super::wb_route::WbView::intl(state.clone());
-                            let secs = super::wb_route::model_cooling_remaining(&view, &final_buddy_model(&sources))
-                                .unwrap_or(0);
+                            let secs = super::wb_route::model_cooling_remaining(
+                                &view,
+                                &final_buddy_model(TargetPool::BuddyAi, &sources),
+                            )
+                            .unwrap_or(0);
                             DispatchError::ModelCooling(secs, TargetPool::BuddyAi)
                         }
                         // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429
@@ -845,7 +876,12 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs, TargetPool::Qoder)
                         }
-                        (p, _) => DispatchError::NoHealthy(p),
+                        // 审查修复：提前终止路径同样携带实际候选序——普通
+                        // NoHealthy 会让 routes 层回退 POOL_FIXED_ORDER 硬编码序，
+                        // Key 绑定（如 bind=qoder 序 [Qoder,Buddy,Trae]）/per_model
+                        // 场景下固定序前置池被虚假注记 skipped、真实前置池漏注记
+                        // （order 处于循环迭代借用中，此处只能 clone）
+                        (p, _) => DispatchError::NoHealthyWithOrder(p, order.clone()),
                     });
                 }
                 if fallback_from.is_none() {
@@ -858,10 +894,14 @@ pub fn resolve_target(
     // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
     // 日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
     log_dispatch_exhausted(state, model, key_id, preferred, &pool_reasons);
-    Err(DispatchError::NoHealthy(
-        // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
-        // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
-        forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
+    // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
+    // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）。
+    // 携带实际候选序（NoHealthyWithOrder）供 503 注记按真实序归因
+    Err(DispatchError::NoHealthyWithOrder(
+        // 审查修复：能走到循环尾说明零可用源（有可用池失败必在循环内
+        // !can_fallback 提前终止），preferred 恒为 None，死防御 .or(preferred) 移除
+        forced_pool.unwrap_or(TargetPool::Trae),
+        order,
     ))
 }
 
@@ -924,6 +964,7 @@ fn smart_pool_order(
     order: &[TargetPool],
     canonical: &str,
     catalog: &[super::wb_catalog::WbModel],
+    intl_catalog: &[super::wb_catalog::WbModel],
     sources: &ModelSources,
 ) -> Vec<TargetPool> {
     let trae_stats = state.pool.stats();
@@ -942,6 +983,24 @@ fn smart_pool_order(
         .as_ref()
         .and_then(|(m, _)| catalog.iter().find(|c| c.id == *m))
         .map(|c| c.rate);
+    // issue #20：buddy-ai 档倍率改查 Intl 动态目录（/v3/config 实抓倍率优先，
+    // 此前复用 CN 目录值导致 smart 排序对 buddy-ai 档失准）；该模型未收录 Intl
+    // 目录时回退 CN 目录值。模型取 BuddyAi 域最终模型（与 #19 按池取域同口径，
+    // BuddyAi 池实发模型 = buddy_intl_final）
+    let buddy_ai_rate = if sources.buddy.is_some() {
+        let m = final_buddy_model(TargetPool::BuddyAi, sources);
+        (!m.is_empty())
+            .then_some(m)
+            .and_then(|m| {
+                intl_catalog
+                    .iter()
+                    .find(|c| c.id == m)
+                    .or_else(|| catalog.iter().find(|c| c.id == m))
+            })
+            .map(|c| c.rate)
+    } else {
+        None
+    };
     let qoder_rate = sources
         .qoder
         .as_ref()
@@ -972,8 +1031,9 @@ fn smart_pool_order(
         let ((earliest, total), rate) = match p {
             TargetPool::Trae => (trae_stats, trae_rate),
             TargetPool::Buddy => (wb_stats, buddy_rate),
-            // buddy-ai：同目录倍率（R-9 同账号体系定价同构），积分快照取国际池
-            TargetPool::BuddyAi => (buddy_ai_stats, buddy_rate),
+            // buddy-ai：Intl 动态目录倍率（issue #20：/v3/config 实抓值优先，
+            // 未收录 Intl 目录回退 CN 目录值；R-9 同账号体系定价同构），积分快照取国际池
+            TargetPool::BuddyAi => (buddy_ai_stats, buddy_ai_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
             // custom：到期 = i64::MAX 后置、倍率 = 组内最小 rate 正常参与、
             // 积分和 = f64::MIN（-total = f64::MAX，第三键后置）
@@ -1006,7 +1066,7 @@ fn pool_health(
 ) -> Result<(), FallbackReason> {
     match pool {
         TargetPool::Buddy => {
-            let model = final_buddy_model(sources);
+            let model = final_buddy_model(TargetPool::Buddy, sources);
             let view = super::wb_route::WbView::wb(state.clone());
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
@@ -1018,7 +1078,8 @@ fn pool_health(
         }
         TargetPool::BuddyAi => {
             // 与 Buddy 同构：独立模型冷却表 + 独立池账号健康预检（§3.1 失败域隔离）
-            let model = final_buddy_model(sources);
+            // issue #19：冷却/预检模型取 BuddyAi 域最终模型（Intl 目录候选）
+            let model = final_buddy_model(TargetPool::BuddyAi, sources);
             let view = super::wb_route::WbView::intl(state.clone());
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
@@ -1069,19 +1130,17 @@ fn pool_health(
             }
             Ok(())
         }
-        // v3：custom 上游组健康判定——任一上游「未熔断且在 Key 白名单内」即可候选
-        // （M-2 预检感知白名单，与 custom_lb::pick_upstream 执行侧同口径：白名单
-        // 排除组内全部健康条目时判不健康走 fallback，避免执行侧 pick_next 返回
-        // None 才 503 exhausted、丢失本可成功的跨池回退）
+        // v3：custom 上游组健康判定——任一上游未熔断且（若 Key 绑定白名单）
+        // 在 allowed 内即可候选（组内选路跳过熔断与白名单外条目；全不可选 →
+        // NoHealthyAccount 走现有 fallback 按序回退下一池）。审查修复：预检
+        // 补 allowed 感知，与执行侧 pick_upstream 同口径（对齐四池
+        // has_selectable_in）——否则白名单排除组内全部健康条目时预检误判 Ok
+        // → pick_next None → 503 exhausted，丢失本可成功的跨池 fallback
         TargetPool::Custom => {
-            if sources
-                .custom
-                .iter()
-                .any(|cm| {
-                    !super::custom_lb::circuit_open(&cm.id)
-                        && allowed.map_or(true, |set| set.contains(&cm.id))
-                })
-            {
+            if sources.custom.iter().any(|cm| {
+                allowed.map_or(true, |set| set.contains(&cm.id))
+                    && !super::custom_lb::circuit_open(&cm.id)
+            }) {
                 Ok(())
             } else {
                 Err(FallbackReason::NoHealthyAccount)
@@ -1100,7 +1159,15 @@ fn pool_healthy(
     pool_health(state, pool, sources, wb_enabled, allowed).is_ok()
 }
 
-fn final_buddy_model(sources: &ModelSources) -> String {
+/// Buddy 源最终模型（issue #19 按目标池取域）：BuddyAi 池取 Intl 目录降级候选
+/// （buddy_intl_final，候选 id 在 Intl 上游必存在），Buddy 池取 CN 目录候选
+///（buddy.0）；Intl 专属折入与未降级场景两域同值
+fn final_buddy_model(pool: TargetPool, sources: &ModelSources) -> String {
+    if pool == TargetPool::BuddyAi {
+        if let Some(m) = &sources.buddy_intl_final {
+            return m.clone();
+        }
+    }
     sources
         .buddy
         .as_ref()
@@ -1110,7 +1177,7 @@ fn final_buddy_model(sources: &ModelSources) -> String {
 
 fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str) -> String {
     match pool {
-        TargetPool::Buddy | TargetPool::BuddyAi => final_buddy_model(sources),
+        TargetPool::Buddy | TargetPool::BuddyAi => final_buddy_model(pool, sources),
         // Trae：后缀剥离后的基名（issue #31 T3.1；无后缀/透传语义 = 原名）
         TargetPool::Trae => sources.trae_final.0.clone(),
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
@@ -1215,14 +1282,8 @@ mod tests {
     /// 注意 wb_catalog 语义"空文件=缺失"，显式空目录不可表达——
     /// 需要"无 WB 干扰"时传一个不相关模型，如 Some(&["hy4"])）
     fn fixture(trae_models: &[&str], wb_models: Option<&[&str]>, policy: Option<&DispatchPolicy>) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
-            "twa_dispatch_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        // 目录名唯一性交给 fs_utils::test_temp_dir（进程内计数器），防 CI 偶发撞名
+        let dir = crate::fs_utils::test_temp_dir("twa_dispatch_test");
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // SQLite 化（P2）：测试种子改走 kv（api_models / wb_model_catalog / dispatch_policy）
         let st = crate::store::db(&dir);
@@ -1266,6 +1327,7 @@ mod tests {
             buddy_ai_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
+            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_uid: std::sync::Mutex::new(None),
@@ -1297,7 +1359,6 @@ mod tests {
             buddy_ai_enabled: AtomicBool::new(false),
             buddy_ai_sticky_enabled: AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
-            listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
             custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
             custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -1449,6 +1510,8 @@ mod tests {
     }
 
     /// 锁定池无该模型源/池耗尽 → NoHealthy(锁定池)，不回退其他池、不误报 Trae
+    ///（主选循环耗尽现统一走 NoHealthyWithOrder 携带实际候选序——前缀锁定 = 单池
+    /// [锁定池]，503 注记侧无前置池可归因，行为不变）
     #[test]
     fn t90_prefix_unavailable_source_errors_locked_pool() {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
@@ -1456,7 +1519,7 @@ mod tests {
         f.seed_healthy(false);
         assert_eq!(
             f.resolve("qoder/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
+            DispatchError::NoHealthyWithOrder(TargetPool::Qoder, vec![TargetPool::Qoder])
         );
     }
 
@@ -1512,6 +1575,30 @@ mod tests {
         assert_eq!(r.model, "my-relay-model");
     }
 
+    /// 审查修复（H-1）：Priority 策略下纯 custom 模型不被 Trae 透传截胡——
+    /// trae_hit 透传分支须对 custom 组命中收窄，否则候选序 [trae, custom]
+    /// 让 Trae 先接管并报「模型不存在」（Smart 仅靠倍率后置侥幸正确，无测试固化）
+    #[test]
+    fn t91_custom_only_model_priority_not_hijacked_by_trae() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&p));
+        f.seed_healthy(true);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "my-relay-model",
+                "base_url": "https://relay.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = f.resolve_no_session("my-relay-model").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.model, "my-relay-model");
+    }
+
     /// v3 P4：custom 组全熔断 + 多源 → 按候选序回退下一池（fallback_from=Custom）
     #[test]
     fn t91_custom_all_circuit_falls_back() {
@@ -1536,13 +1623,52 @@ mod tests {
         super::super::custom_lb::clear_circuit(&list[0].id);
     }
 
-    /// M-2：custom 白名单预检感知（正反对照）——Key 白名单排除组内全部健康条目
-    /// 时预检判不健康走跨池 fallback（而非执行侧 pick_next 返回 None 才 503
-    /// exhausted）；白名单条目健康时照常落 Custom。
-    /// seed_key 须在首次 resolve 之前调用（constraints_for 经 KEYS_STATE 首读固化
-    /// 内存副本）；CustomModel 显式唯一 id 隔离进程级全局熔断表
+    /// 审查修复（Major-2）：pool_health Custom 分支补齐 allowed 白名单感知（与
+    /// 四池 has_selectable_in 同口径）——Key 绑定 custom 白名单排除组内全部
+    /// 健康条目时，预检须判不健康走跨池 fallback；修复前误判 Ok 选中 Custom，
+    /// 执行侧 pick_next None → 503 exhausted，丢失本可成功的回退
     #[test]
     fn t91_custom_whitelist_excluded_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let list = super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true,
+                // 显式唯一 id：upsert 仅在 id 为空时按时间戳生成，并行测试同时间片
+                // 可能撞键（进程级全局熔断表按 id 键控）→ 显式 id 隔离熔断状态
+                "id": "cm-wlfix00000001"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let cm_id = list[0].id.clone();
+        // 两个 Key 均须在首次 resolve 前种入：constraints_for 经 KEYS_STATE
+        // 首读固化内存副本，其后 seed 的 Key 不可见（bind 丢失走默认候选序）
+        f.seed_key("k-exclude", "custom", &["custom:other-model", "trae:t1"]);
+        f.seed_key("k-include", "custom", &[format!("custom:{cm_id}").as_str(), "trae:t1"]);
+        // 白名单不含组内唯一条目（trae:t1 保 fallback 目标池健康）→ 预检不健康 → 回退 Trae
+        let r = f.resolve_key("glm-5.3", "k-exclude").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.fallback_from, Some(TargetPool::Custom));
+        // 正对照：白名单含组内条目 → 正常选中 Custom，不误伤
+        let r = f.resolve_key("glm-5.3", "k-include").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.fallback_from, None);
+    }
+
+    /// M-2 补充（origin/main 同名用例，覆盖与上方 t91 互补的旧语义路径）：
+    /// Key 绑定 custom + 裸 uid 白名单（issue #30 绑定池旧语义）+ 白名单条目熔断
+    /// → 组内全部健康条目被白名单排除 → 预检不健康走跨池 fallback，且落 fallback
+    /// 归因日志；熔断清除后照常落 Custom。用 Auth 类 600s 长窗记账（pool_health
+    /// 仅判 circuit_open，不分类别）：Server 类基准窗仅 30s，全量并行跑时
+    /// constraints_for 可能在 KEYS_STATE 锁上被其他测试的 vault 加密操作阻塞超
+    /// 30s，窗口过期会假失败
+    #[test]
+    fn t91b_custom_bind_whitelist_circuit_falls_back() {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         f.seed_healthy(true);
         // 绑定 custom + 白名单仅含 cm-whitelist0001（bind Key → pool_constraints
@@ -1565,11 +1691,7 @@ mod tests {
         super::super::custom_models::upsert(&f.dir, cm1).unwrap();
         super::super::custom_models::upsert(&f.dir, cm2).unwrap();
 
-        // 反对照：白名单条目熔断 → 组内全部健康条目被白名单排除 → 预检不健康
-        // → 落 Trae（fallback_from=Custom），而非留到执行侧 503。
-        // 用 Auth 类 600s 长窗记账（pool_health 仅判 circuit_open，不分类别）：
-        // Server 类基准窗仅 30s，全量并行跑时 constraints_for 可能在 KEYS_STATE
-        // 锁上被其他测试的 vault 加密操作阻塞超 30s，窗口过期会假失败
+        // 反对照：白名单条目熔断 → 预检不健康 → 落 Trae（fallback_from=Custom）
         super::super::custom_lb::note_circuit_failure(
             "cm-whitelist0001",
             super::super::custom_lb::FailKind::Auth,
@@ -1587,7 +1709,7 @@ mod tests {
         super::super::custom_lb::clear_circuit("cm-whitelist0001");
     }
 
-    /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错
+    /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthyWithOrder(Custom) 显式报错
     /// 不跨池回退（单池候选语义）
     #[test]
     fn t91_custom_prefix_lock_errors_when_exhausted() {
@@ -1604,7 +1726,7 @@ mod tests {
         super::super::custom_lb::note_circuit_failure(&list[0].id, super::super::custom_lb::FailKind::Server);
         assert_eq!(
             f.resolve_no_session("custom/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Custom)
+            DispatchError::NoHealthyWithOrder(TargetPool::Custom, vec![TargetPool::Custom])
         );
         super::super::custom_lb::clear_circuit(&list[0].id);
     }
@@ -1849,14 +1971,14 @@ mod tests {
         assert_eq!(f.resolve("hy4").unwrap_err(), DispatchError::WbDisabled);
     }
 
-    /// 仅 Buddy 源 + Buddy 池耗尽 → 503 语义（NoHealthy），不跨池回退
+    /// 仅 Buddy 源 + Buddy 池耗尽 → 503 语义（NoHealthyWithOrder），不跨池回退
     #[test]
     fn t12_buddy_only_exhausted_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         f.seed_healthy(true); // Trae 池健康但非双源，不得回退
         assert_eq!(
             f.resolve("hy4").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            DispatchError::NoHealthyWithOrder(TargetPool::Buddy, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -1898,7 +2020,7 @@ mod tests {
         f.seed_healthy(false); // Buddy 池健康但非双源
         assert_eq!(
             f.resolve("Doubao-Seed-Evolving").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
+            DispatchError::NoHealthyWithOrder(TargetPool::Trae, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -1911,7 +2033,52 @@ mod tests {
         f.seed_healthy(true); // Trae 池健康，但 fallback 关闭
         assert_eq!(
             f.resolve("glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            // 审查修复：错误携带实际候选序。glm-5.3 双源（≥2）且默认 Smart 策略
+            // → smart 重排后的实际候选序非 POOL_FIXED_ORDER；Qoder 无源
+            // unavailable 跳过，Buddy 有源但池空且 fallback 关 → 在 Buddy 提前
+            // 终止（健康的 Trae 不被越过，正是本测试要锁的语义）
+            DispatchError::NoHealthyWithOrder(
+                TargetPool::Buddy,
+                vec![
+                    TargetPool::Qoder,
+                    TargetPool::Buddy,
+                    TargetPool::BuddyAi,
+                    TargetPool::Trae,
+                    TargetPool::Custom,
+                ]
+            )
+        );
+    }
+
+    /// 审查修复回归：池耗尽提前终止同样携带实际候选序（NoHealthyWithOrder）——
+    /// per_model 自定义序 [buddy-ai, trae] 下：BuddyAi 源缺失跳过 → Trae 池空
+    /// 但后继 Buddy 有源（can_fallback 成立）→ 回退 Buddy → Buddy 也空且后继
+    /// [Qoder, Custom] 零可用源 → 在 Buddy 提前终止（非循环尾耗尽），错误须附
+    /// 真实序。旧实现回退普通 NoHealthy → routes 层按 POOL_FIXED_ORDER 硬编码
+    /// 序归因，真实序前置池的冷却会被漏注记（归因序与真实序错位）
+    #[test]
+    fn t16b_early_terminate_carries_real_order() {
+        let mut p = policy_default();
+        p.per_model.insert(
+            "glm-5.3".into(),
+            vec!["buddy-ai".into(), "trae".into()],
+        );
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        assert_eq!(
+            f.resolve("glm-5.3").unwrap_err(),
+            DispatchError::NoHealthyWithOrder(
+                // 提前终止发生在首个「有源但无后继可用源」的失败池 = Buddy
+                TargetPool::Buddy,
+                // per_model [buddy-ai, trae] + 尾部按 POOL_FIXED_ORDER 补全
+                // （Buddy 不在 per_model 序中，补全时排在 Trae 之后）
+                vec![
+                    TargetPool::BuddyAi,
+                    TargetPool::Trae,
+                    TargetPool::Buddy,
+                    TargetPool::Qoder,
+                    TargetPool::Custom,
+                ]
+            )
         );
     }
 
@@ -2437,7 +2604,16 @@ mod tests {
         f2.seed_key("k1", "trae", &[]);
         assert_eq!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
+            DispatchError::NoHealthyWithOrder(
+                TargetPool::Trae,
+                vec![
+                    TargetPool::Trae,
+                    TargetPool::Buddy,
+                    TargetPool::Qoder,
+                    TargetPool::BuddyAi,
+                    TargetPool::Custom,
+                ]
+            )
         );
     }
 
@@ -2459,7 +2635,7 @@ mod tests {
         f2.seed_key("k1", "buddy", &["b2"]);
         assert_eq!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            DispatchError::NoHealthyWithOrder(TargetPool::Buddy, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -2520,16 +2696,6 @@ mod tests {
 
     // ---------- issue #29 调度失败可观测性 ----------
 
-    /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
-    #[test]
-    fn t39_no_healthy_detail_anonymous_pool_only() {
-        let f = fixture(&[], None, None);
-        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
-        assert!(msg.starts_with("no healthy account available"), "{msg}");
-        assert!(msg.contains("pool=trae healthy=0"), "{msg}");
-        assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
-    }
-
     /// issue #159：NoHealthy 归因「前置候选池因模型级冷却被跳过」——buddy 池
     /// 已启用且同名模型在冷却表内时，503 消息显式携带 buddy skipped 注记
     #[test]
@@ -2543,6 +2709,8 @@ mod tests {
             TargetPool::Trae,
             "anonymous",
             Some("hy4"),
+            // None = 无实际候选序上下文，注记回退 POOL_FIXED_ORDER（Buddy 在 Trae 前）
+            None,
         );
         assert!(
             msg.contains("buddy skipped: model_cooldown remaining="),
@@ -2552,6 +2720,16 @@ mod tests {
         let plain =
             super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
         assert!(!plain.contains("skipped:"), "{plain}");
+    }
+
+    /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
+    #[test]
+    fn t39_no_healthy_detail_anonymous_pool_only() {
+        let f = fixture(&[], None, None);
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(msg.starts_with("no healthy account available"), "{msg}");
+        assert!(msg.contains("pool=trae healthy=0"), "{msg}");
+        assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
     }
 
     /// NoHealthy 详情（修复2）：Key 约束细节（绑定池/白名单条数/作用域健康数）——
@@ -2630,7 +2808,10 @@ mod tests {
         // trae 有源但 Key 作用域空集 → no_healthy_account；无源池 → unavailable
         // → 无更多回退目标，提前终止归因 trae
         let r = f.resolve_key("glm-5.3", "k1");
-        assert!(matches!(r, Err(DispatchError::NoHealthy(TargetPool::Trae))), "{r:?}");
+        assert!(
+            matches!(r, Err(DispatchError::NoHealthyWithOrder(TargetPool::Trae, _))),
+            "{r:?}"
+        );
         assert!(
             f.app_log_contains("dispatch exhausted: model=glm-5.3 key=k1"),
             "应落逐池归因日志"
@@ -2657,7 +2838,9 @@ mod tests {
 
         let resp = super::super::routes::dispatch_error_response(
             &f.state,
-            DispatchError::NoHealthy(TargetPool::Trae),
+            // 旧 NoHealthy 变体已并入 NoHealthyWithOrder：直测用固定序（与原
+            // None 回退口径等价）
+            DispatchError::NoHealthyWithOrder(TargetPool::Trae, POOL_FIXED_ORDER.to_vec()),
             super::super::routes::Protocol::OpenAi,
             "glm-5.3",
             false,
@@ -2724,27 +2907,59 @@ mod tests {
         assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
     }
 
-    /// 审查 #19 Case A 回归锁定：国际档开启 + 双收录模型（glm-5.3 ∈ CN∩Intl），
-    /// 降级候选须限 CN∩Intl 交集（防降级后发往 buddy-ai 池上游模型不存在）——
-    /// CN 专属的 hy4-preview(0.00) 被排除，交集内最低价为 hy3(0.00)。
+    /// 审查 #19 Case A 回归锁定（分域取候选方案）：国际档开启 + 双收录模型
+    /// （glm-5.3 ∈ CN∩Intl）时，后台降级候选按目标池自身域目录取——
+    /// Buddy(CN) 池取 CN 目录最低价（hy4-preview 0.00），BuddyAi 池取 Intl
+    /// 目录候选（静态表倍率全为占位 1.0，并列取首条 hy4-preview-f），
+    /// 从构造上保证「发往 buddy-ai 池的降级 id 必在 Intl 目录存在」
+    ///（main 侧「CN∩Intl 交集过滤」方案同修 #19，本方案覆盖更优，断言随本方案调整）。
     /// 与 t38（国际档关闭不过滤）构成双向口径。
     #[test]
     fn t38a_bg_downgrade_intl_filter_requires_intl_enabled() {
+        use std::sync::atomic::Ordering;
+        let bg = || {
+            json!({"model": "glm-5.3", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "生成标题"}]})
+        };
+
+        // ① Buddy(CN) 池：降级候选取 CN 域目录最低价
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         f.seed_healthy(false);
-        f.state
-            .buddy_ai_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        f.state
-            .wb_bg_downgrade
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        f.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f.state.wb_bg_downgrade.store(true, Ordering::Relaxed);
         super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
-        let bg = json!({"model": "glm-5.3", "max_tokens": 16,
-               "messages": [{"role": "user", "content": "生成标题"}]});
-        let r = resolve_target(&f.state, "glm-5.3", &bg, None).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg(), None).unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "hy4-preview", "Buddy 池降级候选出自 CN 域目录最低价");
+
+        // ② BuddyAi 池：候选出自 Intl 域目录（CN 专属 id 不会发往国际上游）
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f2.state.wb_enabled.store(false, Ordering::Relaxed);
+        f2.state.trae_enabled.store(false, Ordering::Relaxed);
+        f2.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f2.state.wb_bg_downgrade.store(true, Ordering::Relaxed);
+        f2.state.buddy_ai_pool.sync_from_wb(
+            &[super::super::pool::WbSyncAccount {
+                uid: "g1".into(),
+                name: "intl".into(),
+                token: "tk".into(),
+                domain: "www.workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: true,
+                credits: Some(10.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["g1".to_string()],
+        );
+        super::super::unified_catalog::save_whitelist(&f2.dir, &[]).unwrap();
+        let r2 = resolve_target(&f2.state, "glm-5.3", &bg(), None).unwrap();
+        assert_eq!(r2.pool, TargetPool::BuddyAi);
         assert_eq!(
-            r.model, "hy3",
-            "国际档开启 + 双收录 → 降级候选限 CN∩Intl 交集最低价（hy4-preview 非 Intl 收录被排除）"
+            r2.model, "hy4-preview-f",
+            "BuddyAi 池降级候选出自 Intl 域目录（CN 目录最低价 hy4-preview 非 Intl 收录，不会被选用）"
         );
     }
 
@@ -2792,7 +3007,7 @@ mod tests {
         );
     }
 
-    /// 仅 Qoder 源 + 池耗尽 → 503 语义 NoHealthy(Qoder)，不回退 Buddy/Trae
+    /// 仅 Qoder 源 + 池耗尽 → 503 语义 NoHealthyWithOrder(Qoder)，不回退 Buddy/Trae
     #[test]
     fn t42_qoder_only_exhausted_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
@@ -2802,7 +3017,7 @@ mod tests {
         // 池空 = 无健康账号（单源不跨池回退）
         assert_eq!(
             f.resolve("MiniMax-M2.7").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
+            DispatchError::NoHealthyWithOrder(TargetPool::Qoder, POOL_FIXED_ORDER.to_vec())
         );
     }
 

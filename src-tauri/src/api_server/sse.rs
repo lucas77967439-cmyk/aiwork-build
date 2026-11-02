@@ -131,7 +131,10 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
         }
         "done" => {
             if let Some(s) = obj.get("finish_reason").and_then(|v| v.as_str()) {
-                ev.finish_reason = s.to_string();
+                // 3.8.5 审查 L1：与 turn_completion 同口径词表白名单归一化——
+                // 上游偶发走 done 收尾携带非词表值（如 "completed"）同样污染
+                // OpenAI 出口（收尾帧 / aggregate / aggregate_text）
+                ev.finish_reason = normalize_finish(s);
             }
         }
         "turn_completion" => {
@@ -142,17 +145,11 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
             // 审查加固：值过 OpenAI 词表白名单，词表外/空值归 stop——旧实现
             // 硬编码 stop 兼具归一化效果，裸透传会让非词表值（如 "completed"）
             // 污染 OpenAI 出口（收尾帧 / aggregate / aggregate_text）
-            const KNOWN_FINISH: [&str; 5] =
-                ["stop", "length", "tool_calls", "function_call", "content_filter"];
             let fr = obj
                 .get("finish_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            ev.finish_reason = if KNOWN_FINISH.contains(&fr) {
-                fr.to_string()
-            } else {
-                "stop".to_string()
-            };
+            ev.finish_reason = normalize_finish(fr);
         }
         "error" => {
             ev.error_code = obj.get("code").and_then(|v| v.as_i64());
@@ -421,6 +418,8 @@ fn stream_convert_src(
         } else if !has_content {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
             // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性
+            //（审查 F7 / main 审查问题6 同口径：HEAD 旧实现 && !sender.is_closed()
+            //  与其注释意图相悖——断连+空流会跳过哨兵，已被 main 侧修正）
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -436,11 +435,7 @@ fn stream_convert_src(
         }
     }
 
-    (
-        error_info.map(|(code, msg)| (code, msg)),
-        sent_any,
-        pending_usage,
-    )
+    (error_info, sent_any, pending_usage)
 }
 
 /// 流式转换：SOLO SSE → OpenAI legacy text completion SSE（/v1/completions，T9）
@@ -591,7 +586,7 @@ fn stream_convert_text_src(
             }
         } else if !has_content {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
-            // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性
+            // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性（同 L329）
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -608,32 +603,34 @@ fn stream_convert_text_src(
 }
 
 /// 纯文本收集器：output/thought 文本 + tool_calls 跨事件合并 + usage + error
+///（审查修复 M3/M6：此前非流式聚合静默丢弃上游 tool_calls，stream=false 客户端
+/// 拿到空 content 丢工具调用）
 struct PlainCollect {
     content: String,
     reasoning: String,
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    /// 按 index（缺省回退 id）分段合并后的 tool_calls（与流式侧对称）
+    tool_calls: Vec<Value>,
     /// 传输层掐断读错误（issue #158 报错A，P2-1 聚合侧补齐）：此前读错误被
     /// `Err(_) => break` 静默折叠为 EOF——上游 h2 RST/连接重置掐断长响应时，
     /// 半截内容以 finish_reason="stop" 完整返回客户端，tool_calls 残缺也不换号。
     /// 仅留存传输掐断特征读错误（对齐流式侧 is_transport_cut_text 过滤口径），
     /// 其余读错误维持折叠语义不变；saw_done 后的读错误不算（完整响应后关闭）
     read_error: Option<String>,
-    /// 审查修复（M6）：按 index 分段合并后的 tool_calls（与流式侧对称）
-    tools: Vec<Value>,
 }
 
-/// 审查修复（M6）：SOLO tool_call 分片规范化——function_call 旧形态转
-/// function、剔除 namespace/partial_arguments（与流式侧转换同口径）
-fn normalize_tool_delta(mut c: Value) -> Value {
+/// 归一单个上游工具调用分片：function_call→function（legacy 形态）、
+/// 剥离 namespace/partial_arguments（与流式路径的转换保持同构）
+fn normalize_tool_call(call: &Value) -> Option<Value> {
+    let mut c = call.clone();
     if let Some(fc) = c.get("function_call").cloned() {
-        if let Some(obj) = c.as_object_mut() {
-            obj.insert("function".into(), fc);
-            obj.remove("function_call");
-        }
+        let obj = c.as_object_mut()?;
+        obj.insert("function".into(), fc);
+        obj.remove("function_call");
     }
-    if let Some(fn_obj) = c.get("function").and_then(Value::as_object).cloned() {
+    if let Some(fn_obj) = c.get("function").and_then(|f| f.as_object()).cloned() {
         let mut clean = fn_obj;
         clean.remove("namespace");
         clean.remove("partial_arguments");
@@ -641,55 +638,53 @@ fn normalize_tool_delta(mut c: Value) -> Value {
             obj.insert("function".into(), Value::Object(clean));
         }
     }
-    c
+    Some(c)
 }
 
-/// 审查修复（M6）：向既有 tool 槽位合并后续分片——id/type 非空覆盖（首片带全），
-/// function.name 非空覆盖，function.arguments 字符串追加
-fn merge_tool_slot(t: &mut Value, call: &Value) {
-    let Some(obj) = t.as_object_mut() else { return };
-    for k in ["id", "type"] {
-        if let Some(v) = call.get(k).and_then(Value::as_str) {
-            if !v.is_empty() {
-                obj.insert(k.to_string(), json!(v));
+/// 跨事件合并工具调用分片（对齐 Anthropic 侧 ToolBuf 语义）：
+/// 同一调用的流式分片按 index（缺省回退 id）归桶，function.arguments 逐片拼接，
+/// 首片缺失的 id/name 由后续分片补全
+fn merge_tool_calls(buf: &mut Vec<Value>, incoming: &[Value]) {
+    for call in incoming {
+        let Some(c) = normalize_tool_call(call) else { continue };
+        let idx = c.get("index").and_then(Value::as_u64);
+        let cid = c.get("id").and_then(Value::as_str);
+        let pos = buf.iter().position(|b| match (idx, cid) {
+            (Some(i), _) => b.get("index").and_then(Value::as_u64) == Some(i),
+            (None, Some(id)) => b.get("id").and_then(Value::as_str) == Some(id),
+            (None, None) => false,
+        });
+        let Some(p) = pos else {
+            buf.push(c);
+            continue;
+        };
+        if let Some(add_args) = c.pointer("/function/arguments").and_then(Value::as_str) {
+            let b = &mut buf[p];
+            let has_args = b.pointer("/function/arguments").and_then(Value::as_str).is_some();
+            if has_args {
+                if let Some(Value::String(s)) = b.pointer_mut("/function/arguments") {
+                    s.push_str(add_args);
+                }
+            } else if let Some(fn_obj) = b.pointer_mut("/function").and_then(Value::as_object_mut) {
+                fn_obj.insert("arguments".into(), json!(add_args));
+            }
+        }
+        if let Some(b) = buf[p].as_object_mut() {
+            if b.get("id").map(Value::is_null).unwrap_or(true) {
+                if let Some(id) = c.get("id") {
+                    b.insert("id".into(), id.clone());
+                }
+            }
+        }
+        if let Some(name) = c.pointer("/function/name").and_then(Value::as_str) {
+            let b = &mut buf[p];
+            if b.pointer("/function/name").and_then(Value::as_str).map(str::is_empty).unwrap_or(true) {
+                if let Some(fn_obj) = b.pointer_mut("/function").and_then(Value::as_object_mut) {
+                    fn_obj.insert("name".into(), json!(name));
+                }
             }
         }
     }
-    let name = call
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let args = call
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if name.is_empty() && args.is_empty() {
-        return;
-    }
-    if let Some(fo) = obj.get_mut("function").and_then(Value::as_object_mut) {
-        if !name.is_empty() {
-            fo.insert("name".into(), json!(name));
-        }
-        if !args.is_empty() {
-            let cur = fo
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            fo.insert("arguments".into(), json!(format!("{cur}{args}")));
-        }
-    }
-}
-
-/// 非流式读错误 → 传输掐断哨兵：响应未收到完成事件前，任何读取失败都意味着
-/// 聚合结果可能截断（含残缺 tool_calls JSON），不得按成功交付。
-fn read_cut_error(e: &std::io::Error) -> (i64, String) {
-    (
-        crate::api_server::TRANSPORT_CUT_CODE,
-        format!("{} {}", crate::api_server::TRANSPORT_CUT_MSG_PREFIX, e),
-    )
 }
 
 /// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
@@ -703,8 +698,8 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        tool_calls: Vec::new(),
         read_error: None,
-        tools: Vec::new(),
     };
     for line in br.lines() {
         let line = match line {
@@ -712,8 +707,10 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
             Err(e) => {
                 // 传输层掐断捕获（聚合侧补齐，口径同流式侧 take_read_error）：
                 // 仅 !saw_done 且无业务错误时留存哨兵，交 aggregate/aggregate_text
-                // 上抛；其余读错误维持折叠语义（main 保守门控，PR #162 的
-                // read_cut_error 助手由 aggregate_anthropic 复用）
+                // 上抛；其余读错误维持折叠语义。移植注记：main 侧（PR #162）封装了
+                // read_cut_error(&io::Error) -> (i64, String) 助手调用；本侧未移植
+                // 该助手，沿用既有 read_error 延迟上抛模式（循环尾统一
+                // TRANSPORT_CUT_CODE），两者语义等价
                 if !saw_done && out.error_info.is_none() {
                     let text = e.to_string();
                     if super::is_transport_cut_text(&text) {
@@ -728,28 +725,11 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                 "output" | "thought" => {
                     out.content.push_str(&ev.response);
                     out.reasoning.push_str(&ev.reasoning);
-                    // 审查修复（M6）：非流式聚合补 tool_calls 跨事件合并——此前
-                    // 仅收集文本，stream=false 客户端拿到空 content 丢工具调用
-                    //（与流式 ToolBuf 不对称）；按 index 分段：首见创建条目、
-                    // arguments 字符串追加
-                    if let Some(arr) = ev.tool_calls.and_then(|tc| tc.as_array().cloned()) {
-                        for call in arr {
-                            let call = normalize_tool_delta(call);
-                            match call.get("index").and_then(Value::as_u64) {
-                                Some(i) => {
-                                    if let Some(t) = out
-                                        .tools
-                                        .iter_mut()
-                                        .find(|t| t.get("index").and_then(Value::as_u64) == Some(i))
-                                    {
-                                        merge_tool_slot(t, &call);
-                                    } else {
-                                        out.tools.push(call);
-                                    }
-                                }
-                                // 无 index 的分片无法跨事件关联，按独立条目保留（与流式透传对称）
-                                None => out.tools.push(call),
-                            }
+                    // 审查修复（M6）：非流式聚合补 tool_calls 跨事件合并——按
+                    // index（缺省回退 id）归桶，arguments 字符串追加
+                    if let Some(tc) = &ev.tool_calls {
+                        if let Some(arr) = tc.as_array() {
+                            merge_tool_calls(&mut out.tool_calls, arr);
                         }
                     }
                 }
@@ -801,7 +781,7 @@ pub fn aggregate<R: Read + Send>(
     }
     // issue #150：别名回改——合并后的 tool_calls.function.name 还原客户端原名
     if let Some(m) = tool_alias {
-        for t in c.tools.iter_mut() {
+        for t in c.tool_calls.iter_mut() {
             if let Some(orig) = t
                 .get("function")
                 .and_then(|f| f.get("name"))
@@ -824,9 +804,9 @@ pub fn aggregate<R: Read + Send>(
         message["reasoning_content"] = json!(c.reasoning);
     }
     // 审查修复（M6）：非流式聚合补发合并后的 tool_calls（与流式侧对称）
-    let has_tools = !c.tools.is_empty();
+    let has_tools = !c.tool_calls.is_empty();
     if has_tools {
-        message["tool_calls"] = json!(c.tools);
+        message["tool_calls"] = json!(c.tool_calls);
     }
 
     // issue #148：message.tool_calls 非空时 finish_reason 必须为 "tool_calls"——
@@ -915,12 +895,25 @@ struct ToolBuf {
     slot: usize,
 }
 
+/// OpenAI finish_reason 词表白名单归一化（词表外/空值归 stop）。
+/// done 与 turn_completion 两个收尾事件共用（3.8.5 审查 L1）
+fn normalize_finish(fr: &str) -> String {
+    const KNOWN_FINISH: [&str; 5] =
+        ["stop", "length", "tool_calls", "function_call", "content_filter"];
+    if KNOWN_FINISH.contains(&fr) {
+        fr.to_string()
+    } else {
+        "stop".to_string()
+    }
+}
+
 fn anthropic_stop_reason(finish: &str) -> &'static str {
     match finish {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
-        // content_filter 是真实截断语义：映射 refusal（对齐 wb_sse 聚合出口），
-        // 静默归 end_turn 会把「内容被过滤」伪装成「自然结束」
+        // 3.8.5 审查 L4 / main 同口径：content_filter 是真实截断语义（映射
+        // refusal，对齐 wb_sse 聚合出口），静默归 end_turn 会把「内容被过滤」
+        // 伪装成「自然结束」
         "content_filter" => "refusal",
         _ => "end_turn",
     }
@@ -951,6 +944,8 @@ fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
 /// 归一化 OpenAI usage：WB token_usage 原始字段（cache_read_token 等）→
 /// OpenAI 标准（prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens）。
 /// 下游（CPA 等）只认标准字段，直接透传原始事件会导致缓存读恒为 0。
+/// prompt/completion 用 token_number 宽口径解析（f64/字符串形态不再静默得 0），
+/// 与 wb_sse::u64_pair / tool-exec 累加同口径——否则会出现「缓存读 > 总输入」的矛盾账。
 pub(crate) fn normalize_openai_usage(u: &Value) -> Value {
     let prompt = usage_i64(u, &["prompt_tokens", "input_tokens"]).unwrap_or(0);
     let completion = usage_i64(u, &["completion_tokens", "output_tokens"]).unwrap_or(0);
@@ -1347,11 +1342,7 @@ fn stream_convert_anthropic_src(
     // 但「工具已缓冲 + 中途错误」时 error 分支已就地透传错误事件，
     // 需计入 sent_any，否则调用方会重复下发 error / 误触发重试重放
     let sent_any = message_started || (!tools.is_empty() && error_info.is_some());
-    (
-        error_info.map(|(code, msg)| (code, msg)),
-        sent_any,
-        usage,
-    )
+    (error_info, sent_any, usage)
 }
 
 /// 非流式聚合：SOLO SSE → Anthropic message 对象（/v1/messages）
@@ -1369,18 +1360,24 @@ pub fn aggregate_anthropic<R: Read + Send>(
     let mut usage: Option<Value> = None;
     let mut tools: Vec<ToolBuf> = Vec::new();
     let mut error_info: Option<(i64, String)> = None;
+    // 传输层掐断读错误（与 collect_plain.read_error 同模式）：半截内容不得以
+    // 正常 stop_reason 伪装成功——仅 !saw_done 且无业务错误时留存传输掐断
+    // 特征读错误（口径同流式侧），其余读错误维持折叠语义
+    let mut read_error: Option<String> = None;
 
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                // 口径同 collect_plain（is_transport_cut_text 门控，PR #162 补齐
-                // main 侧缺口）：完成前断流按传输掐断上抛哨兵（read_cut_error），
-                // 不把截断的 Anthropic message 当成功交付；其余读错误维持折叠语义
+                // 口径同 collect_plain（is_transport_cut_text 门控）：完成前断流
+                // 留存传输掐断特征读错误（read_error，循环尾统一上抛哨兵），不把
+                // 截断的 Anthropic message 当成功交付；其余读错误维持折叠语义。
+                // 移植注记：main 侧以 read_cut_error 助手封装同款逻辑，本侧为
+                // 内联写法（无独立助手），语义等价
                 if !saw_done && error_info.is_none() {
                     let text = e.to_string();
                     if super::is_transport_cut_text(&text) {
-                        error_info = Some(read_cut_error(&e));
+                        read_error = Some(text);
                     }
                 }
                 break;
@@ -1474,6 +1471,17 @@ pub fn aggregate_anthropic<R: Read + Send>(
 
     if let Some((code, msg)) = &error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // 传输层掐断哨兵上抛（对齐 aggregate/aggregate_text）：半截内容不得以
+    // 正常 stop_reason 伪装成功，交调用方丢弃换号重试（routes 聚合预检）
+    if let Some(e) = read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
     }
 
     let mut blocks: Vec<Value> = Vec::new();
@@ -1679,6 +1687,7 @@ mod tests {
             "c1",
             None,
         );
+        // msg 内容不参与断言（哨兵语义由 code 表达）
         let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
         assert!(!sent_any);
@@ -2124,6 +2133,76 @@ mod tests {
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["stop_reason"], "tool_use");
         assert!(resp["content"].as_array().expect("blocks").iter().any(|b| b["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn aggregate_anthropic_transport_cut_with_content_raises_sentinel() {
+        // Anthropic 非流式聚合：半截内容 + 传输掐断读错误 → 上抛哨兵，
+        // 不得以正常 stop_reason 伪装成功（交调用方丢弃换号重试）
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"hi\"}\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_t", "m", None);
+        let (code, msg) = err.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            msg.starts_with(crate::api_server::TRANSPORT_CUT_MSG_PREFIX),
+            "哨兵消息须携带 transport cut: 前缀（is_transport_cut 双口径之一）：{msg}"
+        );
+        assert!(resp.is_none(), "半截内容不得伪装为正常聚合结果");
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "网络掐断不得计入空完成指纹口径"
+        );
+    }
+
+    #[test]
+    fn aggregate_anthropic_non_transport_read_error_keeps_legacy_semantics() {
+        // 对照组：非传输特征读错误维持旧折叠语义——折叠为 EOF，
+        // 零内容照常返回空聚合结果（不触发传输掐断哨兵）
+        let reader = CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "weird os error 42",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_t", "m", None);
+        assert!(err.is_none(), "非传输读错误不得触发哨兵");
+        assert!(resp.is_some(), "折叠 EOF 应照常返回聚合结果");
+    }
+
+    // ==================== 3.8.5 审查修复：done 词表归一化 + content_filter 映射 ====================
+
+    #[test]
+    fn done_nonwhitelist_finish_reason_normalized_to_stop() {
+        // done 收尾携带词表外值（如 "completed"）→ 出口归一化为 stop，
+        // 不裸透传污染 OpenAI 出口（对齐 turn_completion 词表白名单口径）
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"hi\"}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"completed\"}\n\n",
+        );
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(
+            resp["choices"][0]["finish_reason"], "stop",
+            "done 非词表值必须归一化为 stop"
+        );
+    }
+
+    #[test]
+    fn anthropic_content_filter_maps_to_refusal() {
+        // Anthropic 映射：content_filter 是真实截断语义，不得静默降级 end_turn
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"部分输出\"}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"content_filter\"}\n\n",
+        );
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_t", "m", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(resp["stop_reason"], "refusal");
     }
 
     #[test]

@@ -7,9 +7,11 @@ use crate::models::Settings;
 pub const DATA_DIR_NAME: &str = "AIWorkAssistant";
 /// 旧版数据目录名（品牌迁移前为 Trae Work Assistant），启动时自动迁移到新版目录
 pub const LEGACY_DATA_DIR_NAME: &str = "TraeWorkAssistant";
-/// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移
+/// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移（仅 Windows）
+#[cfg(windows)]
 pub const LEGACY_IDENTIFIER: &str = "com.traework.assistant";
-/// 新版 bundle identifier
+/// 新版 bundle identifier（与 LEGACY 同为 WebView2 目录迁移专用，仅 Windows 消费）
+#[cfg(windows)]
 pub const IDENTIFIER: &str = "com.aiwork.assistant";
 
 /// 品牌迁移：老版本遗留目录**复制**到新目录（旧目录原地保留，老应用可继续使用，两版可并存）。
@@ -26,10 +28,10 @@ pub const IDENTIFIER: &str = "com.aiwork.assistant";
 pub fn migrate_legacy_dirs() -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
 
-    // 1) 数据目录迁移（复制语义）
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let legacy = PathBuf::from(&appdata).join(LEGACY_DATA_DIR_NAME);
-        let new_dir = PathBuf::from(&appdata).join(DATA_DIR_NAME);
+    // 1) 数据目录迁移（复制语义；mac 无旧版数据，legacy.is_dir() 恒 false 天然跳过）
+    if let Ok(appdata) = crate::platform::app_support_root() {
+        let legacy = appdata.join(LEGACY_DATA_DIR_NAME);
+        let new_dir = appdata.join(DATA_DIR_NAME);
         if legacy.is_dir() {
             if new_dir.is_dir() && dir_is_empty(&new_dir) == Some(false) {
                 // 已迁移过：跳过（老应用数据原地保留，两版并存）
@@ -57,6 +59,9 @@ pub fn migrate_legacy_dirs() -> Option<String> {
     // 2) WebView2 用户数据目录迁移（identifier 变更所致；复制语义，失败不影响启动）
     //    排除缓存类子目录（Cache/GPUCache 等）：体积可达 GB 级且常被运行中的老应用锁定，
     //    跳过后由新版本首次运行时自动重建，界面偏好等关键文件仍完整迁移
+    //    F-75 M0-0.3：mac 无 WebView2 用户数据目录概念（WKWebView 数据由系统按
+    //    bundle identifier 管理随 app 删除清除），整段 cfg(windows) 门控
+    #[cfg(windows)]
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let legacy = PathBuf::from(&local).join(LEGACY_IDENTIFIER);
         let new_dir = PathBuf::from(&local).join(IDENTIFIER);
@@ -108,6 +113,7 @@ pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, exclude_dirs: &[&
 }
 
 /// WebView2 用户数据目录中可跳过的缓存类子目录（迁移时排除，运行时自动重建）
+#[cfg(windows)]
 const WEBVIEW_CACHE_DIRS: [&str; 8] = [
     "Cache",
     "Code Cache",
@@ -159,26 +165,40 @@ pub struct AppState {
 /// 配置文件名列表（路由到 conf/ 目录）
 const CONF_FILES: &[&str] = &["app_settings.json"];
 
+/// 修复 3（issue #153）：canonicalize 解析 Junction/目录联接到真实路径。
+/// APPDATA 下若存在联接链（如用户手工迁移目录），路径不解析会让 vault
+/// 等组件踩 os error 448（ERROR_UNTRUSTED_MOUNT_POINT）；解析失败（理论上
+/// 仅在极端 IO 环境发生）退回未解析路径，不阻塞启动。
+/// macos_main 合并适配：Windows canonicalize 返回 verbatim 路径（\\?\C:\…），
+/// strip 前缀还原普通形态（与 app_support_root 拼接口径一致，防日志/配置
+/// 展示与路径等值比较出现两套写法；macOS canonicalize 无此前缀，无副作用）。
+/// 提取为独立函数供测试同口径断言（审查修复：测试机 APPDATA 存在 Junction
+/// 时，裸 expected 与解析后 data_dir 不等会误报）。
+fn canonicalized_data_dir(path: std::path::PathBuf) -> std::path::PathBuf {
+    match path.canonicalize() {
+        Ok(c) => {
+            let s = c.to_string_lossy().to_string();
+            // Windows verbatim 还原：\\?\C:\… → C:\…；\\?\UNC\server\share → \\server\share
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                std::path::PathBuf::from(format!(r"\\{rest}"))
+            } else {
+                std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+            }
+        }
+        Err(_) => path,
+    }
+}
+
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        // 数据目录：%APPDATA%\AIWorkAssistant，不存在则创建
-        // macOS 适配预留（2026-10-03）：Qoder 账号池（qoder_pool/token store/
-        // 快照 profiles_qoder*）全部落在此目录之下。macOS 对应根 = `dirs::data_dir()`
-        // 即 ~/Library/Application Support/AIWorkAssistant；建议本函数按 cfg 分支
-        // 取根目录（Windows=APPDATA / macOS=dirs::data_dir()），下游 data_dir
-        // 拼接逻辑与 Qoder 域代码零改动
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;
-        let data_dir = appdata.join(DATA_DIR_NAME);
+        // 数据目录：%APPDATA%\AIWorkAssistant（macOS: ~/Library/Application Support/AIWorkAssistant，
+        // F-75 M0-0.3；Qoder 账号池 qoder_pool/token store/快照 profiles_qoder* 全部落在此目录下），
+        // 不存在则创建。平台根收口 platform::app_support_root（Windows=APPDATA / mac=dirs::data_dir()）
+        let data_dir = crate::platform::app_support_root()?.join(DATA_DIR_NAME);
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
-        // 修复 3（issue #153）：canonicalize 解析 Junction/目录联接到真实路径。
-        // APPDATA 下若存在联接链（如用户手工迁移目录），路径不解析会让 vault
-        // 等组件踩 os error 448（ERROR_UNTRUSTED_MOUNT_POINT）；解析失败（理论上
-        // 仅在极端 IO 环境发生）退回未解析路径，不阻塞启动
-        let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+        let data_dir = canonicalized_data_dir(data_dir);
 
         // 创建子目录结构
         let conf_dir = data_dir.join("conf");
@@ -283,11 +303,15 @@ impl AppState {
         // 回退默认（豆包双开关落 false），仅按键存在性放行会把损坏行误当
         // 「已配置」漏回填——值不可解析同样视为从未配置
         if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
-            let never_configured =
-                match crate::store::db(&self.data_dir).kv_get_raw("app_settings") {
-                    None => true,
-                    Some(raw) => serde_json::from_str::<serde_json::Value>(&raw).is_err(),
-                };
+            // 「从未配置」判定：键缺失，或键存在但内容损坏——kv_get 对损坏内容
+            // 回退 Settings::default()（双开关落 false）而 kv_get_raw 返回 Some，
+            // 只判键缺失会漏掉损坏路径（3.8.5 审查 L1：kv 半写/手改后双开关恒关）。
+            // 解析口径与 kv_get::<Settings> 一致（合法 JSON 但按 Settings 解析失败
+            // 同样回退默认，Value 口径会漏判这类行）
+            let never_configured = match crate::store::db(&self.data_dir).kv_get_raw("app_settings") {
+                None => true,
+                Some(raw) => serde_json::from_str::<Settings>(&raw).is_err(),
+            };
             if never_configured {
                 s.doubao_keepalive_enabled = true;
                 s.doubao_quota_enabled = true;
@@ -321,10 +345,17 @@ impl AppState {
         if s.qoder_checkin_hhmm.trim().is_empty() {
             s.qoder_checkin_hhmm = "10:15".into();
         }
+        // 注意：此处仅回填时刻，不改 enabled——开关的派生权威在下方 mode 归一
+        //（若此处强行置 true，旧 kv 显式 enabled=false + 空 hhmm 会被错误拉起为 every_hours）
         if s.qoder_credits_sync_hhmm.trim().is_empty() {
-            s.qoder_credits_sync_enabled = true;
             s.qoder_credits_sync_hhmm = "23:40".into();
         }
+        // Qoder Token 续期间隔：零值回填默认 6 + 域钳制 1~24（serde default 已给 6，
+        // 此处兜底旧数据/手改配置越界值；调度器侧另有 max(1) 防线）
+        if s.qoder_token_renew_interval_hours == 0 {
+            s.qoder_token_renew_interval_hours = 6;
+        }
+        s.qoder_token_renew_interval_hours = s.qoder_token_renew_interval_hours.min(24);
         // Qoder 会话流水定时合并（qoder-sessions-compact）：同款零值回填
         //（kv 完全缺失走派生 Default bool=false 会漏开；时刻为空视为从未配置，回填默认开）
         if s.qoder_sessions_compact_hhmm.trim().is_empty() {
@@ -455,6 +486,23 @@ impl AppState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 数据目录落app_support_root() {
+        // F-75 M0-0.3：数据根目录不再直读 APPDATA 环境变量，锁定与 platform 基根一致
+        let s = AppState::new().expect("AppState::new");
+        let expected = crate::platform::app_support_root()
+            .expect("app_support_root")
+            .join(DATA_DIR_NAME);
+        // 同口径 canonicalize（审查修复：测试机 APPDATA 为 Junction 时裸路径
+        // 与解析后 data_dir 不等——正是 canonicalized_data_dir 修复的目标场景）
+        let expected = canonicalized_data_dir(expected);
+        assert_eq!(s.data_dir, expected);
+        // 子目录结构（conf/data/logs）在 new() 内已创建
+        assert!(s.data_dir.join("conf").is_dir());
+        assert!(s.data_dir.join("data").is_dir());
+        assert!(s.data_dir.join("logs").is_dir());
+    }
+
     fn tmp_state(tag: &str) -> AppState {
         let d = std::env::temp_dir().join(format!("twa_state_notify_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -468,6 +516,35 @@ mod tests {
             doubao_pool_lock: Arc::new(Mutex::new(())),
             group_defs_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// 3.8.5 审查修复（L1）：kv 半写/损坏（键存在但内容非法）→ 双开关回填默认开；
+    /// 显式关闭（合法 kv）不被回填复活
+    #[test]
+    fn settings_corrupt_kv_backfills_doubao_switches() {
+        let st = tmp_state("corrupt_kv");
+        crate::store::db(&st.data_dir)
+            .kv_set_raw("app_settings", "{invalid json")
+            .unwrap();
+        let s = st.settings();
+        assert!(
+            s.doubao_keepalive_enabled && s.doubao_quota_enabled,
+            "损坏 kv 路径必须回填默认开"
+        );
+        crate::store::db(&st.data_dir)
+            .kv_set(
+                "app_settings",
+                &serde_json::json!({
+                    "doubao_keepalive_enabled": false,
+                    "doubao_quota_enabled": false
+                }),
+            )
+            .unwrap();
+        let s2 = st.settings();
+        assert!(
+            !s2.doubao_keepalive_enabled && !s2.doubao_quota_enabled,
+            "显式关闭不被回填复活"
+        );
     }
 
     /// 旧 workbuddy_settings 通知字段 → app Settings 一次性搬运：回写 app_settings 持久化 +

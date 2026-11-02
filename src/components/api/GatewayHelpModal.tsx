@@ -114,8 +114,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
       if (await copyText(example)) {
         setCopied(true);
         toast('success', 'cURL 示例已复制到剪贴板');
-        // 审查修复（L36）：成功态停留 2 秒再复位（原先 finally 立即复位，用户看不到「已复制」反馈）；
-        // 重复点击时重置定时器，卸载时统一清理防泄漏
+        // Low 修复（审查 L36）：成功态停留 2 秒再复位——原 finally 立即复位，
+        // 用户看不到「已复制」反馈；重复点击时重置定时器，卸载时统一清理防泄漏
         if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
       } else toast('error', '复制失败');

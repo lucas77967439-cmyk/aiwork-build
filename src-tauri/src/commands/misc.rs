@@ -1,7 +1,6 @@
+use crate::platform::cmd::sys_command;
 use std::collections::{HashMap, HashSet};
-use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +19,11 @@ pub const INVITE_LINK: &str =
 #[tauri::command]
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
     // SQLite 化（P3）：device_map.json → device_map 表
+    // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——与签到写回/
+    // OAuth 登录回写并发时防整表覆盖丢条目（删除被并发回写复活）
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let store = crate::store::db(&state.data_dir);
     let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
     map.remove(&user_id);
@@ -274,30 +278,27 @@ fn is_log_shard_day(day: &str) -> bool {
 }
 
 /// 目录内 `proxy_req_*.log` 及同日轮转分片 `.log.N`，排序 = 日期升序 + 分片序号升序
-/// （即写入时间升序；字典序会把 `.log.10` 排到 `.log.2` 前，须按序号数值排）
-fn proxy_log_files(log_dir: &Path) -> Vec<String> {
+/// （即写入时间升序；字典序会把 `.log.10` 排到 `.log.2` 前，须按序号数值排）。
+/// 目录读取失败返回 Err（对齐基线错误语义；吞成空表会连带清空全部索引缓存）
+fn proxy_log_files(log_dir: &Path) -> Result<Vec<String>, String> {
     let mut files: Vec<String> = std::fs::read_dir(log_dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if proxy_log_shard_key(&name).is_some() {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        .map_err(|e| format!("读取代理日志目录失败: {e}"))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if proxy_log_shard_key(&name).is_some() {
+                Some(name)
+            } else {
+                None
+            }
         })
-        .unwrap_or_default();
+        .collect();
     files.sort_by(|a, b| {
         let ka = proxy_log_shard_key(a).unwrap_or(("", 0));
         let kb = proxy_log_shard_key(b).unwrap_or(("", 0));
         ka.cmp(&kb)
     });
-    files
+    Ok(files)
 }
 
 /// 索引缓存清理：磁盘上已不存在的日志文件（轮转 / 删除）不再占内存
@@ -323,6 +324,15 @@ fn read_range(path: &Path, from: u64, to: u64) -> Result<Vec<u8>, String> {
     f.take(to - from)
         .read_to_end(&mut buf)
         .map_err(|e| format!("读取日志文件失败: {e}"))?;
+    // 短读 = 文件在索引构建/条目定位与本次读取之间被轮转/截断：报错走既有的
+    // 「单条/单文件降级」路径，不静默返回截断内容造成摘要与正文错位
+    if buf.len() as u64 != to - from {
+        return Err(format!(
+            "日志内容短于预期（可能已被轮转或截断）: 期望 {} 字节，实际 {} 字节",
+            to - from,
+            buf.len()
+        ));
+    }
     Ok(buf)
 }
 
@@ -514,7 +524,7 @@ fn proxy_logs_list_impl(
     let offset = opts.offset.unwrap_or(0);
     let limit = opts.limit.unwrap_or(50);
 
-    let files = proxy_log_files(log_dir);
+    let files = proxy_log_files(log_dir)?;
     retain_alive_indexes(log_dir, &files);
 
     // 候选收集：多线程（文件之间互不依赖；冷建索引与关键字全文扫描都是 IO+CPU 密集）。
@@ -544,6 +554,9 @@ fn proxy_logs_list_impl(
     }
     candidates.reverse();
 
+    // total 口径 = 非空块数（与列表 id 的「文件内原始分块序号」语义绑定）：
+    // 极少数解析失败的畸形块计入 total 但页内跳过（末页可短）；若在索引构建期
+    // 过滤会移动原始序号、破坏详情 id 对齐，故保留该口径
     let total = candidates.len();
     let entries: Vec<ProxyLogEntry> = candidates
         .into_iter()
@@ -892,6 +905,7 @@ const BLOCKED_EXEC_EXTS: &[&str] = &[
 
 /// Windows 路径归一化（仅用于前缀比较）：分隔符统一为 `\`、剥离 verbatim
 /// `\\?\` / `\\?\UNC\` 前缀、去尾部分隔符、转小写（Windows 不区分大小写）
+#[cfg(windows)]
 fn normalize_win_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().replace('/', "\\");
     let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -904,8 +918,23 @@ fn normalize_win_path(p: &std::path::Path) -> String {
     s.trim_end_matches('\\').to_lowercase()
 }
 
+/// 前缀比较用归一化（check_export_path 唯一入口）：
+/// Windows 走 normalize_win_path；mac 只统一分隔符与尾部斜杠（保留大小写，
+/// APFS 大小写敏感卷上小写折叠会误判）
+#[cfg(windows)]
+fn normalize_for_prefix(p: &std::path::Path) -> String {
+    normalize_win_path(p)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_for_prefix(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    s.trim_end_matches('/').to_string()
+}
+
 /// 目录前缀匹配：相等，或 path 位于 prefix 的子目录内
 /// （避免 `C:\Windows` 误伤 `C:\Windows-Empire` 这类兄弟目录）
+#[cfg(windows)]
 fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
     if prefix_norm.is_empty() {
         return false;
@@ -913,8 +942,17 @@ fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
     path_norm == prefix_norm || path_norm.starts_with(&format!("{prefix_norm}\\"))
 }
 
-/// 收集需禁止写入的系统目录前缀：Windows 系统目录、Program Files、
+#[cfg(target_os = "macos")]
+fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
+    if prefix_norm.is_empty() {
+        return false;
+    }
+    path_norm == prefix_norm || path_norm.starts_with(&format!("{prefix_norm}/"))
+}
+
+/// 收集需禁止写入的系统目录前缀（Windows）：系统目录、Program Files、
 /// 开始菜单（含用户/公共启动文件夹）。环境变量缺失时用常见默认值兜底
+#[cfg(windows)]
 fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
     let env_or = |k: &str, fb: &str| std::env::var(k).unwrap_or_else(|_| fb.to_string());
     let mut v = Vec::new();
@@ -932,6 +970,28 @@ fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
     v
 }
 
+/// 收集需禁止写入的系统目录前缀（macOS）：SIP 保护域与全机 Library、私有根、
+/// /etc（/private/etc 符链），另加用户级持久化目录 ~/Library/LaunchAgents 与
+/// ~/Library/LaunchDaemons（审查 P2：LaunchAgent 当前用户可写，是用户级
+/// 开机自启持久化滥用面——语义对齐 Windows 分支的启动文件夹封禁；
+/// LaunchDaemons 需 root 但一并封禁防提权写入）——HOME 缺失时跳过用户级两项
+#[cfg(target_os = "macos")]
+fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
+    let mut v = vec![
+        std::path::PathBuf::from("/System"),
+        std::path::PathBuf::from("/Library"),
+        std::path::PathBuf::from("/private"),
+        std::path::PathBuf::from("/etc"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            v.push(std::path::PathBuf::from(&home).join("Library/LaunchAgents"));
+            v.push(std::path::PathBuf::from(&home).join("Library/LaunchDaemons"));
+        }
+    }
+    v
+}
+
 /// 导出路径校验（canonicalize 失败时对原路径做前缀判断）：
 /// ① 命中系统目录/启动文件夹前缀 → 拒绝；
 /// ② 可执行/脚本扩展名（或无扩展名）且不在应用数据目录下 → 拒绝
@@ -943,9 +1003,9 @@ fn check_export_path(
     blocked: &[std::path::PathBuf],
 ) -> Result<(), String> {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let norm = normalize_win_path(&canon);
+    let norm = normalize_for_prefix(&canon);
     for b in blocked {
-        if starts_with_dir(&norm, &normalize_win_path(b)) {
+        if starts_with_dir(&norm, &normalize_for_prefix(b)) {
             return Err(
                 "拒绝写入：目标位于系统目录或启动文件夹，为防止持久化滥用不允许导出到该位置".into(),
             );
@@ -953,7 +1013,7 @@ fn check_export_path(
     }
     let exec_ok = || -> bool {
         let data_canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-        starts_with_dir(&norm, &normalize_win_path(&data_canon))
+        starts_with_dir(&norm, &normalize_for_prefix(&data_canon))
     };
     let is_exec = path
         .extension()
@@ -1015,11 +1075,6 @@ pub const DOUBAO_TASK_NAME: &str = "AIWorkAssistant_DoubaoRenew";
 /// 豆包额度巡检每日计划任务名（批量查额度 + 回写缓存/历史 + 用完记录）
 pub const DOUBAO_QUOTA_TASK_NAME: &str = "AIWorkAssistant_DoubaoQuotaCheck";
 
-// 运行 schtasks 并正确解码输出。
-// 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
-// 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
-// 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
-// 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
 /// 严格校验 HH:MM 时间格式（schtasks /ST 参数）。
 /// 审查修复（命令注入）：time 经 `cmd /c … && schtasks /ST <time>` 执行，cmd 对不含
 /// 空格/引号的参数不做引号包裹，`12:00&calc` 类输入会把 `&` 解释为命令分隔符实现
@@ -1038,10 +1093,38 @@ pub(crate) fn validate_hhmm(time: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// F-75 M2-2.4：schtasks 注册面 mac 明示错误文案（命令级门控统一出口）。
+/// mac 定时主路径 = 内置调度器 tasks/scheduler.rs + 开机自启 + 静默签到（设计 §5.4.1，
+/// 功能零缺口），schtasks 6 任务名 + .cmd 启动器 + 2 个迁移函数整体 Windows 专属。
+#[cfg(not(windows))]
+const SCHTASKS_UNSUPPORTED_MSG: &str =
+    "系统级计划任务注册仅支持 Windows；macOS 请开启「开机自启 + 静默签到」，应用运行期间由内置调度器按时执行";
+
+/// 命令级 schtasks 门控：mac 恒 Err（明示文案），Windows 恒 Ok。
+/// 审查修复（P1）：替代 `#[cfg] { return ...; }` 直排模式——直排块在 mac 构建中
+/// 展开为无条件 return，其后命令体被编译器判定不可达 → unreachable_code 警告
+/// （零警告红线）。gate 形态下命令体在编译器视角仍可达（Result 非幂类型），
+/// 运行时 mac 恒早退，命令体零改动。
+#[cfg(not(windows))]
+pub(crate) fn schtasks_gate() -> Result<(), String> {
+    Err(SCHTASKS_UNSUPPORTED_MSG.to_string())
+}
+#[cfg(windows)]
+pub(crate) fn schtasks_gate() -> Result<(), String> {
+    Ok(())
+}
+
+// 运行 schtasks 并正确解码输出。
 // 审查修复（L16）：本函数是全仓唯一允许的 `cmd /c … && schtasks` shell 包装点。
-// 安全红线：args 仅允许调用方以参数数组传入的 schtasks 子命令/任务名/路径等受控
-// 字面量，禁止拼接任何不可信输入；外部来源参数必须先经白名单校验（如 validate_hhmm）
-// 才能进入。新增调用方须遵守本约定，不得绕过本封装直接派生 cmd。
+// 安全红线（审查备案）：args 仅允许调用方以参数数组传入的 schtasks 子命令/任务名/
+// 路径等受控字面量，**严禁**拼接任何不可信输入（账号名、路径、备注等）；外部来源
+// 参数必须先经白名单校验（如 validate_hhmm）才能进入。cmd 元字符（& | ^ ! %）
+// 构成命令注入面，新增调用点必须保持 args 全常量、不得绕过本封装直接派生 cmd；
+// 若未来需要动态参数，必须改走无 shell 的 sys_command 直调形式。
+// 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
+// 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
+// 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
+// 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),
@@ -1054,9 +1137,8 @@ pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), Stri
     for a in args {
         full.push((*a).to_string());
     }
-    let out = Command::new("cmd")
+    let out = sys_command("cmd")
         .args(&full)
-        .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("执行 schtasks 失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -1120,7 +1202,8 @@ fn register_daily_task(time: &str) -> Result<(), String> {
 
 // 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
 #[tauri::command(async)]
-pub fn task_register(time: String) -> Result<(), String> {
+pub fn task_register(_state: State<AppState>, time: String) -> Result<(), String> {
+    schtasks_gate()?;
     validate_hhmm(&time)?;
     register_daily_task(&time)?;
     // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
@@ -1178,7 +1261,8 @@ pub fn try_migrate_legacy_task() -> Option<String> {
 }
 
 #[tauri::command(async)]
-pub fn task_status(_app: AppHandle) -> Result<String, String> {
+pub fn task_status(_state: State<AppState>, _app: AppHandle) -> Result<String, String> {
+    schtasks_gate()?;
     let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
     if !ok {
         let detail = if !stderr.trim().is_empty() {
@@ -1210,6 +1294,7 @@ pub fn task_status(_app: AppHandle) -> Result<String, String> {
 
 #[tauri::command(async)]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
+    schtasks_gate()?;
     // 只删除本应用的新任务名；旧任务 TraeWorkAssistant_DailyCheckin 属老应用，
     // 两版并存时不得越权删除（老应用的签到计划需继续工作）
     let mut last_detail = String::new();
@@ -1272,9 +1357,9 @@ pub(crate) fn list_task_names() -> Vec<String> {
 /// 查询计划任务定义 XML（schtasks /Query /TN <name> /XML）。
 /// 输出为 UTF-16LE（带 BOM），需按 UTF-16 解码；失败返回 None。
 fn query_task_xml(name: &str) -> Option<String> {
-    let out = Command::new("cmd")
+    // F-75：统一走 sys_command（Windows 内置 CREATE_NO_WINDOW，非 Windows 裸 Command）
+    let out = sys_command("cmd")
         .args(["/c", "chcp", "65001", ">nul", "&&", "schtasks", "/Query", "/TN", name, "/XML"])
-        .creation_flags(0x08000000)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1377,7 +1462,8 @@ fn task_cli_arg(name: &str) -> Option<&'static str> {
 /// 按其原触发计划（每日 / 每周+星期+时刻，解析自任务 XML）重建为 GUI 子系统 exe 直调
 /// （release 主程序 windows_subsystem="windows"，无控制台窗口）。
 /// 幂等：仅迁移 Command 为旧形态的任务，迁移后再次运行自动跳过；
-/// 任一任务迁移失败则不落一次性完成标记，下次启动重试。
+/// 仅瞬时失败（查询任务定义 / schtasks 报错）不落一次性完成标记，下次启动重试；
+/// 确定性跳过（双周计划、畸形时刻等无法无损重建）计数留痕，仍置位标记。
 /// main.rs 启动期后台线程调用（CSV 枚举 + 逐任务 XML 查询可达数秒，不阻塞启动）。
 pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<String> {
     // 一次性完成标记：全量迁移成功后置位，跳过后续启动的枚举扫描
@@ -1401,22 +1487,29 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
         .collect();
     let exe = std::env::current_exe().ok()?;
     let mut migrated = 0usize;
+    let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut notes: Vec<String> = Vec::new();
     for name in targets {
         let Some(arg) = task_cli_arg(&name) else { continue };
         let Some(xml) = query_task_xml(&name) else {
-            // 计入 failed：进摘要落日志留痕，且不置完成标记 → 下次启动重试
+            // 瞬时失败：计 failed 不置完成标记 → 下次启动重试
             failed += 1;
             notes.push(format!("任务迁移失败 {name}：查询任务定义失败"));
             continue;
         };
-        let Some(command) = xml_tag_text(&xml, "Command") else { continue };
+        let Some(command) = xml_tag_text(&xml, "Command") else {
+            // 确定性跳过：任务定义缺 Command 标签无法分类，重试无意义
+            skipped += 1;
+            notes.push(format!("任务迁移跳过 {name}：任务定义缺少 Command 标签（保留旧任务继续工作）"));
+            continue;
+        };
         if !is_legacy_tr_command(&command) {
             continue; // 已是直调形态（新版本注册），幂等跳过
         }
         let (Some(hhmm), Some(schedule)) = (xml_start_hhmm(&xml), parse_task_schedule(&xml)) else {
-            failed += 1;
+            // 确定性跳过：双周计划 / 畸形时刻无法无损重建，重试无意义
+            skipped += 1;
             notes.push(format!("任务迁移跳过 {name}：无法解析触发计划（保留旧任务继续工作）"));
             continue;
         };
@@ -1451,22 +1544,22 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
             }
         }
     }
-    if migrated == 0 && failed == 0 {
-        // 无旧形态任务，无事可做（下轮启动再扫：CSV 枚举 + 存在目标任务时
-        // 的逐任务 XML 查询；全部迁移成功置位标记后不再进入本路径）
-        return None;
-    }
     if failed == 0 {
-        // 全部成功：清掉豆包遗留 .cmd 启动器（其 schtasks 条目已改为直调），
-        // 置一次性完成标记；标记落库失败仅影响下次启动多扫一轮，不重试
+        // 收口（无旧形态任务 / 全部迁移成功 / 仅剩确定性跳过）：清掉豆包遗留
+        // .cmd 启动器，置一次性完成标记，后续启动不再进入本路径；标记落库失败
+        // 仅影响下次启动多扫一轮。取舍：置位后旧版本重注册出的旧形态任务不再
+        // 自动迁移（极小概率，重装新版即恢复直调）
         for f in ["task_doubao_renew.cmd", "task_doubao_quota.cmd"] {
             let _ = std::fs::remove_file(data_dir.join(f));
         }
         let _ = crate::store::db(data_dir)
             .kv_set("schtasks_direct_tr_migrated", &serde_json::json!(true));
+        if migrated == 0 && skipped == 0 {
+            return None; // 无旧形态任务且无可记录事项
+        }
     }
     let summary = format!(
-        "[计划任务迁移] issue #112 旧形态 /TR 重建：{migrated} 成功 / {failed} 失败：{}",
+        "[计划任务迁移] issue #112 旧形态 /TR 重建：{migrated} 成功 / {skipped} 跳过 / {failed} 失败：{}",
         notes.join("；")
     );
     Some(summary)
@@ -1663,7 +1756,7 @@ mod tests {
             .join("logs");
         assert!(dir.is_dir(), "日志目录不存在: {}", dir.display());
         let mut total_bytes = 0u64;
-        for name in proxy_log_files(&dir) {
+        for name in proxy_log_files(&dir).unwrap() {
             total_bytes += std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
         }
 
@@ -1685,7 +1778,7 @@ mod tests {
 
         println!(
             "日志目录 {} 个文件 / {}MB，条目 {}（冷建索引 {}ms / 热命中 {}ms / 深翻页 {}ms / 关键字 {}ms，关键字命中 {}）",
-            proxy_log_files(&dir).len(),
+            proxy_log_files(&dir).unwrap().len(),
             total_bytes / 1024 / 1024,
             cold.total,
             cold_ms,

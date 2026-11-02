@@ -266,7 +266,7 @@ export default function CreditsTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
-    modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, qoderCheckin, uidSet, startStr, todayStr,
+    modelFilter, creditsDaily, wbCheckin, wbSnapshots, qoderSnapshots, qoderCheckin, uidSet, startStr, todayStr,
   ]);
 
   // ---- 趋势数据（消耗柱 + 获得线；网关源为请求数柱）----

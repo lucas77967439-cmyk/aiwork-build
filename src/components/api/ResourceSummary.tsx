@@ -114,7 +114,7 @@ function DispatchCenterCard({
   // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），
   // onBlur 才落盘。审查 F14 修复：改存原始字符串——旧实现 Number('')=0 使「清空
   // 重输」直接跳 0，误失焦即静默保存 0（=关闭调度保护）；现空串/非法输入失焦时
-  // 还原策略值不落盘，合法整数才提交（保存侧 fail-closed，无失焦抢跑钳制）
+  // 还原策略值不落盘，合法数值才提交（保存侧 fail-closed，无失焦抢跑钳制）
   const [reserveDraft, setReserveDraft] = useState<string | null>(null);
   // F2：保存请求序号守卫（仅最新一次响应可写状态）
   const saveSeqRef = useRef(0);
@@ -173,10 +173,11 @@ function DispatchCenterCard({
         patch.buddy,
       );
       if (seq === saveSeqRef.current) {
-        // 审查修复（H3）：保存成功后回读后端最新池配置刷新父级状态（poolSet 的
-        // uids/group_ids 参数为页面加载时的旧快照，其他端改过的池配置会被旧快照
-        // 静默回退，原先仅做本地合并无法感知）。回读失败时退回本地合并（仅覆盖
-        // 本次修改维度），保证 UI 至少反映本次保存结果
+        // 审查修复（H3 / H-3 伴生修复）：保存成功后回读后端最新池配置刷新父级状态
+        // （poolSet 的 uids/group_ids 参数为页面加载时的旧快照，弹窗常驻期间他端改过
+        // 的池配置会被旧快照静默回退，原先仅做本地合并无法感知；Qoder/Buddy 页同款
+        // 修复）。回读失败时退回本地合并（仅覆盖本次修改维度），保证 UI 至少反映本次
+        // 保存结果；回读 await 后复检 seq，乱序的旧回读响应不得覆盖新保存
         const latest = await api.apiServer.poolList().catch(() => null);
         if (seq === saveSeqRef.current) {
           if (latest) {

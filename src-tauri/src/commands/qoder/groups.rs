@@ -49,7 +49,8 @@ pub fn qoder_groups_remove(
     id: String,
 ) -> Result<(), String> {
     // 转发统一删除（顺序：先回落三池成员 → 再删定义 → 最后清 api_pool/api_keys
-    // 引用 + 热重载；原 qoder 实现的审查结论已收敛进共享命令）
+    // 引用 + 热重载；原 qoder 实现的审查结论已收敛进共享命令：先回落再删定义、
+    // qoder_group_ids 幽灵筛选清理 + 热重载均保留）
     super::super::shared_groups::delete_inner(&state, runtime.inner(), &id)
 }
 

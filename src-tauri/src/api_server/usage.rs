@@ -230,7 +230,8 @@ impl DayStats {
 }
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
-/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求；
+/// Custom = 自定义模型（custom_models.json 上游组，统一调度尾部兜底源）请求；
+/// Qoder = Qoder 上游请求；
 /// BuddyAi = Buddy 国际版（buddy-ai 独立池）请求（§3.1 记账分区，与国内混计禁止）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
@@ -282,7 +283,7 @@ impl UsageFile {
         b.get(day)
     }
 
-    /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_ttfb/record_in）
+    /// 记录一次请求（无 TTFT 的简写，仅测试用；生产路径一律走 record_in_ttfb_on）
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record(
@@ -303,7 +304,9 @@ impl UsageFile {
         );
     }
 
-    /// 记录一次请求（带 TTFT，F-76）：流式路径已知首字耗时时使用
+    /// 记录一次请求（带 TTFT，F-76）：流式路径已知首字耗时时使用。
+    /// 仅测试链路可达（生产路径入口取定 day 直走 record_in_ttfb_on，见 G3）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_ttfb(
         &mut self,
@@ -325,7 +328,8 @@ impl UsageFile {
         );
     }
 
-    /// 按桶记录一次请求（custom_route 自定义池路径使用）
+    /// 按桶记录一次请求（custom_route 自定义池路径使用；仅测试链路可达，同上）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_in(
         &mut self,
@@ -345,7 +349,8 @@ impl UsageFile {
         );
     }
 
-    /// 按桶记录一次请求（带 TTFT，F-76）
+    /// 按桶记录一次请求（带 TTFT，F-76；仅测试链路可达，同上）
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_in_ttfb(
         &mut self,
@@ -398,9 +403,9 @@ impl UsageFile {
     /// 按桶记录一次缓存读 tokens 测量到指定日期 entry（M4 审查修复：
     /// DayStats.cached_tokens 维度的旁路入口，不扩 record 系列签名）。
     /// 审查修复（用量跨日归行）：`day` 由调用方在持锁期间取定并传入，
-    /// 写入路径内不再自行取 today——杜绝跨零点时 cached_tokens 与同一请求
-    /// 其他统计/标脏落盘行分裂到不同日期行（对齐 record_in_ttfb_on 的
-    /// 「调用方定日」语义）
+    /// 写入路径内不再自行取 today——杜绝跨零点时 cached_tokens 与调用方
+    /// 脏标记/同一请求其他统计落盘行分裂到不同日期行、旧行修改永不被
+    /// flush（重启丢账；对齐 record_in_ttfb_on 的「调用方定日」语义）
     pub fn record_cached_in(&mut self, bucket: UsageBucket, day: &str, cached: u64) {
         self.bucket_mut(bucket)
             .entry(day.to_string())
@@ -493,12 +498,34 @@ pub struct CustomSessionCtx {
 pub fn load(data_dir: &Path) -> UsageFile {
     let mut f = crate::store::docs::api_usage_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
-    let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
-    // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
-    let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
-    // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
-    let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // 3.8.5 审查 L3：保留期裁剪按「数据目录 + 本地日」节流——load 在统计查询
+    // 热路径被 query_recent_in 反复调用，此前每次刷新/切天数都执行 3 个 DELETE
+    // 全表扫描。日期粒度按本地自然日，跨零点后首查自然重新裁剪，语义不变；
+    // 测试各用独立临时目录，首查仍会执行。当日新写入数据由记账侧当日单行
+    // upsert / 流水 insert 保证不越期，无「当日行未被裁剪」窗口
+    if prune_should_run(data_dir) {
+        let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
+        let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
+        let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    }
     f
+}
+
+/// 保留期裁剪当日节流判定（同目录同日只跑一轮；进程内记忆，重启即重跑无持久态）
+fn prune_should_run(data_dir: &Path) -> bool {
+    static DONE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    let done = DONE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let today = chrono::Local::now().date_naive().to_string();
+    let mut m = done.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(data_dir).map(|d| d.as_str()) == Some(today.as_str()) {
+        return false;
+    }
+    m.insert(data_dir.to_path_buf(), today);
+    true
 }
 
 /// 持久化当日单行（flusher 记账削峰路径：单行 UPSERT 替代原整表 DELETE+重插）。

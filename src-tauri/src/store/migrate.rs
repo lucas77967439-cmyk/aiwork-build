@@ -479,13 +479,21 @@ fn move_to_backup(data_dir: &Path, rel: &str, corrupt: bool) -> std::io::Result<
     let dst = backup_dir.join(rel);
     std::fs::create_dir_all(dst.parent().unwrap_or(&backup_dir))?;
     if dst.exists() {
-        // 同名冲突：加时间戳后缀，绝不覆盖既有备份
+        // 同名冲突：加时间戳后缀，绝不覆盖既有备份；同秒撞名时递增 .2/.3
+        // 序号（对齐 rename_no_clobber 的审查 P2 口径——原生 rename 会静默
+        // 覆盖已存在目标，仅时间戳时同秒第二个文件会吞掉第一个）
         let stamped = format!(
             "{}_{}",
             file_name.trim_end_matches(".json"),
             chrono::Local::now().format("%Y%m%d%H%M%S")
         );
-        return std::fs::rename(&src, dst.with_file_name(format!("{stamped}.json")));
+        let mut cand = dst.with_file_name(format!("{stamped}.json"));
+        let mut seq = 2u32;
+        while cand.exists() {
+            cand = dst.with_file_name(format!("{stamped}.{seq}.json"));
+            seq += 1;
+        }
+        return std::fs::rename(&src, cand);
     }
     std::fs::rename(&src, dst)
 }
@@ -960,8 +968,9 @@ pub struct TraeWorkMigrationReport {
     pub notes: Vec<String>,
     /// settings 步处置结果的结构化字段（前端「迁移安装路径设置」步直接消费，
     /// 不再对 notes 做子串匹配——后端改 note 文案不会误显「已跳过」；
-    /// None = 无 trae_path 存量或迁移未跑该步）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// None = 无 trae_path 存量或迁移未跑该步）。
+    /// #[serde(default)]：修复前落的旧报告无此字段，反序列化按 None 兼容
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_note: Option<String>,
     /// 整组迁入 profiles_trae 的组数
     pub moved_groups: usize,
@@ -996,9 +1005,10 @@ pub fn migrate_traework_merge(data_dir: &Path) -> Option<String> {
             return None;
         }
     }
-    if crate::switcher::proc::any_running(&["Trae CN", "TRAE SOLO CN"]) {
+    if crate::switcher::proc::any_running(&["Trae CN", "TRAE SOLO CN", "TRAE SOLO", "Trae"]) {
         // 运行中：仅当确有存量才提示跳过，否则静默（下次启动廉价复查，不置标记）。
-        // 旧 TRAE SOLO CN 一并检测：用户尚未卸载旧客户端且正在运行时同样暂缓搬迁，
+        // 旧客户端一并检测（TRAE SOLO CN / TRAE SOLO / Trae 旧形态，对齐 env.rs mac
+        // 定位链名单）：用户尚未卸载旧客户端且正在运行时同样暂缓搬迁，
         // 保守对齐 §5.8「复用优雅关闭语义」
         if traework_merge_pending(&store, data_dir) {
             return Some("TraeWork 合并迁移跳过：Trae 客户端正在运行，将在下次启动重试".into());
@@ -1011,6 +1021,7 @@ pub fn migrate_traework_merge(data_dir: &Path) -> Option<String> {
 /// 迁移主体（无进程检测，供单测直调）：settings 步 + 快照池步，全部成功才置标记。
 fn migrate_traework_merge_inner(store: &Store, data_dir: &Path) -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
+    // settings 步结果单列（升级引导报告结构化字段，前端不再子串匹配 notes）
     let mut settings_note: Option<String> = None;
     match migrate_traework_settings(store) {
         Ok(Some(note)) => {
@@ -1257,7 +1268,10 @@ fn annotate_traework_source(sidecar: &Path) {
     if let Ok(s) = serde_json::to_string(&v) {
         let tmp = sidecar.with_extension("json.aiwork-tmp");
         if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, sidecar);
+            // rename 失败（杀软/句柄占用）时清理临时文件，防池根永久残留
+            if std::fs::rename(&tmp, sidecar).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }
@@ -1832,12 +1846,13 @@ mod tests {
     }
 
     #[test]
-    fn traework_merge_settings_rejects_legacy_trae_exe() {
-        // 存量旧客户端 ...\Programs\Trae\Trae.exe（文件名不含 solo）同样拒绝承接：
-        // 承接为 trae_cn_path 会让「打开 Trae」静默拉起退役旧客户端
-        let dir = tmp_dir("traework_legacy_guard");
+    fn traework_merge_settings_rejects_legacy_trae_exe_path() {
+        // 承接守卫补齐（审查修复）：旧形态 Trae.exe（旧 TraeWork 档案 exe_names
+        // 收录、运行检测名单同源）同样不得承接为 trae_cn_path——否则「打开 Trae」
+        // 静默拉起退役旧客户端且压制自动探测
+        let dir = tmp_dir("traework_trae_exe_guard");
         let store = db(&dir);
-        let old_exe = dir.join("Programs").join("Trae").join("Trae.exe");
+        let old_exe = dir.join("fake").join("Trae.exe");
         std::fs::create_dir_all(old_exe.parent().unwrap()).unwrap();
         std::fs::write(&old_exe, "exe").unwrap();
         store
@@ -1848,10 +1863,12 @@ mod tests {
             .unwrap();
 
         let summary = migrate_traework_merge_inner(&store, &dir).unwrap();
-        assert!(summary.contains("丢弃"), "旧版 Trae.exe 应拒绝承接: {summary}");
+        assert!(summary.contains("丢弃"), "旧形态 Trae.exe 应拒绝承接: {summary}");
+
         let v: Value =
             serde_json::from_str(&store.kv_get_raw("app_settings").unwrap()).unwrap();
-        assert!(v.get("trae_cn_path").is_none(), "不得承接旧版 Trae.exe 为 trae_cn_path");
+        assert!(v.get("trae_cn_path").is_none(), "不得承接旧形态 Trae.exe 为 trae_cn_path");
+        assert!(v.get("trae_path").is_none(), "trae_path 键仍应删除");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

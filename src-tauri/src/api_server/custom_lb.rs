@@ -198,6 +198,8 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
                 }
             }
             FailKind::Server => {
+                // fails 恒 ≥1（首插即 1，成功即整条清除），无需 fails==0 兜底分支
+                //（审查修复：原 else-if 分支不可达死代码）
                 if Instant::now() >= *until {
                     // 既有窗口已过期 = 新一次失败片段 → 递增并重设窗口；
                     // 未过期 = 同片段内的换号/并发失败，窗口维持原截止不后延
@@ -205,11 +207,6 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
                     let delay = (CIRCUIT_BASE_SECS << (*fails).saturating_sub(1).min(4))
                         .min(CIRCUIT_MAX_SECS);
                     *until = Instant::now() + Duration::from_secs(delay);
-                } else if *fails == 0 {
-                    let cand = Instant::now() + Duration::from_secs(CIRCUIT_BASE_SECS);
-                    if cand > *until {
-                        *until = cand;
-                    }
                 }
             }
         })
@@ -320,6 +317,40 @@ mod tests {
         assert_eq!(picked.id, idb);
         tried.insert(idb.clone());
         assert!(pick_upstream(&group, &tried, &c, None).is_none());
+    }
+
+    /// 白名单补充断言（macos_main）：组外条目无害、空白名单 = 排除、
+    /// None 解除限制后全组可轮询命中（核心语义与 t08 同口径）
+    #[test]
+    fn t02b_allowed_whitelist() {
+        let (ida, idb) = (uid(9), uid(9));
+        let group = vec![cm(&ida, 3, false), cm(&idb, 1, false)];
+        let c = counter();
+        // 仅白名单内 idb：即使 ida 权重更高也不命中
+        let mut allowed: HashSet<String> = HashSet::new();
+        allowed.insert(idb.clone());
+        for _ in 0..4 {
+            assert_eq!(
+                pick_upstream(&group, &HashSet::new(), &c, Some(&allowed)).unwrap().id,
+                idb
+            );
+        }
+        // 白名单含组外条目（无害）：仅组内交集参与
+        allowed.insert("not-in-group".to_string());
+        assert_eq!(
+            pick_upstream(&group, &HashSet::new(), &c, Some(&allowed)).unwrap().id,
+            idb
+        );
+        // 空白名单 = 该池被该 Key 排除 → None
+        let empty: HashSet<String> = HashSet::new();
+        assert!(pick_upstream(&group, &HashSet::new(), &c, Some(&empty)).is_none());
+        // None = 不限：恢复全组轮询（ida/idb 均可命中）
+        let mut hits = HashMap::new();
+        for _ in 0..8 {
+            let p = pick_upstream(&group, &HashSet::new(), &c, None).unwrap();
+            *hits.entry(p.id).or_insert(0usize) += 1;
+        }
+        assert!(hits.contains_key(&ida) && hits.contains_key(&idb));
     }
 
     /// 主备：活跃条目存在时备胎永不命中；活跃全熔断 → 备胎接管；活跃恢复 → 回流活跃

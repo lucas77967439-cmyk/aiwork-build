@@ -1,5 +1,12 @@
 //! Qoder 签到域（F-80 M1，对照 commands/workbuddy/checkin.rs 模式）：
-//! 签到（NDJSON 管线）/ 签到结果 / 每日定时任务（schtasks 双轨）/ 启动自动补签。
+//! 签到（NDJSON 管线）/ 签到结果 / 启动自动补签。
+//!
+//! 每日定时统一由应用内 Rust 调度器（tasks/scheduler.rs，60s tick + 当日幂等 +
+//! 启动补跑）驱动，全平台一致；前端已无 schtasks 注册 UI（单轨设计，时刻修改统一
+//! 走 settings.qoder_checkin_hhmm）。注意：qoder_checkin_task_register/status/
+//! unregister 三命令 2026-10-18 复核**仍保留实现并注册**（main.rs），mac 上由
+//! schtasks_gate() 在 spawn 前拦截、Windows 侧仅作 CLI/兼容口——前端零调用；
+//! 如确认无外部依赖可整体移除（决策项，勿在无依据时删改）。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -180,6 +187,7 @@ fn delete_task_checked(name: &str) -> Result<(), String> {
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     if times.is_empty() {
         return Err("至少需要一个触发时间（如 10:15）".into());
     }
@@ -223,6 +231,7 @@ pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
+    crate::commands::misc::schtasks_gate()?;
     let prefix = format!("{QODER_CHECKIN_TASK_PREFIX}_");
     // I15：register 侧存的是 replace(':',"") 后的 4 位数字任务名（如 1015），
     // 需还原为 HH:MM；通用 '_'→':' 替换对其恒 no-op，前端会显示成 1015
@@ -239,6 +248,7 @@ pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 删除失败如实反馈（残留任务会继续触发签到），全部成功才记「已注销」；
     // 原实现 `let _ =` 静默吞错，用户以为已注销实际任务仍在跑
     let mut failed: Vec<String> = Vec::new();

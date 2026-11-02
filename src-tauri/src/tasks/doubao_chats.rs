@@ -337,8 +337,8 @@ pub(crate) fn read_leveldb_dir(db_dir: &Path) -> HashMap<Vec<u8>, (u64, Vec<u8>)
 /// （JSON 契约对齐 python stdout 单行）
 pub fn detect_uid(state: &AppState) -> Value {
     let mut result = json!({"user_id": null, "source": null, "launch_ts_ms": 0});
-    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let ud = PathBuf::from(&localappdata).join("Doubao").join("User Data");
+    // 单一事实源（合并审查 #1：Windows 带 User Data 层，mac 直挂 Doubao 根）
+    let ud = crate::switcher::profile::doubao_data_dir();
 
     // 多 Profile：登录会话/client_device_info 写在活跃 Profile 的 leveldb 里
     //（活跃 = Local State → profile.last_used；无 last_used 时取 launch 最新）
@@ -404,8 +404,8 @@ pub fn detect_uid(state: &AppState) -> Value {
     let mut cap_uid: Option<String> = None;
     let mut cap_ts: f64 = 0.0;
     {
-        // 凭证收敛（P1-7）：vault 优先，回退旧明文 kv（迁移前存量）
-        let c = crate::commands::doubao::read_captured_credentials(&state.data_dir);
+        // 凭证只进 vault（审查 P2 收敛）：优先 vault ns，兼容回退旧 kv 一次
+        let c = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(Value::Null);
         if !c.is_null() {
         let u = c.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let ts = c.get("captured_at").and_then(Value::as_str).unwrap_or("").trim().to_string();

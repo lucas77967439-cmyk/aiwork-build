@@ -37,8 +37,26 @@ pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
 // ==================== 启停命令 ====================
 
 /// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
+/// do_start 的进程级启动闸门（L 修复）：「检查已运行 → 长时间 await 启动 → 写入
+/// 句柄」之间的 TOCTOU——并发双启动此前会双双通过检查。占位失败方直接报已运行。
+static DO_START_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动本地 LLM 网关服务（带 TOCTOU 闸门包装，见 DO_START_GATE）。
 /// 成功后同步托盘菜单文本并发送系统通知。
 pub async fn do_start(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) -> Result<ApiServiceStatus, String> {
+    if DO_START_GATE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("API 服务已在运行或正在启动".into());
+    }
+    let out = do_start_inner(app, state, runtime).await;
+    DO_START_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+    out
+}
+
+async fn do_start_inner(
     app: &tauri::AppHandle,
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -623,13 +641,20 @@ pub async fn do_stop(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
 ) -> Result<(), String> {
-    let mut guard = safe_lock(runtime);
-    if let Some(mut rt) = guard.take() {
-        rt.handle.stop();
+    // 审查 P2-10：先取走 runtime 并立即释放 std 锁，再做异步等待——
+    // 锁卫不得跨 await 持有（future 会变 !Send，过不了 tauri command 的
+    // Send 检查），且持锁等待会阻塞并发的启动/停止调用
+    let mut taken = {
+        let mut guard = safe_lock(runtime);
+        guard.take()
+    };
+    if let Some(rt) = taken.as_mut() {
+        // 审查 P2-10：异步等待优雅停机（tokio timeout + await），
+        // 不再以 thread::sleep 轮询阻塞 tokio worker 线程
+        rt.handle.stop_async().await;
         // 批次 C/E：停止前排空用量脏队列、api_keys 计数与日志队列（flusher 已停）
         rt.shared.flush_pending_writes();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
-        drop(guard);
         sync_tray_api_text(app, false);
         crate::notify::notify(app, "API 网关已停止", "本地网关已关闭");
     }
@@ -1283,9 +1308,12 @@ pub fn pool_set(
         pool_file.qoder_tag_ids = v;
     }
     // buddy-ai 开关在 merge 后追加应用（对齐 tag_ids 先例：merge_pool_set 纯函数
-    // 签名不动，存量单测零改动）；热应用统一在 POOL_CFG_LOCK 临界区外执行（M8）
+    // 签名不动，存量单测零改动）；运行中热应用移到配置锁外（M12/M8 修复：此前持
+    // POOL_CFG_LOCK 叶子锁期间嵌套取 runtime 锁，违反「持锁期间不再取其他锁」纪律）
+    let mut buddy_ai_enabled_applied: Option<bool> = None;
     if let Some(v) = buddy_ai_enabled {
         pool_file.buddy_ai_enabled = v;
+        buddy_ai_enabled_applied = Some(v);
     }
     // buddy-ai per-pool 三参数 + 分组/标签筛选（merge 后追加应用，对齐 buddy_ai_enabled
     // 与 tag_ids 先例：merge_pool_set 纯函数签名不动，存量单测零改动）
@@ -1312,6 +1340,15 @@ pub fn pool_set(
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
     // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    // buddy-ai 开关热应用（M12/M8：随本段移出配置锁外，避免临界区内嵌套取 runtime
+    // 锁放大持锁时长；None = 存原值不触碰，与旧行为等价）
+    if let Some(v) = buddy_ai_enabled_applied {
+        if let Some(rt) = safe_lock(&runtime).as_ref() {
+            rt.shared
+                .buddy_ai_enabled
+                .store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared
             .pool
@@ -1393,13 +1430,8 @@ pub fn pool_set(
             pool_file.buddy_ai_hedge_threshold_ms,
             std::sync::atomic::Ordering::Relaxed,
         );
-        // buddy-ai 池上游开关热应用（审查修复（M8）：原在 POOL_CFG_LOCK 临界区内
-        // 嵌套等待 runtime 锁放大持锁时长，移到锁外热应用段统一执行；None = 存原值，
-        // 与旧行为等价）
-        rt.shared.buddy_ai_enabled.store(
-            pool_file.buddy_ai_enabled,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // buddy-ai 池上游开关热应用已在上方配置锁外段统一执行（M12/M8，见
+        // buddy_ai_enabled_applied），此处不再重复 store
         // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
         rt.shared
             .wb_enabled
@@ -2040,16 +2072,30 @@ pub struct LanIfaceIp {
 
 /// 虚拟/回环接口名黑名单（小写子串匹配）：Docker 网桥与 veth 对端、虚拟化平台
 /// Host-Only/NAT 网卡（Hyper-V / WSL / VMware / VirtualBox）、TUN/TAP 代理与
-/// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器。
+/// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器、
+/// macOS 专属虚拟接口（Docker Desktop 网桥 bridge100* / Apple Wireless Direct
+/// Link awdl0 / 低时延 WLAN llw0——`br-` 不命中 `bridge100`，单独收录）。
+/// bridge 编号特例（合并审查 #8）：`bridge0`…`bridge99` 是 mac Thunderbolt 网桥
+/// 的真实网卡命名（可承载局域网流量），先于黑名单放行；`bridge100` 起为 Docker
+/// Desktop 保留编号，仍按黑名单拦截。非纯数字后缀（bridge / bridgeabc /
+/// bridge100x）parse 失败 → 落回黑名单子串匹配。
 /// 中文接口名（「以太网」「WLAN」「本地连接」）与常规英文网卡名均不含关键词
 fn is_virtual_iface(name: &str) -> bool {
     const BLACKLIST: &[&str] = &[
-        "loopback", "docker", "br-", "veth", "virbr", "vmnet", "vethernet", "vmware",
+        "loopback", "docker", "br-", "bridge", "veth", "virbr", "vmnet", "vethernet", "vmware",
         "virtualbox", "virtual", "hyper-v", "wsl", "bluetooth", "tailscale", "zerotier",
         "hamachi", "tap", "tun", "wintun", "clash", "sing-box", "singbox", "mihomo",
         "wireguard", "openvpn", "wan miniport", "ras async", "wi-fi direct",
+        // macOS 专属：Docker Desktop 网桥（bridge100…N）/ Apple Awdl / Llw 虚拟接口
+        "awdl", "llw",
     ];
     let n = name.to_lowercase();
+    // Thunderbolt 网桥放行（bridge0…bridge99）；Docker Desktop 从 bridge100 起编号
+    if let Some(num) = n.strip_prefix("bridge") {
+        if let Ok(id) = num.parse::<u32>() {
+            return id >= 100;
+        }
+    }
     if BLACKLIST.iter().any(|k| n.contains(k)) {
         return true;
     }
@@ -2099,19 +2145,33 @@ pub fn custom_models_list(
 }
 
 /// 保存自定义模型（upsert：id 为空新增并生成 cm- id，存在则整条覆盖；
-/// 校验 name/base_url 必填 + 名称 canonical 唯一；返回保存后的完整列表）
+/// 校验 name/base_url 必填 + 同名仅拒绝「同名+同 base_url+同 api_key」完全重复
+/// （同名不同上游 = 上游组成员）；返回保存后的完整列表）。
+/// 编辑（id 非空）同步清该条目实例级熔断（B2 审查修复：否则修正 base_url/
+/// 换 api_key 后旧冷却窗口仍拦到重启，配置改动看似无效）
 #[tauri::command]
 pub fn custom_models_save(
     state: State<'_, AppState>,
     model: crate::api_server::custom_models::CustomModel,
 ) -> Result<Vec<crate::api_server::custom_models::CustomModel>, String> {
-    crate::api_server::custom_models::upsert(&state.data_dir, model)
+    let edited_id = if model.id.is_empty() { None } else { Some(model.id.clone()) };
+    let list = crate::api_server::custom_models::upsert(&state.data_dir, model)?;
+    if let Some(id) = edited_id {
+        crate::api_server::custom_lb::clear_circuit(&id);
+    }
+    Ok(list)
 }
 
-/// 删除自定义模型（按 id）；返回是否确有删除
+/// 删除自定义模型（按 id）；返回是否确有删除。
+/// 删除成功同步清除该条目的实例级熔断残留（审查修复：否则同 id 复用/残留
+/// 冷却窗口在重启前一直存在；粘性条目不在组内时选路自然回落，TTL 60s 自愈）
 #[tauri::command]
 pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    crate::api_server::custom_models::remove(&state.data_dir, &id)
+    let removed = crate::api_server::custom_models::remove(&state.data_dir, &id)?;
+    if removed {
+        crate::api_server::custom_lb::clear_circuit(&id);
+    }
+    Ok(removed)
 }
 
 /// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
@@ -2725,7 +2785,8 @@ mod pool_merge_tests {
 mod lan_iface_tests {
     use super::{is_virtual_iface, lan_iface_ips_impl};
 
-    /// 黑名单命中：Docker / 虚拟化平台 / 代理 TUN / 回环 / 蓝牙 PAN / 拨号
+    /// 黑名单命中：Docker / 虚拟化平台 / 代理 TUN / 回环 / 蓝牙 PAN / 拨号 /
+    /// macOS 专属虚拟接口（bridge100 / awdl0 / llw0）
     #[test]
     fn virtual_iface_blacklist() {
         assert!(is_virtual_iface("Loopback Pseudo-Interface 1"));
@@ -2748,6 +2809,11 @@ mod lan_iface_tests {
         assert!(is_virtual_iface("Bluetooth Device (Personal Area Network)"));
         assert!(is_virtual_iface("WAN Miniport (IP)"));
         assert!(is_virtual_iface("Microsoft Wi-Fi Direct Virtual Adapter"));
+        // macOS 专属（合并审查跟进：bridge100 不含 "br-"，此前会泄漏为局域网地址）
+        assert!(is_virtual_iface("bridge100"), "Docker Desktop mac 网桥");
+        assert!(is_virtual_iface("bridge101"));
+        assert!(is_virtual_iface("awdl0"), "Apple Wireless Direct Link");
+        assert!(is_virtual_iface("llw0"), "Apple 低时延 WLAN");
     }
 
     /// 物理网卡（中英文常见命名）不误伤
@@ -2761,6 +2827,9 @@ mod lan_iface_tests {
         assert!(!is_virtual_iface("Wi-Fi"));
         assert!(!is_virtual_iface("Intel(R) Wi-Fi 6 AX201 160MHz"));
         assert!(!is_virtual_iface("Realtek Gaming 2.5GbE Family Controller"));
+        // macOS Thunderbolt 网桥（合并审查 #8：bridge0…bridge99 为真实网卡，放行）
+        assert!(!is_virtual_iface("bridge0"), "mac Thunderbolt 网桥");
+        assert!(!is_virtual_iface("bridge2"));
     }
 
     /// 真机冒烟：不 panic；结果无回环/链路本地/IPv6，无虚拟网卡名，按 IP 去重

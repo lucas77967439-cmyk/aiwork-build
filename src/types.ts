@@ -181,6 +181,8 @@ export interface UsageSessionView {
   model: string;
   /** 会话模式（agent/chat 等；上游缺失为空串） */
   mode: string;
+  /** 失败行标记（custom 会话明细返回；其他来源缺省，徽标判定用结构化字段） */
+  failed?: boolean;
   /** 消耗积分（credits_float，兜底 amount_float） */
   credits: number;
   /** 消耗金额（cost_money_float；上游缺失为 0） */
@@ -419,6 +421,8 @@ export interface Settings {
   qoder_credits_sync_hours: string;
   /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
+  /** Qoder Token 续期间隔小时数（1~24，默认 6；客户端 token 惰性窗 7h，间隔 ≤7h 保证过期前续上） */
+  qoder_token_renew_interval_hours: number;
   /** Qoder 会话流水定时合并开关（默认开：qoder-sessions-compact 每 6 小时将早于保留窗的流水按会话合并为单行） */
   qoder_sessions_compact_enabled: boolean;
   /** Qoder 会话流水合并保留窗天数（默认 3，1..=90：近 N 天保留请求级明细，更早的合并） */
@@ -1175,6 +1179,8 @@ export interface UpdateCheckResult {
   release_page: string;
   // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
   sha256?: string | null;
+  // 运行平台（F-75 M3-3.3）：更新引导文案按平台分派（mac dmg 人工安装 vs win NSIS 自动重启）
+  platform?: 'windows' | 'macos';
 }
 
 // API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
@@ -1385,10 +1391,16 @@ export interface WorkBuddyAccountView {
   snapshot_saved_at_workbuddy_ms?: number | null;
   /** CodeBuddy 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
   snapshot_saved_at_codebuddy_ms?: number | null;
-  /** WorkBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  /** WorkBuddy 快照最近一次切换身份不符/回退时间（Unix ms；null = 健康，老后端缺省 undefined） */
   snapshot_verify_failed_workbuddy_ms?: number | null;
-  /** CodeBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  /** CodeBuddy 快照最近一次切换身份不符/回退时间（Unix ms；null = 健康，老后端缺省 undefined） */
   snapshot_verify_failed_codebuddy_ms?: number | null;
+  /** 双端最近一次切换确认超时时间（Unix ms；黄标「未确认」——fail-open 语义下慢启动也会命中） */
+  snapshot_verify_timeout_workbuddy_ms?: number | null;
+  snapshot_verify_timeout_codebuddy_ms?: number | null;
+  /** 快照不可用（槽内无有效登录态 / 身份与该账号不符；需重新登录后「保存当前登录态」） */
+  snapshot_invalid_workbuddy?: boolean;
+  snapshot_invalid_codebuddy?: boolean;
 }
 
 export interface WorkBuddyEnvCheck {
@@ -1676,7 +1688,8 @@ export interface WbModelInfo {
   supports_image: boolean;
   supported_efforts: string[];
   effort_override: string | null;
-  rate: number;
+  /** Intl 目录元数据缺失时为 null（NaN 哨兵序列化），展示按「—」处理 */
+  rate: number | null;
 }
 
 // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----

@@ -206,6 +206,8 @@ function TaskConfigCard({
   setCheckinGap: (v: number) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
   const [tasks, setTasks] = useState<string[]>([]);
   const [renewOn, setRenewOn] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
@@ -224,9 +226,12 @@ function TaskConfigCard({
   const [renewTime, setRenewTime] = useState('10:30');
 
   const refreshTasks = useCallback(() => {
+    // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
+    // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
+    if (platform !== 'windows') return;
     api.workbuddy.checkinTaskStatus().then(setTasks).catch(() => setTasks([]));
     api.workbuddy.renewTaskStatus().then(setRenewOn).catch(() => setRenewOn(false));
-  }, []);
+  }, [platform]);
 
   useEffect(() => {
     refreshTasks();
@@ -339,7 +344,11 @@ function TaskConfigCard({
           <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
         </label>
       </div>
-      <div className="mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+      <div
+        className={`mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${
+          platform !== 'windows' ? 'hidden' : ''
+        }`}
+      >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <div className="text-sm font-medium">每周兜底续期任务</div>
@@ -388,11 +397,11 @@ function TaskConfigCard({
             启用自动签到（启动补签）
             <span className="block text-xs text-slate-400">
               应用启动时立即核验服务端状态，未签到账号会自动补签；同时作为应用内每日{' '}
-              {checkinHhmm || '09:10'} Rust 调度签到的总开关（关闭后仅 Windows 计划任务生效）
+            {checkinHhmm || '09:10'} Rust 调度签到的总开关
             </span>
           </span>
         </label>
-        {/* 每日签到调度时刻（wb_checkin_hhmm 存 app Settings，随「保存配置」统一提交） */}
+        {/* 每日签到调度时刻（wb_checkin_hhmm 存 app Settings，随「保存配置」统一提交；应用内调度器全平台生效） */}
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-slate-500">每日签到时刻</span>
           <input
@@ -424,7 +433,8 @@ function TaskConfigCard({
             秒（多账号串行签到/成长的间隔，默认 3 秒防频控，0 = 关闭）
           </span>
         </div>
-        <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+        {/* 定时任务（F-16；schtasks 仅 Windows，mac 隐藏——自动签到 + 启动补签已覆盖） */}
+        <div className={`rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${platform !== 'windows' ? 'hidden' : ''}`}>
           <div className="mb-2 text-xs text-slate-400">
             应用内置 Rust 定时调度器：应用运行期间每日 {checkinHhmm || '09:10'} 自动签到（晚于该时刻启动会自动补跑，无需管理员权限，失败
             30 分钟后自动重试）。下方注册的 Windows 计划任务作为兜底，在应用未启动时于指定时刻直接运行签到（注册/卸载需要管理员权限）。
@@ -452,8 +462,8 @@ function TaskConfigCard({
           </div>
         </div>
 
-        {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭 */}
-        <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+        {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭（user32 仅 Windows，mac 隐藏） */}
+        <div className={`rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${platform !== 'windows' ? 'hidden' : ''}`}>
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <MousePointerClick size={15} className="text-amber-500" />
@@ -689,6 +699,8 @@ function TaskConfigCard({
 
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);

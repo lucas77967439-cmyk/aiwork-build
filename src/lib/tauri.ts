@@ -125,6 +125,12 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   refresh_remaining_credits: 600_000,
   // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
   cert_install: null,
+  // OAuth 回调交换：后端最多 5 个协议变体串行兜底探测（单请求内部超时 120s），
+  // 最坏总耗时可达 600s，默认 120s 会让前端先报超时而后端仍在交换，放宽到 11 分钟。
+  // oauth_login 内部调用同一套 oauth_parse_callback 交换逻辑（手动粘贴登录的实际链路），
+  // 两者须同放宽，否则覆盖形同虚设
+  oauth_parse_callback: 660_000,
+  oauth_login: 660_000,
 };
 
 /** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
@@ -168,11 +174,15 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {
+  /** F-75 M0-0.5：平台标志（os/arch），init 时拉取一次存 store.platform */
+  platform: {
+    info: () => invoke<{ os: 'windows' | 'macos'; arch: string }>('platform_info'),
+  },
   env: {
     // TraeWork 合并后唯一客户端检测（原 env_check 已删，统一走 Trae CN 通道）
     check: () => invoke<EnvStatus>('env_check_trae_cn'),
     // F-01：跨应用安装位置自动识别（trae | doubao | workbuddy | codebuddy；
-    // qoder 系不走此通道，经 settings 的 qoder_ide_path + ide_exe_candidates 定位）
+    // qoder 系客户端定位在 env.rs 的 qoder 专用通道，不走 app_locate）
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
@@ -340,8 +350,9 @@ export const api = {
     }) => invoke<ProxyLogListResult>('proxy_logs_list', {
       opts: {
         keyword: opts.keyword,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
+        // 后端 ProxyLogQueryOpts 为 serde camelCase：此前发 snake_case 被静默忽略，UI 日期筛选失效
+        startTime: opts.startTime,
+        endTime: opts.endTime,
         offset: opts.offset,
         limit: opts.limit,
       },
@@ -355,12 +366,15 @@ export const api = {
     userId: string,
     targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
+    proxyPort?: number,
   ) =>
     invoke('switch_account', {
       userId,
       targetApp: targetApp ?? null,
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
+      // 续期捕获场景传代理端口：切换后 TRAE 以 --proxy-server 重启，客户端流量走 MITM
+      proxyPort: proxyPort ?? null,
     }),
   saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
@@ -588,6 +602,8 @@ export const api = {
       invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
     refreshToken: (userId: string, force = false) =>
       invoke<string>('workbuddy_refresh_token', { userId, force }),
+    /** 人工清除「需重登」标记（不动凭证；凭证真失效时下一轮签到会重新标记） */
+    clearRelogin: (id: string) => invoke<void>('workbuddy_clear_relogin', { id }),
     checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
       invoke('workbuddy_checkin_start', { opts }),
     growthRun: () => invoke('workbuddy_growth_run'),
@@ -733,9 +749,6 @@ export const api = {
       }),
     checkinResults: (days?: number) =>
       invoke<QoderCheckinRecord[]>('qoder_checkin_results', { days: days ?? null }),
-    checkinTaskRegister: (times: string[]) => invoke('qoder_checkin_task_register', { times }),
-    checkinTaskStatus: () => invoke<string[]>('qoder_checkin_task_status'),
-    checkinTaskUnregister: () => invoke('qoder_checkin_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>
@@ -1131,9 +1144,13 @@ export const api = {
       expectedVersion: string;
       expectedSha256?: string | null;
     }) => invoke<UpdateDownloaded>('update_download', p),
-    // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
+    // 第二步：启动安装器（win：/P /UPDATE /R 自动重启；mac：open dmg 人工拖拽安装）
     runInstaller: (p: { filePath: string; assetName: string }) =>
       invoke<void>('update_run_installer', p),
+    // mac 更新专用：人工拖拽完成后一键重启（LaunchServices 拉起新版后旧进程退出）
+    restartApp: () => invoke<void>('update_restart_app'),
+    // mac 手动安装引导：主动退出应用释放 .app 占用（Finder 无法替换运行中的应用）
+    quitApp: () => invoke<void>('update_quit_app'),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>
@@ -1235,101 +1252,109 @@ export interface ListenerHandlers {
 export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
+  // M10 修复：中途注册失败时清理已注册监听再抛出——原实现前 N-1 个监听泄漏，
+  // 且 store.init 中断后部分事件通道静默失效
   const unsubs: UnlistenFn[] = [];
-  // 审查修复（L31）：注册中途失败（某事件 listen 抛错）时，先注销已注册的
-  // 前 N-1 个监听再重抛，避免泄漏；调用方（store）拿到异常时也不会有残留监听
   try {
-    if (handlers.onProxyLog) {
-      unsubs.push(
-        await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-      );
-    }
-    if (handlers.onAccountCaptured) {
-      unsubs.push(
-        await listen<string>('account-captured', (e) =>
-          handlers.onAccountCaptured!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onCheckinProgress) {
-      unsubs.push(
-        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-          handlers.onCheckinProgress!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onSwitchProgress) {
-      unsubs.push(
-        await listen<string>('switch-progress', (e) =>
-          handlers.onSwitchProgress!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onSwitchDone) {
-      unsubs.push(
-        await listen<SwitchDoneEvent>('switch-done', (e) =>
-          handlers.onSwitchDone!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onSaveLoginProgress) {
-      unsubs.push(
-        await listen<string>('save-login-progress', (e) =>
-          handlers.onSaveLoginProgress!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onSaveLoginDone) {
-      unsubs.push(
-        await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-          handlers.onSaveLoginDone!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onDeviceResetProgress) {
-      unsubs.push(
-        await listen<string>('device-reset-progress', (e) =>
-          handlers.onDeviceResetProgress!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onDeviceResetDone) {
-      unsubs.push(
-        await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-          handlers.onDeviceResetDone!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onProfileProgress) {
-      unsubs.push(
-        await listen<string>('profile-progress', (e) =>
-          handlers.onProfileProgress!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onProfileDone) {
-      unsubs.push(
-        await listen<ProfileDoneEvent>('profile-done', (e) =>
-          handlers.onProfileDone!(e.payload),
-        ),
-      );
-    }
-    if (handlers.onQoderCheckinProgress) {
-      unsubs.push(
-        await listen<string>('qoder-checkin-progress', (e) =>
-          handlers.onQoderCheckinProgress!(e.payload),
-        ),
-      );
-    }
+    await registerAll(handlers, unsubs);
+    return unsubs;
   } catch (err) {
+    // 审查修复（L31）：单个注销失败不阻断清理，继续注销其余监听
     for (const u of unsubs) {
       try {
         u();
       } catch {
-        /* 单个注销失败不阻断清理，继续注销其余监听 */
+        /* ignore */
       }
     }
     throw err;
   }
-  return unsubs;
+}
+
+async function registerAll(
+  handlers: ListenerHandlers,
+  unsubs: UnlistenFn[],
+): Promise<void> {
+  if (handlers.onProxyLog) {
+    unsubs.push(
+      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
+    );
+  }
+  if (handlers.onAccountCaptured) {
+    unsubs.push(
+      await listen<string>('account-captured', (e) =>
+        handlers.onAccountCaptured!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onCheckinProgress) {
+    unsubs.push(
+      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+        handlers.onCheckinProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSwitchProgress) {
+    unsubs.push(
+      await listen<string>('switch-progress', (e) =>
+        handlers.onSwitchProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSwitchDone) {
+    unsubs.push(
+      await listen<SwitchDoneEvent>('switch-done', (e) =>
+        handlers.onSwitchDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSaveLoginProgress) {
+    unsubs.push(
+      await listen<string>('save-login-progress', (e) =>
+        handlers.onSaveLoginProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSaveLoginDone) {
+    unsubs.push(
+      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+        handlers.onSaveLoginDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onDeviceResetProgress) {
+    unsubs.push(
+      await listen<string>('device-reset-progress', (e) =>
+        handlers.onDeviceResetProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onDeviceResetDone) {
+    unsubs.push(
+      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+        handlers.onDeviceResetDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onProfileProgress) {
+    unsubs.push(
+      await listen<string>('profile-progress', (e) =>
+        handlers.onProfileProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onProfileDone) {
+    unsubs.push(
+      await listen<ProfileDoneEvent>('profile-done', (e) =>
+        handlers.onProfileDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onQoderCheckinProgress) {
+    unsubs.push(
+      await listen<string>('qoder-checkin-progress', (e) =>
+        handlers.onQoderCheckinProgress!(e.payload),
+      ),
+    );
+  }
 }

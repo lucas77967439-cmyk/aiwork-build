@@ -206,11 +206,13 @@ impl ProxyServer {
         }
         // p3-2e：直连白名单域（命中域跳过上游 VPN 直连目标，qoder 国内域经 VPN 实测全挂）
         log.log(&format!("上游直连白名单域: {}", direct_domains.join(", ")));
-        // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）
-        if ca::installed_in_windows_root() {
-            log.log("CA 证书已安装到 Windows 受信任根（TraeDeviceProxyCA）✅");
+        // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）。
+        // 三平台收口走 cert_query（Windows=CryptoAPI 根存储进程内查询，#137 后
+        // certutil 不再参与探测 / mac=security find-certificate）
+        if crate::platform::cert_ctl::cert_query("TraeDeviceProxyCA") {
+            log.log("CA 证书已安装到系统信任域（TraeDeviceProxyCA）✅");
         } else {
-            log.log("⚠ CA 证书未安装：请在顶部「证书未信任」徽标或引导页一键安装（certs/ca.cer → Windows 受信任根），否则被代理的客户端会因证书不受信而无法加载页面");
+            log.log("⚠ CA 证书未安装：请在顶部「证书未信任」徽标或引导页一键安装（certs/ca.cer → 系统信任域），否则被代理的客户端会因证书不受信而无法加载页面");
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -776,6 +778,10 @@ pub fn sync_account_devices(ctx: &ProxyCtx) {
 
 /// Windows：WSASocketW + SO_EXCLUSIVEADDRUSE 独占绑定（选项必须在 bind 前设置，
 /// 对齐 Python `srv.setsockopt(SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)`，issue #7）；
+/// macOS：tokio TcpSocket 显式 set_reuseaddr(true)——std bind 在 Unix 上不设该
+/// 选项（rust-lang/rust#12886），不设则 TIME_WAIT 残留期间重启必失败；BSD 语义下
+/// REUSEADDR 只允许接管**无监听者**的端口（含 TIME_WAIT），不能劫持活动监听，
+/// 与「重启必成功」服务目标兼容（合并审查 #6 注释纠偏）；
 /// 其他平台：常规绑定（不设 SO_REUSEADDR，同样拒绝同端口重复绑定）。
 fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
     #[cfg(target_os = "windows")]
@@ -839,7 +845,31 @@ fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
         // fd 所有权转交 std（后续转 tokio 异步轮询）
         Ok(std::net::TcpListener::from_raw_socket(sock as u64))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // F-75 M2-2.3 mac 分支：显式 SO_REUSEADDR（防 TIME_WAIT 残留导致代理重启
+        // 绑定失败——与 Windows 独占语义方向相反但同为「重启必成功」服务目标）。
+        // tokio TcpSocket 实现零新增依赖（socket2/libc 均不必引入）。
+        use std::net::Ipv4Addr;
+        let socket = tokio::net::TcpSocket::new_v4()
+            .map_err(|e| format!("创建监听套接字失败: {e}"))?;
+        socket
+            .set_reuseaddr(true)
+            .map_err(|e| format!("设置 SO_REUSEADDR 失败: {e}"))?;
+        let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        // 审查修复（P0-1，整体黑盒复审）：tokio 1.53 TcpSocket::bind 仅绑定端口返回
+        // io::Result<()>（socket.rs:805），监听器由 listen(backlog) 产出（:906）——
+        // 原写法 `bind(...)?.into_std()` 对 () 调用不存在的方法，mac 构建 E0599
+        socket
+            .bind(addr)
+            .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?;
+        socket
+            .listen(128)
+            .map_err(|e| format!("监听 127.0.0.1:{port} 失败: {e}"))?
+            .into_std()
+            .map_err(|e| format!("监听器转入阻塞模式失败: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         std::net::TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))

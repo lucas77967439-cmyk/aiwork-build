@@ -591,13 +591,22 @@ pub fn apply_context_override(entry: &mut Value, target: Option<u64>) {
 }
 
 /// 上游 400 且本请求带了上下文长度覆盖 → 错误信息尾部追加恢复指引（否则空串）。
-/// 上游档位白名单未知，覆盖值不被接受时 400 是最可能的表现，须让调用方看得出原因
-pub fn context_override_hint(entry: &Value, status: u16) -> String {
+/// 上游档位白名单未知，覆盖值不被接受时 400 是最可能的表现，须让调用方看得出原因。
+/// 审查修复：加正文信号校验（与下方 ③' 分类同口径）——仅当响应正文提及
+/// context_length 相关字样才附指引，避免与覆盖无关的 400 被误导去清设置；
+/// 信封层消费方（envelope_context_reject）据 hint 非空把 Unknown 400 从轮换
+/// 改终局，无信号校验会放大该终局面。代价：上游真实参数拒绝但不点名字段时
+/// 丢指引（此时上游原文仍完整透传），属可接受权衡
+pub fn context_override_hint(entry: &Value, status: u16, body: &str) -> String {
     match entry.get(CONTEXT_TARGET_KEY).and_then(Value::as_u64) {
-        Some(n) if status == 400 => format!(
-            "（本请求按 Qoder 页设置下发了 parameters.context_length={n}；若上游不接受该值，\
-             请在 Qoder 资源调度页清空该模型的上下文长度，恢复跟随上游）"
-        ),
+        Some(n)
+            if status == 400 && CONTEXT_PARAM_SIGNALS.iter().any(|s| body.contains(s)) =>
+        {
+            format!(
+                "（本请求按 Qoder 页设置下发了 parameters.context_length={n}；若上游不接受该值，\
+                 请在 Qoder 资源调度页清空该模型的上下文长度，恢复跟随上游）"
+            )
+        }
         _ => String::new(),
     }
 }
@@ -1933,6 +1942,11 @@ fn anthropic_image_as_url(block: &Value) -> Option<Value> {
     let url = match source.get("type").and_then(Value::as_str) {
         Some("base64") => {
             let media = source.get("media_type").and_then(Value::as_str)?;
+            // 审查修复（Low）：media_type 白名单与 payload.rs::anthropic_image_to_openai
+            // 同口径——客户端可控 MIME 不直透 data URL 上游，防注入异常类型
+            if !matches!(media, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+                return None;
+            }
             let data = source.get("data").and_then(Value::as_str)?;
             if data.is_empty() {
                 return None;
@@ -2739,7 +2753,7 @@ mod tests {
         let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
         let ilines = InterruptibleLines::from_iterator(Box::new(t));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, _fi, _u) =
+        let (err, sent_any, _fi, _u, _t) =
             wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M", &std::collections::HashSet::new(), None);
         drop(tx);
         let mut sent = Vec::new();
@@ -2871,7 +2885,7 @@ mod tests {
     /// 防重复流）——保证上面的换号语义只作用于「首内容帧前」窗口
     #[test]
     fn error_after_content_is_inline_not_rotation() {
-        let (err, sent_any, failed_inline, _u) = {
+        let (err, sent_any, failed_inline, _u, _t) = {
             let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
             let t = QoderTranslate::new(
                 vec![
@@ -3443,9 +3457,24 @@ mod tests {
         assert_eq!(got["parameters"]["enable_thinking"], true, "既有参数保留");
         assert!(got["model_config"].get(CONTEXT_TARGET_KEY).is_none());
         // 仅 parameters 多一个字段，其余不变
-        assert!(context_override_hint(&set, 400).contains("context_length=1000000"));
-        assert_eq!(context_override_hint(&set, 404), "", "非 400 不附指引");
-        assert_eq!(context_override_hint(&unset, 400), "", "未设置不附指引");
+        assert!(context_override_hint(&set, 400, "context_length out of range")
+            .contains("context_length=1000000"));
+        // 审查修复：正文无 context_length 信号的 400 不附指引（避免无关 400 被误导清设置）
+        assert_eq!(
+            context_override_hint(&set, 400, "unrelated invalid request"),
+            "",
+            "无信号 400 不附指引"
+        );
+        assert_eq!(
+            context_override_hint(&set, 404, "context_length out of range"),
+            "",
+            "非 400 不附指引"
+        );
+        assert_eq!(
+            context_override_hint(&unset, 400, "context_length out of range"),
+            "",
+            "未设置不附指引"
+        );
         let mut got_rest = got.clone();
         got_rest["parameters"].as_object_mut().unwrap().remove("context_length");
         assert_eq!(got_rest, base);

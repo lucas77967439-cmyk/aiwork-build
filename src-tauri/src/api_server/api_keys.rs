@@ -124,7 +124,7 @@ impl ResolvedKey {
     }
 
     /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")/Some("buddy-ai")/
-    /// Some("qoder")；空或非法 = None）
+    /// Some("qoder")/Some("custom")；空或非法 = None）
     pub fn bind_pool(&self) -> Option<&'static str> {
         parse_bind_pool(&self.bind_pool)
     }
@@ -469,13 +469,15 @@ fn registry_load(data_dir: &Path) -> ApiKeysFile {
     if let Some(v) = crate::vault::ns_get(data_dir, VAULT_NS, VAULT_KEY) {
         match serde_json::from_value::<ApiKeysFile>(v) {
             Ok(f) => return f,
+            // 审查修复（M4/H2，对齐 store/migrate.rs）：vault 有记录但解析失败 =
+            // 权威存储「状态未知而非不存在」——不得走 legacy 迁移路径把迁移时点
+            // 快照覆盖写回 vault（vault 中新增/编辑/删除的 Key 全部回滚，被删 Key
+            // 复活属鉴权面回退）。fail-closed 返回空表：无启用 Key 时按缺省
+            // auth_disabled=false 拒绝请求（放行仅在显式 auth_disabled 时生效），
+            // 服务可经 UI 重建注册表；vault 原记录原样保留待人工排查。
             Err(e) => {
-                // 审查修复（M4）：fail-closed——vault 记录存在但反序列化失败时，
-                // 不得落入下方遗留库迁移把陈旧 legacy 快照覆盖回 vault
-                //（已删 Key 复活）；报错并返回空表拒绝迁移覆盖（无 Key 放行
-                // 仅在显式 auth_disabled 时生效，缺省即全拒绝，等人工修复 vault）
                 eprintln!(
-                    "[api_keys] vault 注册表反序列化失败，拒绝遗留库迁移覆盖（fail-closed，防止陈旧快照复活已删 Key）: {e}"
+                    "[api_keys] vault 注册表反序列化失败（fail-closed 返回空表，不覆盖 vault 原记录）: {e}"
                 );
                 return ApiKeysFile::default();
             }

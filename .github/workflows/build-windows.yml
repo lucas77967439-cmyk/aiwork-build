@@ -9,6 +9,7 @@ on:
       - feat/export-accounts-json
       - v3.8.5
       - v3.8.7
+      - v3.8.8
   workflow_dispatch:
 
 jobs:
@@ -85,7 +86,7 @@ jobs:
       # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
       # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
       - name: Publish to GitHub Release
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7' || github.ref == 'refs/heads/v3.8.8'
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:

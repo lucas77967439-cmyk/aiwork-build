@@ -628,8 +628,10 @@ pub fn merged_tool_alias_rules(
     merged
 }
 
-/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body /
-/// prepare_wb_chat_body 产物（llm_utils_chat 形态），覆盖三个透传点——
+/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body 产物
+/// （llm_utils_chat 形态；仅 Trae 池接线，wb_route 未接入——wb 产物历史轮为
+/// `tool_calls[].function.name` 形态，未来接入时历史轮改名点需补 `function/name`
+/// 分支），覆盖三个透传点——
 /// `tools[].function.name`、`tool_choice`（normalize 后为字符串工具名）、
 /// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径，
 /// 逐字匹配），改写后返回逆映射（别名→原名）供响应侧回改；无 tools / 零命中
@@ -890,6 +892,11 @@ pub fn fingerprint_sample_entries_clear() {
 /// pool 由调用方传入池标识（wb 池 pool_label()，trae/qoder 字面量）。
 pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
     if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
+        return String::new();
+    }
+    // 空 body（序列化失败 unwrap_or_default）不产生样本（审查修复 L）：
+    // "body 解析失败" 占位无诊断价值，不入环形缓冲占额
+    if body.is_empty() {
         return String::new();
     }
     let sample = fingerprint_sample(body);
