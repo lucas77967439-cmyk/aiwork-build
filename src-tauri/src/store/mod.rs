@@ -156,6 +156,111 @@ impl Store {
         self.kv_set_raw(key, &content)
     }
 
+    /// KV 文档原子读-改-写（审查修复）：读、改、写包在 BEGIN IMMEDIATE 事务内完成
+    /// （进程内连接 Mutex 互斥 + 跨进程写锁），消除「kv_get → 内存改 → kv_set」两段式
+    /// 他方写入被旧快照整体覆盖丢键的窗口——app_settings 三处调用点（settings_set
+    /// patch / schtasks 注册同步签到时刻 / 探测路径持久化兜底）并发场景互踩丢键。
+    /// 事务化（审查 #6）：原实现仅在连接锁内读-改-写，进程内互斥但跨进程不原子——
+    /// GUI 与 `--task-run` CLI 并发 patch 同一 kv 键时后写者基于旧读覆盖丢键；
+    /// BEGIN IMMEDIATE 从读前即取写锁（WAL + busy_timeout 5s 支撑双进程等待），
+    /// 把原子性提升到跨进程。
+    /// 回调约束：只做内存改写与校验，不得做 IO 或再次取连接锁（闭包持有连接锁）。
+    /// - 回调返回 Err：整体放弃写回（校验失败不落库，语义同原「先校验后写」）
+    /// - 回调返回 Ok(false)：内容无变化，空转提交不写盘（保留「仅在探测值变化时写盘」语义）
+    /// panic/失败清场（审查 #13）：f 闭包 panic 直接外抛会把开启的事务残留在共享
+    /// 连接上——此后进程内全部查询永久报 cannot start a transaction within a
+    /// transaction（旧无事务实现 panic 只毒化 Mutex，连接本身是干净的）。f 闭包包
+    /// catch_unwind：panic 时先 ROLLBACK 再 resume_unwind（不吞 panic、仅保证连接
+    /// 干净）；COMMIT 失败（提交期 SQLITE_BUSY 等）同样 rollback 后上抛。四种情形
+    /// （f Err / 读写出错 / f panic / COMMIT 失败）均保证无事务残留。
+    /// 清场自身失败（审查 #4）：连接损坏时 ROLLBACK 也可能失败——此时残留事务
+    /// 若静默吞掉将不可见，后续查询连环报错无从排查。三路径均显式处置：COMMIT/
+    /// 写失败路径把清场错误附加到返回 Err；panic 路径打 stderr 留痕后照常展开。
+    /// «no transaction is active» 视为无残留（事务已自行结束的良性竞态），容错跳过。
+    /// 读到缺失/损坏存量值回退空对象（语义对齐调用点 !is_object 初始化分支）；
+    /// 真实读错误（busy 超时/IO 故障/页损坏）显式上抛放弃写——fail-closed 同
+    /// kv_get_raw_checked 的 R1 纪律：空集会触发整份覆写的路径绝不静默当空集，
+    /// 否则 app_settings 其余键会被单 patch 对象覆盖丢失。
+    pub fn kv_update<E: ToString>(
+        &self,
+        key: &str,
+        f: impl FnOnce(&mut serde_json::Value) -> Result<bool, E>,
+    ) -> Result<(), String> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| format!("开启 kv[{key}] 写事务失败: {e}"))?;
+        // 读-改-写全程入 catch_unwind（AssertUnwindSafe：f 与连接守卫非 UnwindSafe，
+        // panic 时由下方统一 ROLLBACK 清场，安全性由事务原子性保证）
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let raw = conn
+                .query_row("SELECT content FROM kv WHERE key = ?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| format!("读取 kv[{key}] 失败，放弃改写以防覆盖丢失其他键: {e}"))?;
+            let mut current: serde_json::Value = raw
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            if !current.is_object() {
+                current = serde_json::json!({});
+            }
+            if !f(&mut current).map_err(|e| e.to_string())? {
+                return Ok(()); // 无变化：空转提交释放事务，不写盘
+            }
+            let content = serde_json::to_string(&current).map_err(|e| format!("序列化失败: {e}"))?;
+            conn.execute(
+                "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                rusqlite::params![key, content],
+            )
+            .map_err(|e| format!("SQLite 操作失败: {e}"))?;
+            Ok(())
+        }));
+        match outcome {
+            Ok(Ok(())) => {
+                if let Err(e) = conn.execute_batch("COMMIT;") {
+                    // 审查修复（docker #4）：清场自身失败不得静默——连接损坏时
+                    // ROLLBACK 也可能失败，残留事务不可见会毒化后续全部查询
+                    // （cannot start a transaction within a transaction）。
+                    // 显式附加清场错误；无事务可回滚的 «no transaction» 容错
+                    if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                        if !rb.to_string().contains("no transaction") {
+                            return Err(format!(
+                                "提交 kv[{key}] 事务失败: {e}；且回滚清场也失败: {rb}（连接可能残留事务）"
+                            ));
+                        }
+                    }
+                    return Err(format!("提交 kv[{key}] 事务失败: {e}"));
+                }
+                Ok(())
+            }
+            Ok(Err(msg)) => {
+                if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                    if !rb.to_string().contains("no transaction") {
+                        eprintln!(
+                            "[store::kv_update] kv[{key}] 写失败后回滚清场也失败: {rb}（连接可能残留事务，后续查询将报 cannot start a transaction）"
+                        );
+                        return Err(format!("{msg}；且回滚清场也失败: {rb}"));
+                    }
+                }
+                Err(msg)
+            }
+            Err(panic) => {
+                // f panic：先清场再恢复展开（不吞 panic，仅保证共享连接无事务残留）
+                if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                    if !rb.to_string().contains("no transaction") {
+                        // panic 路径无法返回 Err，打 stderr 留痕后照常 resume_unwind
+                        eprintln!(
+                            "[store::kv_update] kv[{key}] panic 后回滚清场也失败: {rb}（连接可能残留事务）"
+                        );
+                    }
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
     // ── 行文档表原语（单 pk + data JSON 的表）────────────────────────────────
     // 表名白名单：仅限本模块常量，杜绝拼接注入。
 
@@ -213,17 +318,17 @@ impl Store {
         })
     }
 
-    /// 行表整表替换 + KV 写入的**同事务**原语（审查 M4/M7）：`rows_replace` 与
-    /// `kv_set` 分属两个独立事务，进程崩溃/并发竞争下会留下「表已更新而 kv
-    /// 元数据未更新（或反之）」的永久分叉——最敏感的是 api_keys 表与鉴权开关 kv。
-    /// `kv_content` 为最终入库字符串（与 kv_set_raw 同语义），Value 形态由调用方
-    /// 在事务外先序列化（对齐 rows_replace 时机）；为 None 时仅执行行替换。
+    /// 整表替换 + kv 元数据写入（单事务）——审查修复（M7）：「行表 + kv 元数据」
+    /// 原拆为 rows_replace 与 kv_set 两个独立事务提交，进程崩溃/并发竞争下可分叉
+    /// （行表已换新而元数据未写或反之，api_keys 行表与鉴权开关分叉最敏感）。
+    /// 本原语在同一事务内完成两者；kv_content 为最终入库字符串（与 kv_set_raw
+    /// 同语义），Value 形态由调用方在事务外先序列化（对齐 rows_replace 时机）。
     pub fn rows_replace_with_kv(
         &self,
         table: &str,
         rows: &[(String, serde_json::Value)],
         kv_key: &str,
-        kv_content: Option<&str>,
+        kv_content: &str,
     ) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {
             return Err(format!("非法表名: {table}"));
@@ -236,8 +341,7 @@ impl Store {
                 serde_json::to_string(data).map_err(|e| format!("序列化失败: {e}"))?,
             ));
         }
-        let kv_key = kv_key.to_string();
-        let kv_content = kv_content.map(str::to_string);
+        let kv_text = kv_content.to_string();
         self.with_conn(move |c| {
             c.execute_batch(&format!("BEGIN; DELETE FROM [{table}];"))?;
             {
@@ -248,13 +352,11 @@ impl Store {
                     stmt.execute(rusqlite::params![pk, text])?;
                 }
             }
-            if let Some(content) = &kv_content {
-                c.execute(
-                    "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
-                     ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-                    rusqlite::params![kv_key, content],
-                )?;
-            }
+            c.execute(
+                "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                rusqlite::params![kv_key, kv_text],
+            )?;
             c.execute_batch("COMMIT;")?;
             Ok(())
         })
@@ -283,32 +385,7 @@ impl Store {
         })
     }
 
-    /// 单行读取（与 row_upsert 配对的读改写原语；返回行文档 Value，行缺失 → None）
-    pub fn row_get(&self, table: &str, pk: &str) -> Result<Option<serde_json::Value>, String> {
-        if !schema::ROW_TABLES.contains(&table) {
-            return Err(format!("非法表名: {table}"));
-        }
-        // with_conn 闭包错误类型 = rusqlite::Error：闭包内只做裸 rusqlite 查询，
-        // JSON 反序列化移到闭包外转 String
-        let raw: Option<String> = self.with_conn(|c| {
-            let mut stmt =
-                c.prepare(&format!("SELECT data FROM [{table}] WHERE pk = ?1"))?;
-            let mut rows = stmt.query(rusqlite::params![pk])?;
-            match rows.next()? {
-                Some(r) => Ok(Some(r.get::<_, String>(0)?)),
-                None => Ok(None),
-            }
-        })?;
-        match raw {
-            Some(text) => serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|e| format!("行文档反序列化失败: {e}")),
-            None => Ok(None),
-        }
-    }
-
-    /// 单行删除（白名单表，与 row_upsert 配对；buddy-ai 迁移/账号移除路径用，
-    /// 仅移除目标 pk 行，不动其余行）
+    /// 单行删除（白名单表；buddy-ai 迁移/账号移除路径用）
     pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
         if !schema::ROW_TABLES.contains(&table) {
             return Err(format!("非法表名: {table}"));
@@ -374,6 +451,55 @@ mod tests {
         // 删除 → Default
         s.kv_delete("k1").unwrap();
         assert_eq!(s.kv_get::<V>("k1"), V::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// kv_update 事务化回归（审查 #6/#13）：事务原子性 + panic/失败无残留。
+    /// 连接干净 = 事务 rollback/commit 后 BEGIN IMMEDIATE 不再报
+    /// cannot start a transaction within a transaction（残留毒化即此症状）
+    #[test]
+    fn kv_update_transaction_hygiene() {
+        let dir = tmp_dir("kvupd");
+        let s = db(&dir);
+        s.kv_set("app", &json!({ "a": 1, "b": 2 })).unwrap();
+
+        // ① f Err：放弃写回，存量不变且事务清场（后续 BEGIN IMMEDIATE 正常）
+        let r: Result<(), String> = s.kv_update("app", |_| Err::<bool, _>("校验失败"));
+        assert!(r.is_err());
+        assert_eq!(
+            s.kv_get_raw("app").as_deref(),
+            Some(r#"{"a":1,"b":2}"#),
+            "f Err 不得写回"
+        );
+
+        // ② f panic：panic 上抛（不吞）且事务清场——若 rollback 缺失，
+        // 此后的 BEGIN IMMEDIATE 将永久报 cannot start a transaction
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.kv_update::<String>("app", |v| {
+                v["a"] = json!(99);
+                panic!("闭包故意 panic");
+            })
+        }))
+        .is_err();
+        assert!(panicked, "f panic 必须上抛而非被吞");
+        assert_eq!(
+            s.kv_get_raw("app").as_deref(),
+            Some(r#"{"a":1,"b":2}"#),
+            "panic 事务须 rollback，改写不得落盘"
+        );
+
+        // ③ 无变化（Ok(false)）：空转提交不写盘，值不变
+        s.kv_update::<String>("app", |_| Ok(false)).unwrap();
+        assert_eq!(s.kv_get_raw("app").as_deref(), Some(r#"{"a":1,"b":2}"#));
+
+        // ④ 正常改写 + 连接复用（①②③之后 BEGIN IMMEDIATE 仍可用 = 无事务残留）
+        s.kv_update::<String>("app", |v| {
+            v["a"] = json!(42);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(s.kv_get_raw("app").as_deref(), Some(r#"{"a":42,"b":2}"#));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

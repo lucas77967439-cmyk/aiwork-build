@@ -91,22 +91,10 @@ fn view_of(
         &state.data_dir,
     )
     .profiles_dir;
-    let (snapshot_saved_at_ms, snapshot_verify_failed_at_ms) = {
-        let (s, f) = crate::switcher::icube::read_snapshot_sidecar(&profiles_ide, &a.id);
-        if s.is_none() && f.is_none() {
-            // 3.8.5 审查修复（L2）：主槽 sidecar 缺失时回退 .bak 代际——与 Work 端
-            // （下方 96-106）及 has_snapshot 口径对齐，「仅 .bak 存在」时徽标不再静默丢失。
-            // 写入侧闭环：icube::mark_snapshot_verify_failed 主槽缺失时回退写
-            // `{id}.bak.meta.json`（sidecar 不随 rotate_bak 轮转，经 .bak 恢复场景
-            // 的标记必须落回退文件），读取侧此处对称回退
-            crate::switcher::icube::read_snapshot_sidecar(
-                &profiles_ide,
-                &format!("{}.bak", a.id),
-            )
-        } else {
-            (s, f)
-        }
-    };
+    // IDE 端 sidecar 位于 profiles 根（profiles_ide/{id}.meta.json），不随 rotate_bak
+    // 进 .bak——无需 Work 侧（槽内 meta 随轮转）的同款 .bak 回退
+    let (snapshot_saved_at_ms, snapshot_verify_failed_at_ms) =
+        crate::switcher::icube::read_snapshot_sidecar(&profiles_ide, &a.id);
     let (snapshot_saved_at_work_ms, snapshot_verify_failed_work_at_ms) = {
         let (s, f) = crate::switcher::electron_root::read_snapshot_meta(&profiles_work, &a.id);
         if s.is_none() && f.is_none() {
@@ -450,39 +438,7 @@ pub async fn qoder_account_refresh_token(
             return Err(format!("账号不在池中: {account_id}"));
         }
         let agent = crate::tasks::http_agent(30);
-        // 跨进程互斥（审查 P2，对齐 qoder_checkin/refresh 的 CrossProcLock 模式）：
-        // 手动续期 ensure_fresh(i64::MAX) 恒走刷新通道，若 schtasks CLI/调度器进程
-        // 正在刷新同账号，双进程并发以同一 refresh_token 发起刷新——服务端一次性
-        // 轮换下后到者误标 needs_relogin。**scope 必须与 qoder-refresh 任务一致
-        // （"refresh"）**——终审修复：原 "refresh-account" 与任务锁不同名互不互斥，
-        // 注释声称的防护场景实际未防住。短暂等待（2s）后仍取不到锁则友好报错，
-        // 不触碰账号状态；guard RAII 且作用域收窄到 ensure_fresh——返回即释放，
-        // 不覆盖其后的池回写/回读路径
-        let (creds, _did, note) = {
-            let (_cross, lock_fail) =
-                qoder_common::CrossProcLock::try_acquire(&st.data_dir, "refresh", 2_000);
-            let Some(_cross) = _cross else {
-                let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
-                fs_utils::app_log(
-                    &st.data_dir,
-                    &format!("[qoder] 手动续期未执行（{reason}）: {account_id}"),
-                );
-                // 文案按失败类型区分：Busy=他方占用；CreateFailed/WaitFailed=机制故障
-                //（对齐 qoder_refresh.rs 的 P3 文案分类修复）
-                let busy = matches!(
-                    lock_fail.as_ref(),
-                    Some(qoder_common::CrossProcLockFail::Busy)
-                );
-                return Err(if busy {
-                    // 审查 #10：锁 scope 为 "refresh"（全账号共享，与 qoder-refresh 任务
-                    // 一致），被占用时可能是其它账号在刷新——不指名「该账号」误导
-                    "另一进程正在执行凭证刷新，请稍后重试".to_string()
-                } else {
-                    format!("续期保护锁不可用（{reason}），请稍后重试")
-                });
-            };
-            qoder_common::ensure_fresh(&st, &agent, &account_id, i64::MAX)
-        };
+        let (creds, _did, note) = qoder_common::ensure_fresh(&st, &agent, &account_id, i64::MAX);
         match note {
             // 成功路径（本次刷新 / 本已新鲜被复用）→ 回读最新视图
             "refreshed" | "fresh" => {
@@ -514,11 +470,6 @@ pub async fn qoder_account_refresh_token(
                 Err("续期已执行但落库失败（重启后需重新续期），请检查磁盘空间后重试".into())
             }
             "pat_rejected" => Err("续期失败：PAT 已被拒绝，请更新 PAT 后重试".into()),
-            // 临期但仍有效且无刷新令牌（2026-10-05 审查修复）：凭证未失效，不再
-            // 误报「已失效」；如实告知无法自动续期、需在过期前重登
-            "near_expiry_no_refresh" => {
-                Err("凭证当前仍在有效期内，但无刷新令牌无法自动续期；请在过期前重新登录客户端或更新 PAT".into())
-            }
             // 永久失败：ensure_fresh 内已回写池 needs_relogin，视图随之展示
             "expired_needs_relogin" | "auth_dead" => {
                 Err("凭证已失效且无法自动续期，请重新登录客户端或更新 PAT".into())

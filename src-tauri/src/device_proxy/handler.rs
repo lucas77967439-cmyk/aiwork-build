@@ -304,10 +304,9 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(r: &mut R, mut buf: BytesMut) -
         let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| format!("非法 chunk size: {size_str}"))?;
         if size == 0 {
-            // 审查修复（L6）：终结块后的 CRLF 与可选 trailer 行必须消费完再返回——
-            // 原实现直接返回，keep-alive 复用连接时残留字节会被下一请求解析为
-            // 请求行 → 解析错误断连。逐行消费直至空行；EOF 视为段结束（body 已
-            // 完整，宽松对齐既有容错）；trailer 段超 1MB 视为异常，报错断连
+            // 审查修复（L6）：终结块后的 trailer 段必须消费完再返回——否则残留在
+            // socket 的 trailer 字节会被 keep-alive 下一请求当响应行解析，连接错位。
+            // 逐行 split 消费直至空行；EOF 视为段结束（body 已完整，宽松对齐既有容错）
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.split_to(pos + 1);
@@ -476,8 +475,6 @@ pub fn update_account_jwt(ctx: &ProxyCtx, user_id: &str, jwt_full: &str) -> &'st
 /// 并发读（签到/另一次捕获）会看到半更新数据）。
 /// 语义对齐 Python 两函数合用：JWT exp 防降级（skipped 不阻塞 refresh 更新）、
 /// refresh 同值 unchanged、追加账号时两者一并写入。
-/// 锁序：持 ACCOUNTS_LOCK 期间嵌套获取 ACCOUNT_COOLDOWNS_LOCK（clear_cooldown）
-/// 为全库唯一嵌套点，单向无死锁（详见 clear_cooldown 内锁序声明）。
 fn update_account_jwt_and_refresh(
     ctx: &ProxyCtx,
     user_id: &str,
@@ -595,14 +592,6 @@ fn write_accounts(ctx: &ProxyCtx, cfg: &serde_json::Value) -> Result<(), String>
 /// Python 版实为 NameError 空转，此处为真实修复）
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
     // SQLite 化（P3）：冷却状态经 store 读写
-    // C4（审查）：整表 load→save 持 ACCOUNT_COOLDOWNS_LOCK——与签到
-    // save_cooldown/手动清理命令并发时防整表覆盖丢条目（与 accounts.rs 修复同构）。
-    // 锁序声明：唯一嵌套调用点 update_account_jwt_and_refresh 持 ACCOUNTS_LOCK
-    // 后进入本函数，锁序恒为 ACCOUNTS_LOCK → ACCOUNT_COOLDOWNS_LOCK（全库无反向
-    // 获取路径，无死锁）；其余调用点（签到/手动清理/解冻回写）均作叶子锁使用
-    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&ctx.data_dir));
     if cd.cooldowns.remove(user_id).is_some() {
         cd.updated_at = Some(crate::fs_utils::now_iso());
@@ -754,17 +743,10 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         return;
     }
     *cache = Some(captured.clone());
-    // 凭证只进 vault（审查 P2 红线：session_id/sid_guard/ttwid 属会话凭证，
-    // 不得明文落 kv）——快照写入 vault ns `doubao_captured`，读取方统一走
-    // vault::doubao_captured_get（vault 优先 → 旧 kv 回退一次）；历史 kv 明文行
-    // 由 vault::migrate_ns_on_startup 启动时收敛进 vault 并清空。
-    // vault 写失败仅记日志放弃本次持久化（内存 cache 仍在），绝不回退明文落盘。
-    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao_captured", "credentials", &captured) {
-        ctx.log.log(&format!("  [doubao] 凭证快照写入 vault 失败（本次不落盘）: {e}"));
-        // 终审修复：vault 系统性故障时若保留内存 cache，identical 短路会让后续
-        // 相同凭证的抓包永不重试落盘，重启后凭证彻底丢失——回滚 cache 为 None，
-        // 下次抓包自然重写（内存 cache 只是加速层，持久化失败即视为「未捕获」）
-        *cache = None;
+    // 凭证收敛（审查 P1-7）：抓包凭证 → vault（ns "doubao"/"captured"），明文禁入
+    // SQLite；vault 失败仅记日志（内存缓存保当次会话可用，下次抓包重试写入）
+    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao", "captured", &captured) {
+        ctx.log.log(&format!("  [doubao] 抓包凭证入 vault 失败（仅本次内存缓存可用）: {e}"));
     }
     ctx.log.log(&format!(
         "  [doubao] 抓到会话凭证: sessionid={} 字符{}{}{}",
@@ -773,6 +755,265 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         if ttwid.is_empty() { String::new() } else { format!("，ttwid={} 字符", ttwid.len()) },
         if uid.is_empty() { "（uid 未识别）".to_string() } else { format!("，uid={uid}") },
     ));
+}
+
+/// 豆包 campaign 请求形态捕获（排障专用）：命中 `/alice/ug/campaign/` 的请求记录
+/// 方法 + 路径 + 查询参数名（msToken/a_bogus 一次性 token 只记前缀长度）+ Cookie
+/// 键名清单 + POST body + 响应状态/前 500 字符，落 proxy 日志与 app_log。
+/// 同时把**完整 query 参数（剔除一次性 a_bogus）+ msToken** 存入 vault（ns "doubao"/"campaign_probe"，
+/// 本地加密存储、凭证同红线），供 doubao_checkin 复用客户端真实参数对齐请求形态
+/// （修复 CLI 签到 710010702 system error：客户端参数集含 device_id/web_id/fp 等
+/// 设备指纹，CLI 缺失被风控拒绝）。
+fn try_capture_doubao_campaign(
+    ctx: &ProxyCtx,
+    host: &str,
+    method: &str,
+    path: &str,
+    req_headers: &[(String, String)],
+    body: &[u8],
+    status: u16,
+    resp_body: &[u8],
+    resp_headers: &[(String, String)],
+) {
+    let host_l = host.to_ascii_lowercase();
+    if !host_l.ends_with("doubao.com") || !path.contains("/alice/ug/campaign/") {
+        return;
+    }
+    let (p, q) = path.split_once('?').unwrap_or((path, ""));
+    // 完整参数（入 vault）与脱敏摘要（入日志）双份
+    let mut params = serde_json::Map::new();
+    let mut qdesc_parts: Vec<String> = Vec::new();
+    for kv in q.split('&') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        // 入 vault 前先百分号解码：load_campaign_probe 侧会统一再编码——若这里存原始
+        // 编码值会造成双重编码（%7B → %257B），服务端解析必错（2026-10-28 审查修复）
+        let decoded = urlencoding::decode(v)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| v.to_string());
+        // a_bogus 为一次性反爬 token（与 msToken 不同：msToken 是有意复用的会话级值），
+        // 复用过期值比回退内置稳定参数更易触发风控——不进 vault，仅日志记名供比对
+        //（2026-10-29 审查修复 L5）
+        if k != "a_bogus" {
+            params.insert(k.to_string(), serde_json::Value::String(decoded));
+        }
+        if k == "msToken" || k == "a_bogus" {
+            qdesc_parts.push(format!(
+                "{k}={}…({}字符)",
+                v.chars().take(6).collect::<String>(),
+                v.len()
+            ));
+        } else {
+            qdesc_parts.push(format!("{k}=…"));
+        }
+    }
+    let qdesc = qdesc_parts.join("&");
+    let cookie = req_headers
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let jar = parse_cookie_header(cookie);
+    let cookie_names = jar.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(",");
+    // msToken 优先取 query（客户端每请求带新鲜值），缺失回退 cookie
+    let ms_token = params
+        .get("msToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            jar.iter()
+                .find(|(k, _)| k == "msToken")
+                .map(|(_, v)| v.clone())
+        });
+    // 落盘前脱敏（审查修复）：body/resp 可能含凭证类键值（msToken 等 token 形态参数），
+    // 必须过体级凭证键值掩码——完整参数已入加密 vault，排障价值保留
+    let body_s = super::logger::mask_body(&String::from_utf8_lossy(&body[..body.len().min(2048)]));
+    let ua = req_headers
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    // 客户端请求带 accept-encoding（代理降级为 gzip/deflate）→ 响应体多为压缩字节。
+    // 审查修复（2026-10-31）：先按 content-encoding 解压——否则下面 resp_ok 的 JSON
+    // 解析恒失败，campaign_probe 永远不会落库，CLI 永远用回退旧参数（实测 3 天未入库）
+    let resp_plain = super::logger::decompress_body(resp_body, resp_headers);
+    let resp_s = super::logger::mask_body(&String::from_utf8_lossy(
+        &resp_plain[..resp_plain.len().min(500)],
+    ));
+    let line = format!(
+        "[doubao-campaign] {method} {p}?{qdesc} -> {status} resp={resp_s} cookies=[{cookie_names}] body={body_s} ua={ua}"
+    );
+    ctx.log.log(&format!("  {line}"));
+    crate::fs_utils::app_log(&ctx.data_dir, &line);
+    // 完整参数 + msToken 入 vault（仅 landing/checkin 与 v3/detail 两类目标端点；
+    // 任何一次命中都刷新——参数是设备指纹非一次性值，msToken 取最新）。
+    // 审查修复（2026-10-28）：仅当上游信封 code==0 才落库——客户端自己被风控拒绝的
+    // 请求参数不得覆盖可用参数集（响应体非 JSON/解析失败也视为不可信，跳过）
+    let resp_ok = status == 200
+        && serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
+            .map(|v| {
+                v.get("code")
+                    .map(|c| c.as_i64() == Some(0) || c.as_str() == Some("0"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    if resp_ok && (p.ends_with("/landing/checkin") || p.contains("/v3/detail/")) {
+        if !params.is_empty() {
+            // 设备级 Cookie（2026-11-06）：字节风控的设备标识，发奖端点 landing/checkin
+            // 强校验——仅 sessionid+sid_guard+msToken 三个会话 Cookie 会被 710010702 拒。
+            // 刻意排除会话类 Cookie（sessionid/sid_guard/sessionid_ss/multi_sids 等）：
+            // 会话凭证由凭证抓取链路按账号单独存，这里只收设备维度键
+            const DEVICE_COOKIE_KEYS: &[&str] = &["ttwid", "odin_tt", "tt_scid", "s_v_web_id"];
+            let device_cookies: serde_json::Map<String, serde_json::Value> = jar
+                .iter()
+                .filter(|(k, v)| DEVICE_COOKIE_KEYS.contains(&k.as_str()) && !v.is_empty())
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            // 按 sessionid 分键（设备指纹与登录会话绑定：跨账号复用 probe 会被拒），
+            // 全局键 campaign_probe 保留兜底（旧版 CLI/凭证轮换场景）
+            let probe = serde_json::json!({
+                "captured_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                "params": serde_json::Value::Object(params),
+                "ms_token": ms_token,
+                "ua": ua,
+                "device_cookies": serde_json::Value::Object(device_cookies),
+            });
+            let mut stored = 0u8;
+            if let Some(sid_v) = jar.iter().find(|(k, _)| k == "sessionid").map(|(_, v)| v.clone()).filter(|v| !v.is_empty()) {
+                let sid_key = format!("campaign_probe:sid:{sid_v}");
+                if crate::vault::ns_set(&ctx.data_dir, "doubao", &sid_key, &probe).is_ok() {
+                    stored += 1;
+                }
+            }
+            if crate::vault::ns_set(&ctx.data_dir, "doubao", "campaign_probe", &probe).is_ok() {
+                stored += 1;
+            }
+            if stored == 0 {
+                ctx.log.log("  [doubao-campaign] 参数入 vault 失败（仅日志可比对）");
+            }
+        }
+        // 客户端手动签到成功 → 按日落库（2026-10-31）：额度看板「今日新增额度」口径
+        // 原本只有 CLI 签到落库，客户端手动签到的 reward 看不见。此处解析 checkin
+        // code==0 响应的 reward_amount，按 cookie sessionid 逐账号比对 vault 明文凭证
+        // 定位归属账号后 record_day_at（fail-不覆盖-success 规则见 record_day）。
+        if p.ends_with("/landing/checkin") {
+            let parsed = serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
+                .ok()
+                .and_then(|v| v.get("data").cloned());
+            let checked = parsed
+                .as_ref()
+                .and_then(|d| d.get("checked_in"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let idempotent = parsed
+                .as_ref()
+                .and_then(|d| d.get("idempotent"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if checked || idempotent {
+                let reward = parsed
+                    .as_ref()
+                    .and_then(|d| d.get("reward_amount"))
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|v| *v > 0);
+                let status = if checked { "success" } else { "already" };
+                let sessionid = jar.iter().find(|(k, _)| k == "sessionid").map(|(_, v)| v.clone());
+                // uid 识别（2026-11-02 修复）：multi_sids 携带 uid:sessionid 映射，当前
+                // sessionid 对应的 uid 即签到账号——会话轮换免疫。实测 olympus 参数只是
+                // 开关位（"1"）、sessionid 与 vault 存量比对因轮换必然失配，均弃用
+                let cookie_header = req_headers
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let uid_detected =
+                    doubao_uid_from_multi_sids(&cookie_header, sessionid.as_deref().unwrap_or(""));
+                let mut matched: Option<(String, String)> = None;
+                if !uid_detected.is_empty() {
+                    let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
+                    if let Some(a) = pool.accounts.iter().find(|a| a.user_id == uid_detected) {
+                        let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
+                        matched = Some((a.user_id.clone(), name));
+                    }
+                }
+                if matched.is_none() && !sessionid.as_deref().unwrap_or_default().is_empty() {
+                    // 兜底：sessionid 与 vault 存量比对（客户端未轮换会话的老场景）
+                    let sid = sessionid.as_deref().unwrap_or_default();
+                    let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
+                    for a in &pool.accounts {
+                        let Some(v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &a.user_id) else {
+                            continue;
+                        };
+                        if v.get("session_id").and_then(serde_json::Value::as_str) == Some(sid) {
+                            let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
+                            matched = Some((a.user_id.clone(), name));
+                            break;
+                        }
+                    }
+                }
+                match matched {
+                    Some((uid, name)) => {
+                        // skip_on_busy=false：本条是客户端侧独有 reward（调度器同批写入
+                        // 不含这笔），锁 Busy 时降级进程内锁继续写，尽力不丢
+                        crate::doubao_checkin_results::record_day_at(
+                            &ctx.data_dir,
+                            [(
+                                uid.clone(),
+                                name,
+                                status.to_string(),
+                                reward,
+                                // 代理捕获为 success/already 形态，失败原因无从产生
+                                None,
+                                crate::doubao_checkin_results::today_key(),
+                            )],
+                            false,
+                        );
+                        // 客户端当前会话回写该账号 vault：豆包会话轮换，回写后 CLI 凭证
+                        // 始终与客户端一致（fresh），避免 CLI 会话过期类失败
+                        if let Some(mut v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &uid) {
+                            if let Some(obj) = v.as_object_mut() {
+                                if let Some(sid) = sessionid.as_deref().filter(|s| !s.is_empty()) {
+                                    obj.insert("session_id".into(), serde_json::Value::String(sid.to_string()));
+                                }
+                                for ck in ["sid_guard", "ttwid"] {
+                                    if let Some(cv) = jar
+                                        .iter()
+                                        .find(|(k, _)| k == ck)
+                                        .map(|(_, v)| v.clone())
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        obj.insert(ck.to_string(), serde_json::Value::String(cv));
+                                    }
+                                }
+                            }
+                            let _ = crate::vault::ns_set(&ctx.data_dir, "doubao", &uid, &v);
+                        }
+                        let line = format!(
+                            "[doubao-campaign] 客户端签到落库: uid={uid} status={status} reward={reward:?}"
+                        );
+                        ctx.log.log(&format!("  {line}"));
+                        crate::fs_utils::app_log(&ctx.data_dir, &line);
+                    }
+                    None => {
+                        // 按字符截前 8 位：字节切片遇多字节 UTF-8 边界会 panic
+                        let sid_prefix = sessionid
+                            .as_deref()
+                            .map(|s| s.chars().take(8).collect::<String>())
+                            .unwrap_or_else(|| "无".to_string());
+                        let line = format!(
+                            "[doubao-campaign] 客户端签到成功但未匹配到池内账号（multi_sids uid={uid_detected:?} sid前8={sid_prefix}），跳过落库",
+                        );
+                        ctx.log.log(&format!("  {line}"));
+                        crate::fs_utils::app_log(&ctx.data_dir, &line);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------- 上游转发 ----------------
@@ -898,6 +1139,23 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
                 let resp_h = resp_pairs.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     try_capture_doubao_credentials(&ctx2, &host2, &req_h, &resp_h);
+                });
+            }
+            // campaign 请求形态捕获（2026-10-28 排障：CLI 签到 710010702 system error、
+            // detail 同会话正常——需要客户端真实请求对齐 scene/参数/头；客户端手动签到
+            // 走本代理时落 app_log 供比对；完整 query 参数 + msToken 入 vault 供 CLI 复用）
+            {
+                let ctx2 = Arc::clone(ctx);
+                let host2 = host.to_string();
+                let m2 = method.clone();
+                let path2 = req.path.clone();
+                let req_h = req.headers.clone();
+                let body2 = req.body.clone();
+                let status2 = status;
+                let resp2 = resp_body.clone();
+                let resp_h2 = resp_pairs.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    try_capture_doubao_campaign(&ctx2, &host2, &m2, &path2, &req_h, &body2, status2, &resp2, &resp_h2);
                 });
             }
             ctx.req_logger.log_request(

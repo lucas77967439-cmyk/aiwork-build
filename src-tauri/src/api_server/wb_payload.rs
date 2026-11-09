@@ -195,6 +195,34 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You help the user with programming work using the buddy/deepseek-v4.1-flash model."
                 .to_string(),
         ),
+        // ⚠ 顺序约束（docker 审查回归）：以下两条 DSH 品牌兜底必须先于下方
+        // #195 提升的前缀规则应用。前缀规则若先行，DSH 品牌变体句（"You are a
+        // coding agent powered by the DeepSeek Harness…"）会被改写成
+        // "using the DeepSeek Harness"——"deepseek harness" 是 RESIDUAL_MARKERS
+        // 成员，残留即指纹 → 上游 11128；且升级激进重试时激进表兜底
+        // （"powered by DeepSeek Harness"）的 from 已被改掉、无法补救，该变体
+        // 从「激进重试可净」退化为 Fatal。两个形态各布一条：带 the 变体与实证
+        // 模型句 "…powered by the <model>" 同构；不带 the 变体为 2026-10-06
+        // 身份句时代形态（对齐激进表既有兜底）。激进表同名规则保留兜幂等
+        (
+            "powered by the DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+        (
+            "powered by DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+        // issue #195（2026-11-07 网关 11128 样本实证）：DSH 模型句模型名变体
+        // 首轮兜底——3.8.8 时代模型句只布防 glm- 前缀与 buddy/deepseek-v4.1-flash
+        // 逐字句（当时抓包的模型配置形态），用户侧模型名不带池前缀时（如
+        // deepseek-v4.1-flash）默认表不命中，而唯一能兜住的前缀规则在激进表——
+        // 又因 wb_sanitize 默认开时 11128 升级断链永不生效 → 首轮即 Fatal。
+        // 激进表同名规则提升为默认规则（改写形态一致，幂等），所有模型名变体
+        // 首轮即净；原激进规则保留兜幂等（默认表改写后激进 from 不再出现）
+        (
+            "You are a coding agent powered by the ".to_string(),
+            "You help the user with programming work using the ".to_string(),
+        ),
         // CodeBuddy 1.106.1（2026-10-29 抓包实证，buddy 池 /v1/chat/completions
         // 单一形态 ×10）：模型句句式与 glm- 前缀规则（"You are a coding agent
         // powered by the glm-"）不同——"an AI coding assistant, powered by"
@@ -532,6 +560,31 @@ pub fn default_tool_alias_rules() -> Vec<(String, String)> {
         ("job_output".to_string(), "read_job_log".to_string()),
         ("pwsh".to_string(), "run_shell".to_string()),
         ("working_directory".to_string(), "work_dir".to_string()),
+        // issue #195（2026-11-07 网关 11128 样本实证）：DSH ACP 桥接三件——IDE
+        // 桥接形态工具集（total=40 hash=c200e57d 于三份 11128 样本恒定）中
+        // acp_ 前缀为 ACP（Agent Client Protocol）桥接独家命名，不在 rc.2/rc.3
+        // 抓包样本的 25/141 工具内，此前未布防；别名取语义保持 snake_case，
+        // 逐一核对不与既有 to 值/真实名碰撞
+        ("acp_cache".to_string(), "tool_cache".to_string()),
+        ("acp_read_original_image".to_string(), "read_source_image".to_string()),
+        ("acp_status".to_string(), "runtime_status".to_string()),
+        // DSH 0.2.1-rc.3 实证补十一条（2026-11-05 会话 request/header 抓包 141 工具）：
+        // rc.2 的 25 工具样本未涵盖插件化后的新增面——Cordis 内省二件、Agent Teams
+        // 协作七件（list_agents/spawn_teammate/wait_agent/team_task_* 四件）、
+        // 插件管理、工作区依赖探针均为该客户端独家命名；glob/grep/read/write/edit/web_* 等
+        // 通用名维持不改（避免模型侧语义损失）。别名一律取语义保持的 snake_case
+        // 通用词，且逐一核对不与请求内存活真实名、不与既有规则 to 值碰撞
+        ("cordis_inspect_list".to_string(), "ext_inspect_list".to_string()),
+        ("cordis_inspect_query".to_string(), "ext_inspect_query".to_string()),
+        ("list_agents".to_string(), "list_teammates".to_string()),
+        ("spawn_teammate".to_string(), "add_teammate".to_string()),
+        ("wait_agent".to_string(), "await_teammate".to_string()),
+        ("team_task_create".to_string(), "new_shared_task".to_string()),
+        ("team_task_get".to_string(), "read_shared_task".to_string()),
+        ("team_task_list".to_string(), "list_shared_tasks".to_string()),
+        ("team_task_update".to_string(), "update_shared_task".to_string()),
+        ("plugin_manager".to_string(), "extension_manager".to_string()),
+        ("load_workspace_dependencies".to_string(), "load_deps".to_string()),
         // ==================== CodeBuddy 独家（1.106.1 抓包实证） ====================
         // 2026-10-29 buddy CLI 抓包实证 18 工具：replace_in_file/write_to_file/
         // ask_followup_question 经 Cline/Roo 段、ToolSearch 经 Claude Code 段
@@ -628,10 +681,8 @@ pub fn merged_tool_alias_rules(
     merged
 }
 
-/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body 产物
-/// （llm_utils_chat 形态；仅 Trae 池接线，wb_route 未接入——wb 产物历史轮为
-/// `tool_calls[].function.name` 形态，未来接入时历史轮改名点需补 `function/name`
-/// 分支），覆盖三个透传点——
+/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body /
+/// prepare_wb_chat_body 产物（llm_utils_chat 形态），覆盖三个透传点——
 /// `tools[].function.name`、`tool_choice`（normalize 后为字符串工具名）、
 /// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径，
 /// 逐字匹配），改写后返回逆映射（别名→原名）供响应侧回改；无 tools / 零命中
@@ -894,11 +945,6 @@ pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
     if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
         return String::new();
     }
-    // 空 body（序列化失败 unwrap_or_default）不产生样本（审查修复 L）：
-    // "body 解析失败" 占位无诊断价值，不入环形缓冲占额
-    if body.is_empty() {
-        return String::new();
-    }
     let sample = fingerprint_sample(body);
     record_fingerprint_sample("empty", pool, &sample, &template_hit_note());
     format!(" 指纹样本: {sample}")
@@ -926,7 +972,15 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .chars()
         .take(300)
         .collect();
-    let mut out = format!("system=\"{}\"", sys.replace('"', "'"));
+    // 截断标记：原文超出 300 字符时尾部补省略号。UI「生成规则」取首句作 from
+    // （模板改写是逐字 contains+replace 精确匹配），首句完整才可逐字命中；省略号
+    // 让调用方明确区分「首句已完整」与「被截断的残句」，避免拿残句当规则落库
+    let truncated = system.chars().count() > 300;
+    let mut out = format!(
+        "system=\"{}{}\"",
+        sys.replace('"', "'"),
+        if truncated { "…" } else { "" }
+    );
     // 工具名画像（issue #150 增强）：此前仅截前 10 个，tools 工具集指纹识别
     // 升级后需全量画像定位「哪类客户端形态在被拦」——展示前 10 + 全量总数 +
     // 排序名 FNV-1a 短哈希（同名集合跨请求稳定聚合，日志侧可按 hash 分桶统计）
@@ -959,18 +1013,26 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
     out
 }
 
-/// 首条 system 消息文本提取（string 与 text blocks 两种形态；无 → 空串）。
-/// fingerprint_sample 与 residual_fingerprint_note 共用
+/// 首条系统提示消息文本提取（string 与 text blocks 两种形态；无 → 空串）。
+/// fingerprint_sample 与 residual_fingerprint_note 共用。
+///
+/// role 口径：`system` 与 `developer` 均视为系统提示（大小写不敏感）。后者是
+/// OpenAI 规范里的系统级角色，部分客户端（DSH 的 developer workspace 指令）用它
+/// 承载系统提示——只看 `system` 时这类请求样本恒为空串，诊断闭环断裂
+/// （issue #99 样本「system=""」即此因）。`prepare_wb_chat_body` 在转发前已把
+/// developer 归一为 system，故此处对齐同一口径，避免取样与清洗看到不同消息
+fn is_system_role(msg: &Value) -> bool {
+    msg.get("role")
+        .and_then(|r| r.as_str())
+        .map(|r| r.eq_ignore_ascii_case("system") || r.eq_ignore_ascii_case("developer"))
+        .unwrap_or(false)
+}
+
 fn first_system_text(v: &Value) -> String {
     v.get("messages")
         .and_then(|m| m.as_array())
         .and_then(|msgs| {
-            msgs.iter().find(|msg| {
-                msg.get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|r| r.eq_ignore_ascii_case("system"))
-                    .unwrap_or(false)
-            })
+            msgs.iter().find(|msg| is_system_role(msg))
         })
         .and_then(|msg| msg.get("content"))
         .map(|c| match c {
@@ -1000,6 +1062,13 @@ const RESIDUAL_MARKERS: &[&str] = &[
     // （qoder.com.cn 等域名词与 "Qoder" 单词不触发）
     "qoderwork",
     "qoder team",
+    // DSH 模型句特征词组（审查 M-5）：默认表前缀规则 "You are a coding agent
+    // powered by the " → "You help the user with programming work using the "
+    // 未命中/被覆盖时，指纹残留无法自检报出——补整词组让残留自检闭环。
+    // 既有规则改写结果均不含该词组（to 侧为 "You help the user ..." / "You are
+    // an AI agent ..." 句式），无误报；回归门
+    // default_map_outputs_are_residue_free_and_idempotent 自动覆盖
+    "coding agent powered by",
     "codebuddy",
     "opencode",
     "deepseek harness",
@@ -1607,6 +1676,8 @@ mod tests {
         assert!(s.starts_with("system=\"say 'hi' x"), "{s}");
         // 300 字符截断：总长远小于 400 源文本
         assert!(s.len() < 400, "len={}", s.len());
+        // 截断标记：原文超 300 字符时尾部有省略号，供 UI 区分「首句完整」与「残句」
+        assert!(s.contains("…\""), "截断样本应带省略号标记: {s}");
         // Responses 原生工具形态（无 function 包裹）回退顶层 name
         let body2 = json!({
             "messages":[{"role":"system","content":"s"}],
@@ -1614,6 +1685,50 @@ mod tests {
         });
         let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
         assert!(s2.contains("tools=[web_search]"), "{s2}");
+        // 未超 300 字符 → 不带省略号（避免 UI 误判为残句）
+        assert!(!s2.contains("…"), "短样本不应带省略号: {s2}");
+    }
+
+    /// role=developer 承载系统提示时样本不得为空（issue #99 样本 system="" 根因）：
+    /// 只看 role=system 会让这类请求的样本恒为空串，诊断闭环与「生成规则」全失效
+    #[test]
+    fn fingerprint_sample_reads_developer_role_system_prompt() {
+        let body = json!({
+            "messages":[
+                {"role":"developer","content":"You are an AI agent powered by DeepSeek Harness."},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
+        assert!(!s.starts_with("system=\"\""), "developer 角色应参与取样: {s}");
+        assert!(s.contains("DeepSeek Harness"), "{s}");
+
+        // 数组块形态的 developer content 同样参与取样
+        let body2 = json!({
+            "messages":[
+                {"role":"developer","content":[
+                    {"type":"text","text":"You are an AI agent powered by DeepSeek Harness."}
+                ]},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
+        assert!(s2.contains("DeepSeek Harness"), "{s2}");
+
+        // 残指纹自检同口径：developer 承载的已知 marker 必须被检出
+        let note = residual_fingerprint_note(&serde_json::to_vec(&body).unwrap())
+            .expect("developer 角色的系统提示应参与残指纹自检");
+        assert!(note.contains("deepseek harness"), "{note}");
+
+        // role 大小写不敏感（"DEVELOPER"/"Developer" 皆参与）
+        let body3 = json!({
+            "messages":[
+                {"role":"Developer","content":"You are an AI agent powered by DeepSeek Harness."},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s3 = fingerprint_sample(&serde_json::to_vec(&body3).unwrap());
+        assert!(s3.contains("DeepSeek Harness"), "{s3}");
     }
 
     /// issue #99 布防：VS Code 扩展身份句逗号续接变体（现有句号规则必然漏匹配）
@@ -1960,6 +2075,66 @@ mod tests {
         );
         assert!(!out2.to_lowercase().contains("opencode"), "{out2}");
         assert!(!out2.contains("harness"), "{out2}");
+    }
+
+    /// issue #195：DSH 模型句模型名变体（用户侧模型名不带池前缀）首轮即清洗
+    /// （2026-11-07 网关 11128 样本实证：deepseek-v4.1-flash 未带 buddy/ 前缀，
+    /// 默认表 glm- 前缀与 buddy/deepseek 逐字规则均不命中 → 残留指纹 → 上游
+    /// 11128 → 旧升级断链下直接 Fatal）。默认表新增的模型句签名前缀规则兜住
+    #[test]
+    fn dsh_model_sentence_unprefixed_variant_rewritten() {
+        let tpl = default_template_map();
+        let out = apply_template_map(
+            "You are a coding agent powered by the deepseek-v4.1-flash model.",
+            &tpl,
+        );
+        assert!(!out.contains("coding agent powered by"), "{out}");
+        assert!(
+            out.contains("using the deepseek-v4.1-flash model."),
+            "{out}"
+        );
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+    }
+
+    /// docker 审查回归：DSH 品牌变体句不得被 #195 提升进默认表的前缀规则
+    /// 反向改写成 "using the DeepSeek Harness"——"deepseek harness" 是
+    /// RESIDUAL_MARKERS 成员，残留即指纹 → 上游 11128；且升级激进重试时激进表
+    /// 兜底（"powered by DeepSeek Harness"）的 from 已被改掉、无法补救，变体
+    /// 从「激进重试可净」退化为 Fatal。默认表两条品牌兜底（带/不带 the）必须
+    /// 先于前缀规则应用，首轮即连根消除品牌词 + 幂等安全；默认表与
+    /// 「默认+激进合并表」（aggressive=true 同款组合）双口径覆盖
+    #[test]
+    fn dsh_brand_variant_not_reversed_into_residual_by_prefix_rule() {
+        let variants = [
+            // 带 the 变体（与实证模型句 "…powered by the <model>" 同构）
+            "You are a coding agent powered by the DeepSeek Harness.",
+            // 不带 the 变体（2026-10-06 身份句时代形态，对齐激进表既有兜底）
+            "You are a coding agent powered by DeepSeek Harness.",
+        ];
+        // 默认表口径：首轮即净（激进重试不再需要）
+        let tpl = default_template_map();
+        for v in &variants {
+            let out = apply_template_map(v, &tpl);
+            assert!(
+                !out.to_lowercase().contains("deepseek harness"),
+                "品牌词残留: {v} → {out}"
+            );
+            assert!(!out.contains("powered by"), "{out}");
+            assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等: {v} → {out}");
+        }
+        // 默认+激进合并表口径：同款净改写，激进兜底不破坏
+        let mut agg = default_template_map();
+        agg.extend(aggressive_template_rules());
+        for v in &variants {
+            let out = apply_template_map(v, &agg);
+            assert!(
+                !out.to_lowercase().contains("deepseek harness"),
+                "品牌词残留: {v} → {out}"
+            );
+            assert!(!out.contains("powered by"), "{out}");
+            assert_eq!(apply_template_map(&out, &agg), out, "改写须幂等: {v} → {out}");
+        }
     }
 
     /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型
@@ -3022,6 +3197,29 @@ mod tests {
         for from in ["subagent_fork", "job_output", "pwsh", "working_directory"] {
             assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
         }
+        // DSH 独家（0.2.1-rc.3 补录 2026-11-05 实证：Cordis 内省二件 + Agent
+        // Teams 协作七件 + 插件管理 + 工作区依赖探针——改动静默丢失别名时由
+        // 本守护拦截）
+        for from in [
+            "cordis_inspect_list",
+            "cordis_inspect_query",
+            "list_agents",
+            "spawn_teammate",
+            "wait_agent",
+            "team_task_create",
+            "team_task_get",
+            "team_task_list",
+            "team_task_update",
+            "plugin_manager",
+            "load_workspace_dependencies",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // DSH 独家（ACP 桥接三件，issue #195 补录 2026-11-07 实证：IDE 桥接
+        // 形态 40 工具集，acp_ 前缀独家命名此前未布防）
+        for from in ["acp_cache", "acp_read_original_image", "acp_status"] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
         // CodeBuddy 独家（1.106.1 抓包实证；4 个同名工具经 Cline/Roo 与
         // Claude Code 段规则覆盖，此为剩余独家名）
         for from in [
@@ -3048,6 +3246,34 @@ mod tests {
             assert_eq!(aliases.iter().filter(|x| *x == a).count(), 1, "别名 {a} 重复");
             assert!(!froms.contains(a), "别名 {a} 与规则 from 重名");
         }
+    }
+
+    /// issue #195：DSH ACP 桥接三件别名正向改写（tools 透传点名 + 逆映射可回改）
+    #[test]
+    fn dsh_acp_bridge_tools_aliased() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "acp_cache", "parameters": {}}},
+                {"type": "function", "function": {"name": "acp_read_original_image", "parameters": {}}},
+                {"type": "function", "function": {"name": "acp_status", "parameters": {}}}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse =
+            apply_tool_alias_forward(&mut buf, &default_tool_alias_rules()).expect("应发生改写");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("tool_cache"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("read_source_image"));
+        assert_eq!(v["tools"][2]["function"]["name"], json!("runtime_status"));
+        assert_eq!(reverse.get("tool_cache").map(String::as_str), Some("acp_cache"));
+        assert_eq!(
+            reverse.get("read_source_image").map(String::as_str),
+            Some("acp_read_original_image")
+        );
+        assert_eq!(
+            reverse.get("runtime_status").map(String::as_str),
+            Some("acp_status")
+        );
     }
 
     /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（从

@@ -329,7 +329,6 @@ fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     crate::commands::misc::run_schtasks(args)
 }
 
-#[cfg(windows)] // 仅 workbuddy_renew_task_status 的 Windows 分支消费（mac 恒 false）
 fn task_exists(name: &str) -> bool {
     run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"]).map(|(ok, _, _)| ok).unwrap_or(false)
 }
@@ -345,7 +344,6 @@ fn wb_checkin_task_names() -> Vec<String> {
 
 #[tauri::command(async)]
 pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String>) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
     if times.is_empty() {
         return Err("至少需要一个触发时间（如 09:00 / 21:00）".into());
     }
@@ -377,7 +375,6 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
 
 #[tauri::command(async)]
 pub fn workbuddy_checkin_task_status() -> Result<Vec<String>, String> {
-    crate::commands::misc::schtasks_gate()?;
     let prefix = format!("{WB_CHECKIN_TASK_PREFIX}_");
     // I15 同步修（蓝本同款缺陷）：register 侧存 4 位数字任务名（如 1015），
     // 需还原为 HH:MM；通用 '_'→':' 替换对其恒 no-op
@@ -394,7 +391,6 @@ pub fn workbuddy_checkin_task_status() -> Result<Vec<String>, String> {
 
 #[tauri::command(async)]
 pub fn workbuddy_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
     for name in wb_checkin_task_names() {
         let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
     }
@@ -405,7 +401,6 @@ pub fn workbuddy_checkin_task_unregister(state: State<AppState>) -> Result<(), S
 /// token 每周兜底续期任务（F-09；python --renew-only 惰性刷新）
 #[tauri::command(async)]
 pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: String) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
     // day: MON..SUN（schtasks /SC WEEKLY /D）；默认 SUN。
     // 审查修复（命令注入）：白名单校验（此前仅大写化，"mon&calc" → "MON&CALC" 仍可注入）
     let d = if day.is_empty() { "SUN".to_string() } else { day.to_uppercase() };
@@ -432,17 +427,11 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: 
 
 #[tauri::command]
 pub fn workbuddy_renew_task_status() -> bool {
-    // mac 无 schtasks；前端注册卡片隐藏，bool 返回值兼容旧契约。
-    // 双 cfg 单体形态：mac 构建仅保留 return（无后续代码 → 无 unreachable 警告）
-    #[cfg(not(windows))]
-    return false;
-    #[cfg(windows)]
     task_exists(WB_RENEW_TASK_NAME)
 }
 
 #[tauri::command(async)]
 pub fn workbuddy_renew_task_unregister(state: State<AppState>) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
     let _ = run_schtasks(&["/Delete", "/TN", WB_RENEW_TASK_NAME, "/F"]);
     fs_utils::app_log(&state.data_dir, "WorkBuddy 每周续期定时任务已注销");
     Ok(())

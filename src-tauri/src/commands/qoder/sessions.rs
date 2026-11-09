@@ -149,7 +149,6 @@ pub(crate) fn aggregate_session_rows(
                     } else {
                         String::new()
                     },
-                    failed: None,
                     credits: a.credits,
                     cost_money: 0.0,
                     input_tokens: a.pt as u64,
@@ -329,7 +328,6 @@ pub fn qoder_session_detail_query(
                 date: date.clone(),
                 model,
                 mode: String::new(),
-                failed: None,
                 credits,
                 cost_money: 0.0,
                 input_tokens: pt.max(0) as u64,

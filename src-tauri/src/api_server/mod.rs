@@ -300,20 +300,17 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        // 入口取定 day（对齐 record_usage_qoder 的 G3 模式）：记账与脏标记共用
-        // 同一 day——此前 record_ttfb 内部自取 today_key 与下方脏标记各取一次，
-        // 跨零点时账落旧日行、脏标新日行，旧行修改永不被 flush（重启丢失）
-        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
-        guard.record_in_ttfb_on(
-            bucket, &day, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+        guard.record_ttfb(
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );
         // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
+        let bucket = if is_wb { usage::UsageBucket::Wb } else { usage::UsageBucket::Trae };
+        let day = usage::today_key();
         drop(guard);
         self.usage_dirty
             .lock()
@@ -356,18 +353,16 @@ impl ApiSharedState {
         completion_tokens: u64,
         ttfb_ms: Option<u64>,
     ) {
-        // 入口取定 day（G3 对齐）：记账与脏标记用同一时间点的日期，
-        // 防跨零点时账目落入旧行、脏标记新行永不 flush 导致丢账
-        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_in_ttfb_on(
-            bucket, &day, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
+        guard.record_in_ttfb(
+            bucket, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens,
             completion_tokens, ttfb_ms,
         );
         // 批次 C 削峰：只记内存 + 标脏，SQLite 落盘由 flusher（2s）/stop 时统一执行
+        let day = usage::today_key();
         drop(guard);
         self.usage_dirty
             .lock()
@@ -398,11 +393,9 @@ impl ApiSharedState {
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_in_ttfb_on(
+        guard.record_in(
             usage::UsageBucket::Custom,
-            &day,
             model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
-            None,
         );
         // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
         drop(guard);
@@ -437,13 +430,13 @@ impl ApiSharedState {
         if cached == 0 {
             return;
         }
-        // 入口取定 day（G3 对齐，用量跨日归行修复）：记账与脏标记共用同一日期键，
-        // 防跨零点时 cached_tokens 落旧日行、脏标新日行导致旧行修改永不被 flush
-        let day = usage::today_key();
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // 审查修复（用量跨日归行）：day 在持锁期间取定一次，cached_tokens 写入
+        // 与标脏落盘共用同一日期键，杜绝跨零点时写入行与标脏行分裂到两日
+        let day = usage::today_key();
         guard.record_cached_in(bucket, &day, cached);
         drop(guard);
         self.usage_dirty
@@ -878,10 +871,7 @@ pub const TRANSPORT_CUT_MSG_PREFIX: &str = "transport cut:";
 /// 传输层掐断文案识别（issue #158 报错A：Trae 池 ~5min 长流被上游
 /// RST_STREAM 掐断）。仅作用于 io::Error 的 Display 文本（reqwest/hyper
 /// 传输层错误消息），不作用于上游业务错误消息——业务侧 4xx/5xx 文本即使
-/// 含相近词也不会走到这里（读错误只可能来自传输层）。
-/// 特征词按子串宽匹配（"http2"/"stream error" 偏宽）：误报后果是把普通读错误
-/// 也按掐断处理（不冷却/换号而非折叠 EOF），比漏报保守——审查决议维持现状，
-/// 出现误判样本再收紧
+/// 含相近词也不会走到这里（读错误只可能来自传输层）
 pub fn is_transport_cut_text(text: &str) -> bool {
     let m = text.to_ascii_lowercase();
     m.contains("rst_stream")

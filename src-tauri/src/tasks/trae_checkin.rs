@@ -188,7 +188,7 @@ pub fn humanize_device_signed(message: &str) -> String {
 /// （如 4014）拒绝的凭证级认证失败，服务端按凭证状态拒绝而非 401 吊销——重试无法
 /// 恢复，需重走 OAuth。特征词取服务端完整短语（小写比对），过宽会误伤其他业务
 /// 错误触发重新登录引导（对齐 #76 特征词窄口径教训）
-pub(crate) fn is_auth_rejected_error(message: &str) -> bool {
+fn is_auth_rejected_error(message: &str) -> bool {
     message.to_lowercase().contains("not able to authenticate you")
 }
 
@@ -205,9 +205,7 @@ pub fn humanize_auth_rejected(message: &str) -> String {
 }
 
 /// 签到/状态错误文案统一转译入口：设备绑定上限（issue #76）+ 设备当日已签（issue #110）
-/// + 服务端拒绝认证（issue #128）。
-/// append-only 契约：各级转译仅在原文后追加引导、不改写原文——run_round 对转译后
-/// 消息再做 is_device_signed_error 特征词判定依赖此前提，改写式实现会丢特征词
+/// + 服务端拒绝认证（issue #128）
 pub fn humanize_checkin_error(message: &str) -> String {
     humanize_auth_rejected(&humanize_device_signed(&humanize_device_limit(message)))
 }
@@ -389,14 +387,7 @@ fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds
     if cooldown_seconds == 0 {
         data.cooldowns.remove(uid);
         data.updated_at = Some(fs_utils::now_iso());
-        // 落盘失败不再静默（审查修复 L）：冷却清除失败会导致「以为已解冻但库
-        // 未变」，状态机出现不可观测漂移
-        if let Err(e) = crate::store::docs::account_cooldowns_save(&store, &data) {
-            fs_utils::app_log(
-                &state.data_dir,
-                &format!("冷却清除落盘失败 uid={uid}: {e}"),
-            );
-        }
+        let _ = crate::store::docs::account_cooldowns_save(&store, &data);
         return;
     }
     let entry = if cooldown_seconds == -1 {
@@ -423,14 +414,7 @@ fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds
     };
     data.cooldowns.insert(uid.to_string(), entry);
     data.updated_at = Some(fs_utils::now_iso());
-    // 落盘失败不再静默（审查修复 L）：永久冷却（AuthRejected/SessionDead）写入
-    // 失败会导致「以为已冷却但库未变」，下轮重复请求不可观测
-    if let Err(e) = crate::store::docs::account_cooldowns_save(&store, &data) {
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("冷却写入落盘失败 uid={uid} type={error_type}: {e}"),
-        );
-    }
+    let _ = crate::store::docs::account_cooldowns_save(&store, &data);
 }
 
 /// 清除账号冷却状态（签到成功后调用）
@@ -910,8 +894,7 @@ mod tests {
             humanize_device_limit("该账户数量超出套餐范围"),
             "该账户数量超出套餐范围"
         );
-        // 未命中 → 原样透传（不影响常规错误可见性；含「账户数量」/「已达上限」
-        // 但与设备绑定无关的错误不再被误追加引导）
+        // 未命中 → 原样透传（不影响常规错误可见性）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");
     }

@@ -24,12 +24,7 @@ use super::{ProgressSink, Session, StepStatus};
 
 /// 根级白名单条目（文件或目录，Copy-SnapshotItem 语义自适应）。
 /// AUTH_FILES 三件套为登录凭据域（2026-10-04 修复新增）：备份纳入 + 恢复对称清理
-/// （restore_electron_root），保证恢复后登录凭据与快照账号一致。
-/// mac 平台化（2026-10-05 终审修复）：mac Electron 应用 Cookies 直挂数据根
-/// （QoderWork 实测 + icube 系同布局先例），Windows 版 Network/ 目录在 mac 恒缺失
-/// ——白名单按平台分派，mac 追加根级 Cookies/Cookies-journal，否则登录会话不入
-/// 快照、恢复后残留上一账号 Cookies（切了等于没切的同型问题）。
-#[cfg(windows)]
+/// （restore_electron_root），保证恢复后登录凭据与快照账号一致
 const ROOT_ITEMS: [&str; 9] = [
     "Local State",
     "Network",
@@ -41,43 +36,6 @@ const ROOT_ITEMS: [&str; 9] = [
     "auth.machine-id",
     "auth-profile-overlays.v1.dat",
 ];
-#[cfg(target_os = "macos")]
-const ROOT_ITEMS: [&str; 11] = [
-    "Local State",
-    "Network",
-    "Local Storage",
-    "Session Storage",
-    "Preferences",
-    "Shared Dictionary",
-    "auth.v1.dat",
-    "auth.machine-id",
-    "auth-profile-overlays.v1.dat",
-    "Cookies",
-    "Cookies-journal",
-];
-
-/// 登录会话 Cookies 路径（平台分派：Windows 在 Network/ 内，mac 直挂数据根）。
-/// pub(crate)：switch_flow 的 QoderWork 软校验（mod.rs）必须复用本分派——
-/// 3.8.5 审查修复（M-C1）：硬编码 Network/Cookies 在 mac 恒缺失，导致 macOS
-/// 每次切换 QoderWork 都误报「快照不含 Cookies」。
-#[cfg(windows)]
-pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
-    base.join("Network").join("Cookies")
-}
-#[cfg(target_os = "macos")]
-pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
-    base.join("Cookies")
-}
-#[cfg(not(any(windows, target_os = "macos")))]
-pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
-    base.join("Network").join("Cookies")
-}
-
-/// mac 恢复对称清理域：根级 Cookies 与 auth 三件套同语义（快照缺失而数据目录
-/// 现存 → 删除，防旧版快照/未登录快照恢复后残留上一账号会话）。Windows 侧
-/// Cookies 随 Network/ 目录整体覆盖，无此残留面，维持原状。
-#[cfg(target_os = "macos")]
-const ROOT_COOKIES_FILES: [&str; 2] = ["Cookies", "Cookies-journal"];
 
 /// 登录凭据域三件套（restore 侧对称清理用：快照缺失而数据目录现存 → 删除，
 /// 防旧版快照恢复后残留上一账号凭据——Work 启动读 auth.v1.dat 优先于 Cookies）
@@ -163,28 +121,22 @@ pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: 
     let _ = std::fs::write(&path, v.to_string());
 }
 
-/// 清除 QoderWork 切换验证失败标记。主槽与 .bak 回退槽都清（哪份快照被恢复过
-/// 就清哪份，双槽幂等），对齐 mark 的回退链。
+/// 清除 QoderWork 切换验证失败标记（主槽缺失回退 .bak，与 mark 同目标）。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
-    let candidates = [
-        profiles_dir.join(slot).join("snapshot_meta.json"),
-        profiles_dir
-            .join(format!("{slot}.bak"))
-            .join("snapshot_meta.json"),
-    ];
-    for path in candidates {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(obj) = v.as_object_mut() else {
-            continue;
-        };
-        if obj.remove("verifyFailedAtMs").is_some() {
-            let _ = std::fs::write(&path, v.to_string());
-        }
+    let Some(path) = meta_write_target(profiles_dir, slot) else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if obj.remove("verifyFailedAtMs").is_some() {
+        let _ = std::fs::write(&path, v.to_string());
     }
 }
 
@@ -205,7 +157,7 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             src.display()
         ));
     }
-    if !src.join("Local State").exists() && !cookies_path(&src).exists() {
+    if !src.join("Local State").exists() && !src.join("Network").join("Cookies").exists() {
         return Err(format!(
             "{} 数据目录中未发现 Local State / Cookies（可能未登录），已取消备份",
             sess.prof.app_name
@@ -220,7 +172,7 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             copied += 1;
         }
     }
-    if !dest.join("Local State").exists() && !cookies_path(&dest).exists() {
+    if !dest.join("Local State").exists() && !dest.join("Network").join("Cookies").exists() {
         // 清理半成品快照，避免空槽位污染快照列表
         let _ = std::fs::remove_dir_all(&dest);
         return Err(format!(
@@ -256,7 +208,7 @@ fn test_snapshot_integrity(src: &std::path::Path, app: &str, sink: &dyn Progress
             ));
         }
     }
-    if !cookies_path(src).exists() {
+    if !src.join("Network").join("Cookies").exists() {
         sink.step(
             "restore",
             StepStatus::Warn,
@@ -336,18 +288,6 @@ pub fn restore_electron_root(
     // 仍留在数据目录——Work 启动读它作登录真源，切了等于没切（switcher.log 实测：
     // 恢复 6 项成功、客户端仍登录原账号）。删除后 Work 回退 Cookies/登录页，可恢复
     for item in AUTH_FILES {
-        if !src.join(item).exists() {
-            let live = dest.join(item);
-            if live.exists() {
-                let _ = std::fs::remove_file(&live);
-            }
-        }
-    }
-    // mac：根级 Cookies 与 auth 同语义的对称清理（快照缺失而现存 → 删除）——
-    // 防旧版快照/未登录快照恢复后残留上一账号会话；Windows 随 Network/ 整体
-    // 覆盖无此面（见 ROOT_COOKIES_FILES 注释）
-    #[cfg(target_os = "macos")]
-    for item in ROOT_COOKIES_FILES {
         if !src.join(item).exists() {
             let live = dest.join(item);
             if live.exists() {
@@ -507,111 +447,6 @@ mod tests {
         let err = backup_electron_root(&sess, "qd-test", &QuietSink).unwrap_err();
         assert!(err.contains("未发现 Local State / Cookies"), "实际: {err}");
         assert!(!profiles.join("qd-test").exists(), "半成品快照应被清理");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// 捕获进度步的 sink（身份 mismatch Warn 断言用）
-    struct CaptureSink(std::sync::Mutex<Vec<(String, StepStatus, String)>>);
-    impl ProgressSink for CaptureSink {
-        fn step(&self, stage: &str, status: StepStatus, msg: &str) {
-            self.0.lock().unwrap().push((stage.to_string(), status, msg.to_string()));
-        }
-    }
-
-    /// 3.8.5 审查修复（M-C2）：主槽 meta 缺失时 mark/clear 回退 {slot}.bak——
-    /// rotate_bak 后主槽不存在、切换实际经 .bak 恢复的场景，失败徽标不再漏报
-    #[test]
-    fn mark_clear_verify_failed_bak_fallback() {
-        let _guard = test_io_lock();
-        let base = std::env::temp_dir().join(format!("sw-er-vmk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let profiles = base.join("profiles");
-        // 仅 .bak 回退槽有 meta（meta 在槽目录内，rotate 时随目录迁入 .bak）
-        std::fs::create_dir_all(profiles.join("qd-a.bak")).unwrap();
-        std::fs::write(
-            profiles.join("qd-a.bak").join("snapshot_meta.json"),
-            r#"{"schemaVersion":1,"layout":"electron-root","detectedUid":"qd-a"}"#,
-        )
-        .unwrap();
-        mark_snapshot_verify_failed(&profiles, "qd-a");
-        assert!(
-            read_snapshot_meta(&profiles, "qd-a.bak").1.is_some(),
-            "mark 应落 .bak 回退槽"
-        );
-        // 双槽并存：主槽优先（不重复写 .bak）
-        std::fs::create_dir_all(profiles.join("qd-a")).unwrap();
-        std::fs::write(
-            profiles.join("qd-a").join("snapshot_meta.json"),
-            r#"{"schemaVersion":1,"layout":"electron-root"}"#,
-        )
-        .unwrap();
-        mark_snapshot_verify_failed(&profiles, "qd-a");
-        assert!(read_snapshot_meta(&profiles, "qd-a").1.is_some());
-        // clear 双槽幂等清除
-        clear_snapshot_verify_failed(&profiles, "qd-a");
-        assert!(read_snapshot_meta(&profiles, "qd-a").1.is_none());
-        assert!(read_snapshot_meta(&profiles, "qd-a.bak").1.is_none());
-        // 两候选均无 meta：静默不 panic
-        mark_snapshot_verify_failed(&profiles, "qd-none");
-        clear_snapshot_verify_failed(&profiles, "qd-none");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// 3.8.5 审查修复（M-C3）：restore 前身份校验三分支——meta detectedUid 与槽位
-    /// 不符 → Warn 不阻断；回退自 .bak（src 槽名≠目标）跳过比对；旧快照无
-    /// detectedUid 静默放行（对齐 icube warn_if_slot_identity_mismatch）
-    #[test]
-    fn snapshot_identity_mismatch_warn() {
-        let _guard = test_io_lock();
-        let base = std::env::temp_dir().join(format!("sw-er-mis-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let profiles = base.join("profiles");
-        let data_dir = base.join("appdata");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let args = crate::switcher::RunArgs {
-            action: crate::switcher::Action::Switch,
-            target_app: crate::switcher::TargetApp::QoderWork,
-            user_id: Some("qd-a".into()),
-            proxy_port: None,
-            include_indexeddb: false,
-            expected_current_uid: String::new(),
-            machine_id_override: None,
-            data_dir: base.clone(),
-        };
-        let mut sess = crate::switcher::Session::new(&args);
-        sess.prof.data_dir = data_dir;
-        sess.prof.profiles_dir = profiles.clone();
-        let slot_dir = profiles.join("qd-a");
-        std::fs::create_dir_all(&slot_dir).unwrap();
-        // 污染快照：保存时探测身份是 qd-b
-        std::fs::write(
-            slot_dir.join("snapshot_meta.json"),
-            r#"{"schemaVersion":1,"layout":"electron-root","detectedUid":"qd-b"}"#,
-        )
-        .unwrap();
-        let sink = CaptureSink(Default::default());
-        warn_if_slot_identity_mismatch(&slot_dir, "qd-a", &sess.prof.profiles_dir, &sink);
-        assert!(
-            sink.0
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, st, m)| *st == StepStatus::Warn && m.contains("与槽位账号不符")),
-            "mismatch 必须 Warn"
-        );
-        // 回退自 .bak（src 槽名≠目标 slot）：跳过代际比对
-        let sink2 = CaptureSink(Default::default());
-        warn_if_slot_identity_mismatch(&profiles.join("qd-a.bak"), "qd-a", &sess.prof.profiles_dir, &sink2);
-        assert!(sink2.0.lock().unwrap().is_empty(), "回退代际不做比对");
-        // 旧快照无 detectedUid：静默放行
-        std::fs::write(
-            slot_dir.join("snapshot_meta.json"),
-            r#"{"schemaVersion":1,"layout":"electron-root"}"#,
-        )
-        .unwrap();
-        let sink3 = CaptureSink(Default::default());
-        warn_if_slot_identity_mismatch(&slot_dir, "qd-a", &sess.prof.profiles_dir, &sink3);
-        assert!(sink3.0.lock().unwrap().is_empty(), "无 detectedUid 静默放行");
         let _ = std::fs::remove_dir_all(&base);
     }
 

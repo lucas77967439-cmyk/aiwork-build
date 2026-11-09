@@ -12,8 +12,6 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::fs_utils;
-#[cfg(target_os = "macos")] // 唯一消费方为 mac port_pids 的 netstat 查询
-use crate::platform::cmd::sys_command;
 use crate::state::AppState;
 
 /// 看门狗标记：用户主动停止代理时置 true，用于区分「主动停止」与「代理异常崩溃」。
@@ -31,11 +29,25 @@ static PROXY_GEN: AtomicU64 = AtomicU64::new(0);
 static PREV_SYSTEM_PROXY: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 
 /// 运行中的代理句柄（进程内 ProxyServer + 启动元数据）。
+/// 2026-11-06 起改为进程级静态：调度器任务线程（豆包 probe 自动保活）也需要
+/// 查询/启停代理，原 managed State 仅命令层可访问。语义不变：
 /// Drop 不需要 kill 子进程：ProxyServer 析构即发送 shutdown 信号终止 accept 循环。
 pub struct ProxyHandle {
     pub server: crate::device_proxy::ProxyServer,
     pub started_at: i64,
     pub gen: u64,
+}
+
+static PROXY_HANDLE: Mutex<Option<ProxyHandle>> = Mutex::new(None);
+
+/// 进程级句柄锁（防毒化恢复）；命令层与任务线程统一经此访问
+pub(crate) fn proxy_handle_lock() -> std::sync::MutexGuard<'static, Option<ProxyHandle>> {
+    PROXY_HANDLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 代理是否运行中（任务线程可查）
+pub(crate) fn proxy_is_running() -> bool {
+    proxy_handle_lock().is_some()
 }
 
 #[derive(serde::Serialize)]
@@ -108,9 +120,8 @@ fn port_pids(port: u16) -> Vec<String> {
     }
 
     // 行端口字段为网络字节序存于低 16 位（ntohs 语义，实证单测锁定）；
-    // 行数以能完整装入缓冲为上限兜底（IPv4 行 6×u32 / IPv6 行 12×u32——
-    // MIB_TCP6ROW_OWNER_PID 为 48 字节；status==0 时 OS 保证 dwNumEntries 行
-    // 完整，min 仅为防御性收窄，杜绝越界读；步长须与行宽一致，/14 会漏读尾行）
+    // 行数以能完整装入缓冲为上限兜底（status==0 时 OS 保证 dwNumEntries 行
+    // 完整，min 仅为防御性收窄，杜绝越界读）
     let mut pids: Vec<u32> = Vec::new();
     let mut record = |local_port: u32, pid: u32| {
         if u16::from_be((local_port & 0xFFFF) as u16) == port && !pids.contains(&pid) {
@@ -134,7 +145,7 @@ fn port_pids(port: u16) -> Vec<String> {
         let rows = unsafe {
             std::slice::from_raw_parts(
                 table.table.as_ptr(),
-                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 12),
+                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 14),
             )
         };
         for row in rows {
@@ -144,37 +155,10 @@ fn port_pids(port: u16) -> Vec<String> {
     pids.iter().map(|p| p.to_string()).collect()
 }
 
-/// macOS：无 GetExtendedTcpTable，退 netstat 进程外查询（0xc0000142 spawn 撞窗
-/// 系 Windows 特有，mac 无碍）。F-75 审查补齐：mac netstat 旗标为 `-an -p tcp`
-/// （小写协议名），输出列为 `tcp4 0 0 127.0.0.1.<port> *.* LISTEN`（PID 列不存在，
-/// 仅端口占用提示用）——返回「占用」判定本身即可，PID 信息缺失无碍（仅错误文案展示）
-#[cfg(target_os = "macos")]
-fn port_pids(port: u16) -> Vec<String> {
-    let Ok(out) = sys_command("netstat").args(["-an", "-p", "tcp"]).output() else {
-        return vec![];
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let suffix = format!("127.0.0.1.{port}");
-    // F-75 审查补齐：首列 tcp4/tcp6 前缀过滤——表头行等非连接行不得误判「占用」
-    if text.lines().any(|l| {
-        let cols: Vec<&str> = l.split_whitespace().collect();
-        cols.len() > 3 && cols[0].starts_with("tcp") && cols[3] == suffix
-    }) {
-        vec!["?".to_string()] // mac netstat 无 PID 列，占位表示「有监听」
-    } else {
-        vec![]
-    }
-}
-
-/// 非 Windows/macOS 平台无此诊断路径：返回空表
-#[cfg(not(any(windows, target_os = "macos")))]
+/// 非 Windows 平台无此诊断路径（原 netstat 实现同样仅 Windows 有效）：返回空表
+#[cfg(not(target_os = "windows"))]
 fn port_pids(_port: u16) -> Vec<String> {
     vec![]
-}
-
-/// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
-fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 同步托盘「代理」菜单文本（未运行显示"启动"，运行中显示"停止"）；
@@ -193,13 +177,12 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
 pub async fn do_start(
     app: &AppHandle,
     state: &AppState,
-    proxy_state: &Mutex<Option<ProxyHandle>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
     // 标记「非主动停止」，供看门狗区分崩溃与用户停止
     PROXY_INTENTIONAL_STOP.store(false, Ordering::Relaxed);
     {
-        let mut g = safe_lock(proxy_state);
+        let mut g = proxy_handle_lock();
         match &*g {
             Some(h) if h.server.is_running() => return Err("代理已在运行".into()),
             // 残留死句柄（崩溃后看门狗尚未清理）：直接回收后继续启动
@@ -219,50 +202,19 @@ pub async fn do_start(
     }
     let proxy_addr = format!("127.0.0.1:{port}");
 
-    #[cfg(target_os = "macos")]
-    {
-        // mac 预检 = 活动监听探测（合并审查 #6）：std::net TcpListener::bind 在
-        // Unix 上**不**设置 SO_REUSEADDR（rust-lang/rust#12886），直接 bind 预检
-        // 会把 TIME_WAIT 残留误报成「端口占用」——代理快速重启场景必现。
-        // connect 成功 = 确有监听者 → 报占用；ConnectionRefused = 无监听
-        //（TIME_WAIT 残留）→ 放行，随后 bind_exclusive 的 set_reuseaddr(true)
-        // 可正常接管。探测与绑定间存在 TOCTOU 竞态窗口，bind_exclusive 失败时
-        // 仍以原始 io 错误兜底报错，不会假启动。
-        match std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            std::time::Duration::from_millis(300),
-        ) {
-            Ok(_) => {
-                // PID 诊断（对齐 Python 绑定失败时列出占用进程）
-                let pids = port_pids(port);
-                let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
-                return Err(format!(
-                    "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
-                ));
-            }
-            // 无监听（TIME_WAIT 残留等）→ 放行
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-            Err(e) => return Err(format!("端口探测失败: {e}")),
+    // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
+    // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => drop(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // PID 诊断（对齐 Python 绑定失败时列出占用进程）
+            let pids = port_pids(port);
+            let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
+            return Err(format!(
+                "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
+            ));
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
-        // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）。
-        // Windows std bind 语义 = 独占（SO_EXCLUSIVEADDRUSE），预检即最终语义：
-        // 占用（含 TIME_WAIT 残留）一律拦截，与 bind_exclusive 行为一致。
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => drop(l),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // PID 诊断（对齐 Python 绑定失败时列出占用进程）
-                let pids = port_pids(port);
-                let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
-                return Err(format!(
-                    "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
-                ));
-            }
-            Err(e) => return Err(format!("端口探测失败: {e}")),
-        }
+        Err(e) => return Err(format!("端口探测失败: {e}")),
     }
 
     // 捕获启动前的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 本地代理）。
@@ -291,32 +243,9 @@ pub async fn do_start(
                 }
             }
         }
-        // 审查修复：门控口径与实现对齐——capture_proxy_snapshot_services 为
-        // mac-only（proxy_ctl.rs cfg(target_os="macos")），原 not(windows) 会把
-        // Linux 也编入并在 E0425 处失败；收紧为 cfg(target_os = "macos")
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "windows"))]
         {
-            // F-75 M2-2.1：mac 补齐 Windows 同等能力——读取用户 VPN 作为
-            // 上游透传，并在停止时经 PREV_SYSTEM_PROXY 还原（语义与 Windows 分支一致）。
-            // 审查 #11：capture_proxy_snapshot_services 同时记录「启用代理的网络服务
-            // 清单」，还原时仅对这些服务写回用户 VPN、其余服务 off（还原面收窄）
-            match crate::platform::proxy_ctl::capture_proxy_snapshot_services() {
-                Some((en, sv, ov))
-                    if sv != proxy_addr && !sv.contains(&format!("127.0.0.1:{port}")) =>
-                {
-                    *PREV_SYSTEM_PROXY
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
-                        Some((en, sv.clone(), ov));
-                    Some(sv)
-                }
-                _ => {
-                    *PREV_SYSTEM_PROXY
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
-                    None
-                }
-            }
+            None
         }
     };
 
@@ -352,9 +281,8 @@ pub async fn do_start(
     let server = crate::device_proxy::ProxyServer::start(cfg, Some(app.clone()))
         .await
         .map_err(|e| {
-            // 审查修复（H2，融合 ours 快照清理）：启动失败路径清理本轮已捕获的系统代理
-            // 快照，不留脏状态——此时尚未接管系统代理（set_proxy 在启动成功后才执行），
-            // 快照残留会让下次 proxy_stop 把该快照当「曾接管」消费（用「别人的快照」还原）
+            // 审查修复（H2）：启动失败路径清理本轮已捕获的系统代理快照，不留脏状态——
+            // 此时尚未接管系统代理，快照残留会让下次 proxy_stop 用「别人的快照」还原
             *PREV_SYSTEM_PROXY
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
@@ -367,7 +295,7 @@ pub async fn do_start(
     spawn_watchdog(app.clone(), state.data_dir.clone(), gen, server.exit_signal());
 
     {
-        let mut g = safe_lock(proxy_state);
+        let mut g = proxy_handle_lock();
         *g = Some(ProxyHandle { server, started_at, gen });
     }
 
@@ -412,8 +340,8 @@ fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watc
             return;
         }
         // 清理死句柄（仅当代际匹配，避免误清新实例）
-        if let Some(ps) = app.try_state::<Mutex<Option<ProxyHandle>>>() {
-            let mut g = ps.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut g = proxy_handle_lock();
             if g.as_ref().map(|h| h.gen) == Some(gen) {
                 g.take();
             }
@@ -445,19 +373,28 @@ fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watc
 pub async fn proxy_start(
     app: AppHandle,
     state: State<'_, AppState>,
-    proxy_state: State<'_, Mutex<Option<ProxyHandle>>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
-    do_start(&app, &state, &proxy_state, port).await
+    do_start(&app, &state, port).await
+}
+
+/// 同步启动代理（调度器任务线程用，2026-11-06 方案 A）：复用 do_start 全部语义
+/// （系统代理快照/上游透传/端口预检/看门狗）。任务线程非 async 上下文，经
+/// block_on 桥接（与托盘 proxy-toggle 同款模式）。
+pub(crate) fn start_proxy_blocking(
+    app: &AppHandle,
+    state: &AppState,
+    port: u16,
+) -> Result<ProxyStatus, String> {
+    tauri::async_runtime::block_on(do_start(app, state, port))
 }
 
 #[tauri::command]
 pub fn proxy_stop(
     app: AppHandle,
     state: State<AppState>,
-    proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> Result<ProxyStatus, String> {
-    let mut g = safe_lock(&proxy_state);
+    let mut g = proxy_handle_lock();
     let (port, captured) = match &*g {
         Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
         None => (0, 0),
@@ -471,15 +408,11 @@ pub fn proxy_stop(
         h.server.stop();
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
     }
-    // H-2 修复（融合 main H2）：仅当本轮确曾接管（句柄命中）或留有未消费快照（看门狗
-    // 崩溃路径 consume=false 保留给本路径还原）才执行还原——代理未运行且无快照时的
-    // 重复停止调用不再触发还原，避免把用户自己的 VPN 系统代理静默清空
-    // （还原语义不变：启动前存在外部代理(VPN)则还原之，否则清空避免全局断网）
-    let snapshot_pending = PREV_SYSTEM_PROXY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
-    if was_running || snapshot_pending {
+    // 审查修复（H2）：仅「确曾接管」（本次确实停止了运行中的代理实例）才还原系统代理；
+    // 句柄为 None（代理未运行/早已停止）时跳过并提示无需还原——原实现无条件
+    // restore_system_proxy(true)，重复点「停止」会落入 clear_win_proxy()，静默清掉
+    // 用户自己设置的 VPN/系统代理
+    if was_running {
         // 还原系统代理（#14 共用）：若启动前存在外部代理(VPN)，则还原之；否则清空，
         // 避免本机全局断网（consume=true 取走快照，本轮还原一次性）
         if let Err(e) = restore_system_proxy(true) {
@@ -500,13 +433,49 @@ pub fn proxy_stop(
     })
 }
 
+/// 同步停止代理（调度器任务线程用，2026-11-06 方案 A）：proxy_stop 命令的核心抽取，
+/// 事件/托盘同步在 app=None 时跳过（仅 app_log）。语义与命令层完全一致：
+/// 仅「确曾接管」才还原系统代理，重复调用幂等安全。
+pub(crate) fn stop_proxy_blocking(state: &AppState, app: Option<&AppHandle>) -> Result<ProxyStatus, String> {
+    let mut g = proxy_handle_lock();
+    let (port, captured) = match &*g {
+        Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
+        None => (0, 0),
+    };
+    let was_running = g.is_some();
+    if let Some(h) = g.take() {
+        PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
+        let c = h.server.captured.load(Ordering::Relaxed);
+        h.server.stop();
+        fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
+    }
+    if was_running {
+        if let Err(e) = restore_system_proxy(true) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+            );
+        }
+    } else if let Some(app) = app {
+        let _ = app.emit("proxy-log", "代理未在运行，系统代理无需还原");
+    }
+    if let Some(app) = app {
+        sync_tray_proxy_text(app, false);
+    }
+    Ok(ProxyStatus {
+        running: false,
+        port,
+        captured,
+        started_at: None,
+    })
+}
+
 #[tauri::command]
 pub fn proxy_status(
     _app: AppHandle,
     _state: State<AppState>,
-    proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> ProxyStatus {
-    let g = safe_lock(&proxy_state);
+    let g = proxy_handle_lock();
     match &*g {
         Some(h) => ProxyStatus {
             running: h.server.is_running(),
@@ -528,7 +497,7 @@ pub fn proxy_status(
 // Windows 系统代理(WinINet)。故启动本地代理时同步把系统代理指向本机端口，TRAE 的全部
 // 流量(含鉴权)即汇入我们的 MITM 代理；停止时还原，避免全局断网。
 #[cfg(target_os = "windows")]
-pub(crate) fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String> {
+fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     run_reg(key, "ProxyEnable", "REG_DWORD", if enable { "1" } else { "0" })?;
     if enable {
@@ -553,37 +522,6 @@ pub(crate) fn clear_win_proxy() -> Result<(), String> {
     apply_proxy(false, "", "")
 }
 
-/// F-75 M2-2.1 mac 分支：networksetup 逐服务接管/还原（实现收口 platform::proxy_ctl）。
-/// server 形态与 Windows 分支一致（"127.0.0.1:8899"）。
-#[cfg(target_os = "macos")]
-pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
-    crate::platform::proxy_ctl::apply_system_proxy(true, addr, "127.0.0.1;localhost;<local>")
-}
-
-/// mac 还原清空：off 态逐服务关闭（bypass 列表不动——代理已关，列表不再生效，
-/// 且保留用户 bypass 配置避免误清）
-#[cfg(target_os = "macos")]
-pub(crate) fn clear_win_proxy() -> Result<(), String> {
-    crate::platform::proxy_ctl::apply_system_proxy(false, "", "")
-}
-
-/// 还原路径的平台分派（审查修复 P0：restore_system_proxy/_on_exit 此前直调
-/// cfg(windows) 的 apply_proxy，mac 构建必然 E0425）：Windows 走注册表三键，
-/// mac 走 networksetup 逐服务（PREV_SYSTEM_PROXY 快照即 get_system_proxy 返回形态，
-/// 两平台 (enabled, server, bypass) 语义一致）。
-fn apply_prev_proxy(enable: bool, server: &str, bypass: &str) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        apply_proxy(enable, server, bypass)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // 审查 #11：还原面收窄——仅对捕获时启用代理的服务写回用户 VPN，
-        // 其余服务 off 清接管残留（capture_proxy_snapshot_services 记录的清单）
-        crate::platform::proxy_ctl::restore_system_proxy_services(enable, server, bypass)
-    }
-}
-
 /// 还原系统代理（#14 提取共用）：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样
 /// 还原，否则清空系统代理。`consume=true` 取走快照（proxy_stop / 应用退出，一次性）；
 /// `consume=false` 仅窥视（看门狗崩溃路径不消费，保留给后续 proxy_stop 继续还原）。
@@ -599,7 +537,7 @@ pub(crate) fn restore_system_proxy(consume: bool) -> Result<(), String> {
         }
     };
     match prev {
-        Some((en, sv, ov)) if en => apply_prev_proxy(true, &sv, &ov),
+        Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
         _ => clear_win_proxy(),
     }
 }
@@ -615,7 +553,7 @@ pub(crate) fn restore_system_proxy_on_exit(proxy_was_running: bool) -> Result<()
         .unwrap_or_else(|e| e.into_inner())
         .take();
     match prev {
-        Some((true, sv, ov)) => apply_prev_proxy(true, &sv, &ov),
+        Some((true, sv, ov)) => apply_proxy(true, &sv, &ov),
         // 防御分支：快照存在但未启用（正常路径不会出现，get_existing 仅存启用项）
         Some(_) => clear_win_proxy(),
         None if proxy_was_running => clear_win_proxy(),
@@ -659,33 +597,7 @@ pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
     }
 }
 
-/// mac 版直开前防御（P1 审查修复，与上方 Windows 版同语义）：应用异常退出可能
-/// 未还原系统代理——若系统代理仍指向本机「我们上次使用的端口」，提前清除，
-/// 避免 Trae 直开时全部请求 ERR_CONNECTION_RESET。只匹配写盘记录的端口
-/// （127.0.0.1 + last_proxy_port.txt，读取方式与 Windows 版完全一致）。
-/// 本轮审查修复：清除原语改 clear_stale_local_proxy_port（逐服务精确命中
-/// 「web 代理 = 127.0.0.1:port」才 off）——原直调 clear_win_proxy 会对全部
-/// 网络服务逐个 off，把用户 VPN 代理（配置在其他网络服务上的 Clash 等）一并
-/// 清掉，违反本函数「不误伤用户自己的 VPN 本地代理」承诺。
-#[cfg(target_os = "macos")]
-pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
-    let last_port = std::fs::read_to_string(state.data_dir.join("last_proxy_port.txt"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok());
-    let Some(port) = last_port else { return };
-    match crate::platform::proxy_ctl::clear_stale_local_proxy_port(port) {
-        Ok(0) => {
-            // 无命中（代理已还原 / 指向他物 = 用户自己的代理）——静默
-        }
-        Ok(n) => fs_utils::app_log(
-            &state.data_dir,
-            &format!("已清理指向已停止本地代理的残留系统代理(127.0.0.1:{port}，{n} 个网络服务)"),
-        ),
-        Err(e) => fs_utils::app_log(&state.data_dir, &format!("清理残留系统代理失败: {e}")),
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn cleanup_stale_local_proxy(_state: &AppState) {}
 
 /// 通知 WinINet 代理设置已变更，让运行中的进程立即生效
@@ -778,8 +690,15 @@ fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String>
     res.map_err(|e| format!("reg 写入失败({name}): {e}"))
 }
 
-// F-75 M2-2.1：原「仅 Windows 支持系统代理设置」stub 已由上方 mac 实现替代
-// （set_win_proxy/clear_win_proxy 现为两平台真实实现，Windows 路径零变化）
+#[cfg(not(target_os = "windows"))]
+fn set_win_proxy(_addr: &str) -> Result<(), String> {
+    Err("仅 Windows 支持系统代理设置".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_win_proxy() -> Result<(), String> {
+    Err("仅 Windows 支持系统代理设置".into())
+}
 
 /// 应用退出路径使用：标记「主动停止」，让看门狗静默（退出清理由 RunEvent::Exit 统一完成）
 pub(crate) fn mark_intentional_stop() {

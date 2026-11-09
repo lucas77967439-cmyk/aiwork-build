@@ -12,6 +12,8 @@ export type ViewKey =
   // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
   | 'doubao-overview'
   | 'doubao-accounts'
+  | 'doubao-checkin'
+  | 'doubao-quota'
   | 'doubao-settings'
   // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
   | 'buddy-overview'
@@ -181,8 +183,6 @@ export interface UsageSessionView {
   model: string;
   /** 会话模式（agent/chat 等；上游缺失为空串） */
   mode: string;
-  /** 失败行标记（custom 会话明细返回；其他来源缺省，徽标判定用结构化字段） */
-  failed?: boolean;
   /** 消耗积分（credits_float，兜底 amount_float） */
   credits: number;
   /** 消耗金额（cost_money_float；上游缺失为 0） */
@@ -389,6 +389,18 @@ export interface Settings {
   doubao_keepalive_enabled: boolean;
   /** issue #147：豆包会员额度每日巡检应用内调度开关（默认开，环境配置页可关） */
   doubao_quota_enabled: boolean;
+  /** 豆包每日签到调度开关（默认开，环境配置页可关） */
+  doubao_checkin_enabled: boolean;
+  /** 豆包每日签到时刻 HH:MM（默认 09:15，任务配置页可改） */
+  doubao_checkin_hhmm: string;
+  /** 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期时自动开代理+切客户端抓包对齐 */
+  doubao_probe_auto_keepalive: boolean;
+  /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
+  doubao_sync_mode: string;
+  /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
+  doubao_sync_hours: string;
+  /** 豆包数据同步 daily 模式时刻 HH:MM（默认 23:50） */
+  doubao_sync_hhmm: string;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
@@ -421,8 +433,6 @@ export interface Settings {
   qoder_credits_sync_hours: string;
   /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
-  /** Qoder Token 续期间隔小时数（1~24，默认 6；客户端 token 惰性窗 7h，间隔 ≤7h 保证过期前续上） */
-  qoder_token_renew_interval_hours: number;
   /** Qoder 会话流水定时合并开关（默认开：qoder-sessions-compact 每 6 小时将早于保留窗的流水按会话合并为单行） */
   qoder_sessions_compact_enabled: boolean;
   /** Qoder 会话流水合并保留窗天数（默认 3，1..=90：近 N 天保留请求级明细，更早的合并） */
@@ -784,6 +794,8 @@ export interface PoolStatus {
   cooldown_reason: string | null;
   /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
   hard_credit?: boolean;
+  /** 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，显示恢复倒计时；旧后端未返回时为 undefined） */
+  hard_until?: number | null;
   disabled: boolean;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
@@ -798,7 +810,7 @@ export interface ApiPoolFile {
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
-  /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  /** Buddy 池调度策略（取值同 strategy）；空 = 加权公平轮转（fair_rotation，WB 专属默认，PR #187） */
   wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
@@ -820,7 +832,7 @@ export interface ApiPoolFile {
   buddy_ai_group_ids?: string[];
   /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
   buddy_ai_tag_ids?: string[];
-  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（与 qoder_strategy 同语义——wb_strategy 已改公平轮转专属默认，不在此列） */
   buddy_ai_strategy?: string;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
@@ -864,7 +876,7 @@ export interface ApiPoolFile {
   qoder_pool_sticky_ttl_secs?: number;
   /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
   qoder_sticky_ttl_secs?: number;
-  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列） */
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];
@@ -1002,6 +1014,8 @@ export interface DoubaoAccountView {
   user_id: string;
   name: string;
   note: string;
+  /** 共享分组 id（shg_*；null = 未分组） */
+  group_id: string | null;
   has_snapshot: boolean;
   size_bytes: number;
   file_count: number;
@@ -1030,6 +1044,55 @@ export interface DoubaoAccountView {
   session_source: string | null;
   /** 池级：最近一次 KeepAlive 保活时间（所有行同值） */
   last_keepalive_at: string | null;
+  // ── 签到/总额度缓存（tasks/doubao_checkin 巡检回写）──
+  /** 总额度（campaign detail progress.total_amount，签到巡检成功后回写） */
+  quota_total: number | null;
+  /** 连续签到天数 */
+  checkin_continuous_days: number | null;
+  /** 最近一次成功签到日期（YYYY-MM-DD） */
+  checkin_last_date: string | null;
+  /** 最近一次签到巡检运行时间（成功/失败均更新） */
+  checkin_last_run_at: string | null;
+}
+
+/** 签到趋势单日点（doubao_checkin_results 按日聚合；doubao_checkin_results_query / dashboard trend 共用） */
+export interface DoubaoCheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
+  reward_total: number;
+}
+
+/** 额度看板统计（doubao_dashboard_stats：池聚合 + 今日签到 + 近 30 天趋势） */
+export interface DoubaoDashboardStats {
+  account_count: number;
+  quota_total: number;
+  quota_known_count: number;
+  today_reward: number;
+  today_ok: number;
+  today_already: number;
+  today_failed: number;
+  max_continuous_days: number | null;
+  trend: DoubaoCheckinTrendPoint[];
+}
+
+/** 额度趋势明细：单账号某日签到结果（doubao_checkin_results_detail） */
+export interface DoubaoDayAccountResult {
+  user_id: string;
+  name: string;
+  /** success | already | fail */
+  status: string;
+  /** 签到奖励额度（success 时非空） */
+  reward: number | null;
+  /** 失败原因（仅 fail 时非空；旧数据/存量行为 null——失败原因落库后重开仍可排障） */
+  message?: string | null;
+}
+
+/** 额度趋势单日明细（同 uid 同日一条，重试轮覆盖为最终态；日期升序） */
+export interface DoubaoDayDetail {
+  date: string;
+  accounts: DoubaoDayAccountResult[];
 }
 
 /** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */
@@ -1179,8 +1242,6 @@ export interface UpdateCheckResult {
   release_page: string;
   // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
   sha256?: string | null;
-  // 运行平台（F-75 M3-3.3）：更新引导文案按平台分派（mac dmg 人工安装 vs win NSIS 自动重启）
-  platform?: 'windows' | 'macos';
 }
 
 // API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
@@ -1677,6 +1738,8 @@ export interface WbCheckinRecord {
   message: string;
   /** 签到获得积分（接口返回或前后余额差值兜底） */
   reward?: number;
+  /** issue #180：积分次日到账（credit_delayed）待入账标记；T+1 回填后置 false */
+  reward_pending?: boolean;
 }
 
 /** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */
@@ -1688,8 +1751,7 @@ export interface WbModelInfo {
   supports_image: boolean;
   supported_efforts: string[];
   effort_override: string | null;
-  /** Intl 目录元数据缺失时为 null（NaN 哨兵序列化），展示按「—」处理 */
-  rate: number | null;
+  rate: number;
 }
 
 // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
@@ -1854,6 +1916,9 @@ export interface QoderCheckinRecord {
   reward?: number;
   /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
   campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+  /** 失败归因（issue #190）：blocked_need_trust=风控信任未建立（需建信任后手动重试）；
+   * 历史记录无此字段 */
+  fail_kind?: string;
 }
 
 /** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
@@ -1873,6 +1938,9 @@ export interface QoderCheckinDone {
   failed: number;
   /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
   empty: number;
+  /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
+   * 自动重试无效（issue #190，口径对齐 Rust 侧） */
+  blocked: number;
 }
 
 export interface QoderCreditPackage {

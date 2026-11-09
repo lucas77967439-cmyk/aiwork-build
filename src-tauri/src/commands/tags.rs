@@ -287,8 +287,6 @@ pub fn tags_delete(
 /// 校验 tag_id 存在；uid 跨池全局唯一（Trae 数字 / wb- / qd- 前缀）。
 /// uid 存在性由调用方负责（前端仅从各池账号列表取值）；账号删除路径经
 /// account_tags_remove_account 清理绑定，不会产生孤儿行。
-/// pub(crate)：三池导入路径（Buddy/WB/Qoder）恢复标签绑定统一走本函数，
-/// 持锁「校验 → 落绑定」防并发删标签留下悬空绑定。
 pub(crate) fn account_tags_set_inner(state: &AppState, uid: &str, tag_ids: &[String]) -> Result<(), String> {
     let store = crate::store::db(&state.data_dir);
     // tag_id 必须存在（防幽灵标签）。校验与写入纳入同一 group_defs_lock 临界区：

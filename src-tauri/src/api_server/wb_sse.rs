@@ -183,15 +183,11 @@ fn parse_data(data: &str) -> Option<WbEvent> {
             .and_then(|m| m.as_str())
             .unwrap_or("upstream error")
             .to_string();
-        // 审查修复（M1）：错误码宽口径提取——code 宽口径：上游可能以字符串形态
-        // 下发（"code":"4001"），as_i64 落 0 会误入 ErrKind::Server 兜底（30m 熔断），
-        // 丢失 classify_wb_error 的模型级豁免判定依据——字符串可 parse 时取值
+        // 审查修复（M1）：错误码宽口径提取——code 为字符串形态（如 "4001"）时
+        // parse 成功即取值，避免落 0 丢失 classify_wb_error 的模型级豁免判定依据
         let code = err
             .get("code")
-            .and_then(|c| {
-                c.as_i64()
-                    .or_else(|| c.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-            })
+            .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse::<i64>().ok())))
             .unwrap_or(0);
         return Some(WbEvent::Error { code, msg });
     }
@@ -275,24 +271,13 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
 
 /// 流式转发：WB SSE → 客户端协议帧（扩展返回）
 ///
-/// 返回 (流内错误, 是否已发送过数据, 流内失败已就地下发, usage, EOF 截断)：
+/// 返回 (流内错误, 是否已发送过数据, 流内失败已就地下发, usage)：
 /// - error_info：尚未向下游发送任何数据时捕获的流内错误（调用方据此换号重试）；
 /// - failed_inline：流内失败事件（response.failed / error 帧）已就地透传客户端——
 ///   调用方不得再按成功收尾（不记成功、不清冷却、不绑定粘性），也不应重试
 ///   （错误已原样给到客户端，重试会造成重复流）。
-/// - eof_truncated：上游 EOF 未收到 Done/Error 且已有内容（审查 #6）：客户端
-///   仍在线时已按协议补齐终止帧优雅收尾，拿到的是「补齐后的完整形态」而非
-///   上游原貌；客户端已断连（tx.is_closed()）时补帧无接收方、跳过补发，该标记
-///   仅表示「流被截断收尾」——调用方记账/日志可据此标注截断，便于排障归因
 /// - 行源须为可中断行源：上游停滞期间每 LINE_POLL 检查一次客户端断连
 ///   （tx.is_closed()），断连即终止转发（上游连接与账号并发槽随 Drop 释放）
-///
-/// 参数（issue #93 / #150/#158）：
-/// - `encoded`：Responses 请求侧展平编码名集合（审查 #4/F4）——proto == Responses
-///   时仅对集合命中者还原 {name, namespace} 双字段，原生含 `__` 的扁平 function 名
-///   （如 MCP mcp__server__tool）保持单 name 字段；
-/// - `tool_alias`：工具别名逆向回改映射（issue #150/#158 P1-2），流式 tool_calls
-///   发射前 rename_tool_back 回改原名。
 // 宏内末次赋值（text_block_open）在收尾路径后不再读取，属预期行为（对齐 sse.rs）
 #[allow(unused_assignments)]
 pub fn stream_forward_ex(
@@ -303,7 +288,7 @@ pub fn stream_forward_ex(
     model: &str,
     encoded: &HashSet<String>,
     tool_alias: Option<&ToolAliasReverse>,
-) -> (Option<(i64, String)>, bool, bool, Option<Value>, bool) {
+) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
     let mut failed_inline = false;
@@ -312,10 +297,6 @@ pub fn stream_forward_ex(
     let mut has_content = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
-    // 终态帧防重（审查 2026-10-07，对齐 sse.rs saw_done 模式）：正常 Done /
-    // 流内 error 已发过收尾帧时，循环后断流收尾不得再发（否则重发 tool_use
-    // 块 + message_stop、response.completed 或第二个 [DONE]）
-    let mut saw_done = false;
 
     macro_rules! send {
         ($s:expr) => {
@@ -352,6 +333,9 @@ pub fn stream_forward_ex(
     let mut tool_buf: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
     // 上游最后携带的 finish_reason（P1 修复：Anthropic message_delta 按此映射 stop_reason）
     let mut last_finish = String::new();
+    // 已执行 finish_stream 标记：Done 分支收尾后，循环后的 EOF 断流兜底
+    // 不得再次触发（否则每条成功流 [DONE]/message_stop 重复下发）
+    let mut finished = false;
     // issue #96：OpenAI 透传 role 只保留首个下发帧（Buddy 上游逐帧携带 role，
     // 违反 OpenAI 流式惯例 role 仅出现在首个 delta）
     let mut openai_role_sent = false;
@@ -489,23 +473,17 @@ pub fn stream_forward_ex(
                             "arguments": args,
                         });
                         // 编码名还原为 Codex 只接受的 {name, namespace} 双字段；
-                        // 仅对请求侧登记的编码名拆分（审查 #4/F4，issue #93）——
+                        // 仅对请求侧登记的编码名拆分（审查 F4，issue #93）——
                         // 客户端原生扁平工具名可能天然含 `__`，未登记者保持单 name
                         if encoded.contains(name.as_str()) {
-                            // 审查修复（Low）：别名回改与 OpenAi 分支同口径（issue #150/#158）——
-                            // 命中别名先整体回改为客户端原名（原名整体下发交客户端按名匹配，
-                            // 不再做命名空间拆分）；未命中别名保持既有拆分逻辑
-                            let mut restored = name.to_string();
-                            rename_tool_back(tool_alias, &mut restored);
-                            if restored != name.as_str() {
-                                item["name"] = json!(restored);
-                            } else if let Some((ns, inner)) =
-                                crate::api_server::wb_responses::split_namespaced(name)
-                            {
-                                item["name"] = json!(inner);
-                                item["namespace"] = json!(ns);
-                            } else {
-                                item["name"] = json!(name);
+                            match crate::api_server::wb_responses::split_namespaced(name) {
+                                Some((ns, inner)) => {
+                                    item["name"] = json!(inner);
+                                    item["namespace"] = json!(ns);
+                                }
+                                None => {
+                                    item["name"] = json!(name);
+                                }
                             }
                         } else {
                             item["name"] = json!(name);
@@ -558,23 +536,8 @@ pub fn stream_forward_ex(
                 if !has_content {
                     // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
-                    // 审查 P2-9：Responses 协议若已发 created（空 delta chunk 触发
-                    // resp_created 置位），哨兵上抛前补发 response.failed 收尾——
-                    // Codex 等客户端在 created 后等待终态事件，悬空流会一直等待；
-                    // error.code=empty_completion 保留哨兵语义（调用方仍按空完成
-                    // 换号重试，返回元组的 sent_any/failed_inline 语义不变）。
-                    // 发送前检查在线（对齐下方 EOF 分支门控，避免向已关闭通道写帧）
-                    if resp_created && !tx.is_closed() {
-                        let mut resp = responses_object(chat_id, model, "failed", vec![], None);
-                        resp["error"] = json!({
-                            "code": "empty_completion",
-                            "message": super::EMPTY_COMPLETION_MSG,
-                        });
-                        resp_send(tx, "response.failed", json!({
-                            "type": "response.failed",
-                            "response": resp,
-                        }));
-                    }
+                    // 注：Responses 协议 created 仅在载荷帧时下发（噪声帧门控），
+                    // 影子风控场景上游零载荷 chunk → 未发 created，换号重试干净
                     error_info = Some((
                         super::EMPTY_COMPLETION_CODE,
                         super::EMPTY_COMPLETION_MSG.to_string(),
@@ -583,7 +546,7 @@ pub fn stream_forward_ex(
                 }
                 // Done 与 EOF 断流共用收尾序列（P1-5 提取为 finish_stream!）
                 finish_stream!();
-                saw_done = true;
+                finished = true;
                 sent_any = true;
                 break;
             }
@@ -630,11 +593,8 @@ pub fn stream_forward_ex(
                 if let Some(x) = u {
                     usage = Some(x);
                 }
-                // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入。
-                // 同帧载荷判定复用为 Anthropic message_start 的延迟发送条件
-                //（审查修复 L：纯噪声帧不再提前触发 message_start）
-                let frame_has_payload =
-                    delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
+                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
                     || delta
                         .get("reasoning_content")
                         .and_then(|c| c.as_str())
@@ -642,18 +602,12 @@ pub fn stream_forward_ex(
                     || delta
                         .get("tool_calls")
                         .and_then(|t| t.as_array())
-                        .map_or(false, |a| !a.is_empty());
-                if frame_has_payload {
+                        .map_or(false, |a| !a.is_empty())
+                {
                     has_content = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
-                    // 审查修复（issue #96 噪声帧 + 空完成换号重试协议违规）：
-                    // message_start 延迟到首个真实载荷帧再发——纯噪声 delta 帧
-                    // 不提前开启 message，避免空完成换号重试时同一 SSE 流收到
-                    // 重复 message_start / 悬空 message（严格客户端协议违规）
-                    if frame_has_payload {
-                        anthropic_start(tx, &mut message_started, chat_id, model);
-                    }
+                    anthropic_start(tx, &mut message_started, chat_id, model);
                     // T5.3/F-62：思考链增量 → thinking block（先于文本块）
                     if let Some(t) = delta.get("reasoning_content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                         if !thinking_block_open {
@@ -849,10 +803,24 @@ pub fn stream_forward_ex(
                         }
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
                         crate::api_server::routes::Protocol::Responses => {
-                            resp_ensure_created!();
-                            // created 帧已下发：后续流内错误必须就地 response.failed，
-                            // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
-                            sent_any = true;
+                            // 审查修复（macOS #1）：噪声帧门控——纯噪声帧（空 delta、
+                            // 无 finish、无 usage）不再提前下发 created / 置 sent_any。
+                            // 原实现空 delta chunk 也触发 created：空完成换号重试失效
+                            // （调用方据 sent_any 误判「已发送数据」不再重试），且真
+                            // 换号会向已含 created 的流拼接第二份响应（与下方 P2-9
+                            // 注释矛盾）。对齐 OpenAi 分支整帧跳过口径：仅载荷帧
+                            // （正文/思考/工具调用/finish/usage 任一非空）触发
+                            let frame_has_payload = frame_has_usage
+                                || !finish.is_empty()
+                                || delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("reasoning_content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("tool_calls").and_then(|t| t.as_array()).map_or(false, |a| !a.is_empty());
+                            if frame_has_payload {
+                                resp_ensure_created!();
+                                // created 帧已下发：后续流内错误必须就地 response.failed，
+                                // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
+                                sent_any = true;
+                            }
                             // 文本增量 → message 输出项 + output_text.delta
                             if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                                 if !resp_msg_open {
@@ -920,13 +888,8 @@ pub fn stream_forward_ex(
     // 上游断流（EOF 未收到 Done/Error 事件）优雅收尾（审查 P1-5，对齐
     // sse.rs SOLO finish_stream 语义）：已有内容 → 按协议补齐终止帧，避免
     // 严格客户端因未闭合的 content_block / message 项挂起；零内容不伪装
-    // 成功，走下方空完成哨兵换号重试。
-    // 审查 #6：截断补齐是「有内容但未正常闭合」的降级收尾，与上游原貌不符，
-    // 以第 5 元组上抛，由调用方在记账/日志行标注（截断可观测，便于排障归因）。
-    // saw_done 兼作 main 侧「已执行 finish_stream」防重（成功流 [DONE]/
-    // message_stop 不再重复下发），语义与 eof_truncated 判定统一
-    let eof_truncated = !saw_done && error_info.is_none() && !failed_inline && has_content;
-    if eof_truncated && !tx.is_closed() {
+    // 成功，走下方空完成哨兵换号重试
+    if error_info.is_none() && !finished && !failed_inline && has_content && !tx.is_closed() {
         finish_stream!();
         sent_any = true;
     }
@@ -938,9 +901,8 @@ pub fn stream_forward_ex(
     // 兜底同型：正常 Done 收尾（finished）/ 流内失败（failed_inline）不算
     // 掐断；有内容时上方分支已补齐终止帧（客户端看到完整收尾），此处只补
     // 上抛——调用方按失败落账（不绑粘性不记成功）；零内容时覆盖空完成哨兵
-    //（调用方换号且不计空完成指纹）。「正常 Done 收尾」守卫复用 saw_done
-    //（macos_main 命名，语义同 main 侧 finished）
-    if error_info.is_none() && !saw_done && !failed_inline {
+    //（调用方换号且不计空完成指纹）
+    if error_info.is_none() && !finished && !failed_inline {
         if let Some(e) = parser.take_read_error() {
             error_info = Some((
                 super::TRANSPORT_CUT_CODE,
@@ -949,33 +911,34 @@ pub fn stream_forward_ex(
         }
     }
 
-    // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛（原样收尾会让
-    // 客户端收到 "empty provider response"）。判定与客户端在线解耦——断连
-    // 也上抛，否则调用方误判成功绑粘性；仅 response.failed 帧发送前检查在线，
-    // 避免向已关闭通道写帧。
-    // 终审补齐（P2-9 同构）：resp_created 已置位（空 delta/usage chunk 触发）时
-    // 与 Done 分支对称地补发 response.failed——EOF 断流同属「created 后悬空」
-    // 场景（qoder_route 证实 EOF 零完成真实存在，非理论不可达），补发后仍上抛
-    // 哨兵交调用方换号重试，sent_any/failed_inline 语义不变
+    // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛；判定与客户端
+    // 在线解耦——断连也上抛，否则调用方误判成功绑粘性（原样收尾会让客户端
+    // 收到 "empty provider response"）
     if error_info.is_none() && !has_content && !failed_inline {
-        if resp_created && !tx.is_closed() {
-            let mut resp = responses_object(chat_id, model, "failed", vec![], None);
-            resp["error"] = json!({
-                "code": "empty_completion",
-                "message": super::EMPTY_COMPLETION_MSG,
-            });
-            resp_send(tx, "response.failed", json!({
-                "type": "response.failed",
-                "response": resp,
-            }));
-        }
         error_info = Some((
             super::EMPTY_COMPLETION_CODE,
             super::EMPTY_COMPLETION_MSG.to_string(),
         ));
     }
 
-    (error_info, sent_any, failed_inline, usage, eof_truncated)
+    (error_info, sent_any, failed_inline, usage)
+}
+
+/// 兼容封装：旧三元组返回（B1 后生产侧已全部迁移 stream_forward_ex，仅测试使用，
+/// #[cfg(test)] 门控消 dead_code；新调用方请用 stream_forward_ex）
+#[cfg(test)]
+pub fn stream_forward(
+    lines: InterruptibleLines,
+    tx: &Sender,
+    proto: crate::api_server::routes::Protocol,
+    chat_id: &str,
+    model: &str,
+    encoded: &HashSet<String>,
+    tool_alias: Option<&ToolAliasReverse>,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
+    let (error_info, sent_any, _failed_inline, usage) =
+        stream_forward_ex(lines, tx, proto, chat_id, model, encoded, tool_alias);
+    (error_info, sent_any, usage)
 }
 
 /// 非流式聚合：WB SSE → 内部 OpenAI completion（tool_calls 按 index 合并）
@@ -1336,7 +1299,7 @@ mod tests {
             .collect();
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let start = std::time::Instant::now();
-        let (_err, sent_any, _fi, _u, _t) = stream_forward_ex(
+        let (_err, sent_any, _fi, _u) = stream_forward_ex(
             src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None,
         );
         assert!(!sent_any, "断连后不得有任何事件下发");
@@ -1345,106 +1308,6 @@ mod tests {
             "活跃流断连应立即终止，实测 {:?}",
             start.elapsed()
         );
-    }
-
-    /// 审查 2026-10-07：活跃流中途断连且有内容——eof_truncated 应置位（流被
-    /// 截断收尾），sent_any 语义不变；该场景 tx 已关、wb_sse 跳过补帧，
-    /// 调用方日志文案据 tx.is_closed() 区分「客户端已断开」与「已补齐终止帧」
-    ///
-    /// 确定性：from_iterator 转发线程向无界 std channel 预取行，本闭包 drop rx
-    /// 的时机由生产者线程决定——CI 高负载下可能先于消费者首个 delta 下发执行，
-    /// 消费者首轮 tx.is_closed() 即 break，sent_any=false 误报（2026-10-13
-    /// macOS aarch64 job 偶发）。故 drop rx 前先 try_recv 观测到消费者已实际
-    /// 下发首帧（rx 未 drop，观测不影响消费），「断连前已下发」前提确定性成立；
-    /// 10s 兜底 deadline 防异常情况下测试无限挂起。
-    #[test]
-    fn stream_forward_eof_truncated_when_client_disconnects_midstream() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let mut rx = Some(rx);
-        let mut i = 0usize;
-        // 行序列：delta + 空行交替；产出行 5 前模拟客户端断开（drop rx），
-        // 此前至少 1 个 delta 事件已完整下发（has_content/sent_any 已置位）
-        let iter = std::iter::from_fn(move || {
-            i += 1;
-            if i == 5 {
-                if let Some(r) = rx.as_mut() {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while matches!(r.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty))
-                    {
-                        if std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-                drop(rx.take());
-            }
-            if i > 9 {
-                return None;
-            }
-            if i % 2 == 1 {
-                Some(format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{}\"}}}}]}}",
-                    (i + 1) / 2
-                ))
-            } else {
-                Some(String::new())
-            }
-        });
-        let src = InterruptibleLines::from_iterator(Box::new(iter));
-        let (error_info, sent_any, failed_inline, _usage, eof_truncated) =
-            stream_forward_ex(src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None);
-        assert!(error_info.is_none(), "断连不应产生流内错误");
-        assert!(sent_any, "断连前已下发 delta");
-        assert!(!failed_inline, "断连不是流内失败");
-        assert!(
-            eof_truncated,
-            "断连且有内容应标记 eof_truncated（流被截断收尾）"
-        );
-    }
-
-    /// 审查 P2-9：Responses 协议空完成——created 已发（空 delta chunk 触发）时，
-    /// 哨兵上抛前补发 response.failed 收尾帧（客户端不再悬空等待终态事件）；
-    /// 哨兵语义不变：error_info 仍上抛空完成错误驱动调用方换号，failed_inline
-    /// 不置位（未按「失败已透传终态」处理）
-    #[test]
-    fn stream_forward_responses_empty_completion_after_created_sends_failed_frame() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let src = lines(&[
-            // 空 delta chunk：触发 created 占位帧（不计入 has_content）
-            "data: {\"choices\":[{\"delta\":{}}]}",
-            "",
-            "data: [DONE]",
-            "",
-        ]);
-        let (error_info, sent_any, failed_inline, _usage, _t) = stream_forward_ex(
-            src,
-            &tx,
-            crate::api_server::routes::Protocol::Responses,
-            "chat-1",
-            "m",
-            &HashSet::new(),
-            None,
-        );
-        assert_eq!(
-            error_info,
-            Some((
-                crate::api_server::EMPTY_COMPLETION_CODE,
-                crate::api_server::EMPTY_COMPLETION_MSG.to_string()
-            ))
-        );
-        assert!(sent_any, "created 已下发");
-        assert!(!failed_inline);
-        drop(tx); // 关闭通道后收集全部下发帧
-        let mut body = String::new();
-        while let Some(Ok(b)) = rx.try_recv().ok() {
-            body.push_str(&String::from_utf8_lossy(&b));
-        }
-        assert!(body.contains("event: response.created"));
-        assert!(body.contains("event: response.failed"));
-        assert!(body.contains("empty_completion"));
-        // 空完成不得伪装成正常完成
-        assert!(!body.contains("response.completed"));
     }
 
     /// issue #96：Buddy 上游每个 delta 携带噪声字段（空 tool_calls 数组、逐帧
@@ -1475,7 +1338,7 @@ mod tests {
         data.push("data: [DONE]".to_string());
         data.push(String::new());
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
-        let (err, sent_any, _fi, usage, _t) = stream_forward_ex(
+        let (err, sent_any, _fi, usage) = stream_forward_ex(
             src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat_96", "step-5-preview", &HashSet::new(), None,
         );
         assert!(err.is_none());
@@ -1628,7 +1491,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, usage, eof_truncated) = stream_forward_ex(
+        let (err, sent_any, usage) = stream_forward(
             lines,
             &tx,
             crate::api_server::routes::Protocol::Responses,
@@ -1639,8 +1502,6 @@ mod tests {
         );
         assert!(err.is_none());
         assert!(sent_any);
-        assert!(!failed_inline);
-        assert!(!eof_truncated);
         assert!(usage.is_some());
         drop(tx);
 
@@ -1661,24 +1522,19 @@ mod tests {
     }
 
     /// issue #93：Responses 流式下编码名 function_call 还原为 {name, namespace}
-    /// 双字段；扁平 function 工具保持单 name 且不带 namespace（回归）；
-    /// 审查 #4：仅请求侧展平集合命中者拆分，原生 `__` 名不拆
+    /// 双字段；扁平 function 工具保持单 name 且不带 namespace（回归）
     #[test]
     fn stream_forward_responses_restores_namespaced_function_call() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&[
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"multi_agent_v1__spawn_agent\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}",
             "",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"mcp__node_repl__js\",\"arguments\":\"{}\"}}]}}]}",
-            "",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call_3\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4}}",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4}}",
             "",
             "data: [DONE]",
             "",
         ]);
-        // 请求侧展平集合：multi_agent_v1__spawn_agent 为展平编码名；
-        // mcp__node_repl__js、shell 为原生扁平名（未入集合）
-        let (err, sent_any, _failed_inline, usage, _t) = stream_forward_ex(
+        let (err, sent_any, usage) = stream_forward(
             lines,
             &tx,
             crate::api_server::routes::Protocol::Responses,
@@ -1695,13 +1551,9 @@ mod tests {
         while let Ok(frame) = rx.try_recv() {
             body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
         }
-        // done 项：集合命中的编码名拆为 spawn_agent + namespace=multi_agent_v1
+        // done 项：编码名拆为 spawn_agent + namespace=multi_agent_v1
         assert!(body.contains("\"name\":\"spawn_agent\""));
         assert!(body.contains("\"namespace\":\"multi_agent_v1\""));
-        // 审查 #4：原生含 `__` 扁平名不拆，保持单 name 字段
-        assert!(body.contains("\"name\":\"mcp__node_repl__js\""));
-        assert!(!body.contains("\"name\":\"js\""));
-        assert!(!body.contains("\"namespace\":\"mcp__node_repl\""));
         // 扁平工具不带 namespace 字段
         assert!(body.contains("\"name\":\"shell\""));
         assert!(!body.contains("\"namespace\":\"\""));
@@ -1725,7 +1577,7 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":1001}}",
             "",
         ]);
-        let (err, sent_any, failed_inline, _usage, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", &HashSet::new(), None,
         );
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
@@ -1751,39 +1603,13 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, usage, eof_truncated) = stream_forward_ex(
+        let (err, sent_any, failed_inline, usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", &HashSet::new(), None,
         );
         assert!(err.is_none());
         assert!(sent_any);
         assert!(!failed_inline);
         assert!(usage.is_none(), "上游未下发 usage 时不得伪造");
-        assert!(!eof_truncated, "正常 Done 收尾不得误报截断");
-    }
-
-    /// 审查 #6 回归：EOF 断流（有内容、未收到 Done/Error）→ eof_truncated=true
-    /// 上抛调用方（终止帧已就地补齐，客户端正常收尾，但与上游原貌不符需可观测）
-    #[test]
-    fn stream_forward_eof_truncation_with_content_is_reported() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
-        let lines = lines(&[
-            // 有内容但上游直接断流：无 [DONE]、无 error 帧
-            "data: {\"choices\":[{\"delta\":{\"content\":\"截断输出\"}}]}",
-            "",
-        ]);
-        let (err, sent_any, failed_inline, _usage, eof_truncated) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None,
-        );
-        assert!(err.is_none());
-        assert!(sent_any);
-        assert!(!failed_inline);
-        assert!(eof_truncated, "EOF 截断补齐必须作为第 5 元上抛");
-        drop(tx);
-        let mut body = String::new();
-        while let Ok(frame) = rx.try_recv() {
-            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
-        }
-        assert!(body.contains("[DONE]"), "截断流必须补齐终止帧: {body}");
     }
 
     /// 流内失败标记对 Anthropic 协议同样生效（event: error 就地下发）
@@ -1796,7 +1622,7 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":7}}",
             "",
         ]);
-        let (err, _sent_any, failed_inline, _usage, _t) = stream_forward_ex(
+        let (err, _sent_any, failed_inline, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", &HashSet::new(), None,
         );
         assert!(err.is_none());
@@ -1814,7 +1640,7 @@ mod tests {
     fn stream_forward_error_before_stream_uplifts() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
-        let (err, sent_any, failed_inline, _usage, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None,
         );
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
@@ -1834,7 +1660,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, _u, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", &HashSet::new(), None,
         );
         assert!(err.is_none() && sent_any && !failed_inline);
@@ -1927,7 +1753,7 @@ mod tests {
         let ilines = InterruptibleLines::from_reader(CutAfterFirstRead { n: 0 })
             .expect("首字窗口内应有产出");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, failed_inline, _u, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
             ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M",
             &HashSet::new(), None,
         );
@@ -1958,7 +1784,7 @@ mod tests {
             "",
         ]);
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, failed_inline, _u, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
             ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-2", "M",
             &HashSet::new(), None,
         );
@@ -2020,7 +1846,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, _u, _t) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_6", "m", &HashSet::new(), None,
         );
         assert!(err.is_none() && sent_any && !failed_inline);

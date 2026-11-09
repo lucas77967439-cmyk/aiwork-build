@@ -184,8 +184,7 @@ impl ApiLogger {
     ) {
         let (h, m, s) = Self::local_hms();
 
-        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
-        let uid_short: String = uid.chars().take(12).collect();
+        let uid_short = &uid[..uid.len().min(12)];
         let ttfb_part = match ttfb_ms {
             Some(t) => format!(" ttfb={t}ms"),
             None => String::new(),
@@ -230,8 +229,7 @@ impl ApiLogger {
     ) {
         let (h, m, s) = Self::local_hms();
 
-        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
-        let uid_short: String = uid.chars().take(12).collect();
+        let uid_short = &uid[..uid.len().min(12)];
         let mut lines = Vec::new();
         lines.push(format!(
             "[{:02}:{:02}:{:02}] [DEBUG] uid={} status={}",
@@ -270,27 +268,10 @@ impl ApiLogger {
         self.enqueue(data);
     }
 
-    /// 日期白名单校验（审查 P2-7）：恰 10 字节、第 5/8 字节为 b'-'、其余 ASCII
-    /// 数字（YYYY-MM-DD 形态）。防路径注入（date 拼进文件名）——不合法一律拒绝，
-    /// 上层按「无日志」处理
-    fn is_valid_log_date(date: &str) -> bool {
-        let b = date.as_bytes();
-        b.len() == 10
-            && b[4] == b'-'
-            && b[7] == b'-'
-            && b.iter()
-                .enumerate()
-                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
-    }
-
     /// 读取指定日期的日志文件内容（按时间倒序排列）
     pub fn read_log(&self, date: &str) -> Option<String> {
         self.flush_pending();
-        // 审查 P2-7：date 白名单校验后才拼进文件路径，防路径注入；
-        // 不合法按「无日志」处理
-        if !Self::is_valid_log_date(date) {
-            return None;
-        }
+        // date 格式: "2026-08-14"
         let path = self.dir.join(format!("api_{}.log", date));
         match fs::read(&path) {
             Ok(bytes) => {
@@ -462,10 +443,10 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
                 st.file = Some(f);
                 st.date = today;
             }
-            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行。
-            // 审查修复（L4）：打开失败不再无痕丢整批——stderr + app_log 落一条
-            // 观测行（含丢弃行数与目标路径），防磁盘满/权限故障期间日志静默丢失
+            // 打开失败：丢弃本批（与旧实现 write 失败静默语义一致），保留队列外后续行
             Err(e) => {
+                // 审查修复（L4）：打开失败不再无痕丢整批——stderr + app_log 落一条
+                // 观测行（含丢弃行数与目标路径），防磁盘满/权限故障期间日志静默丢失
                 let msg = format!(
                     "[api_logger] 打开日志文件失败，丢弃本批 {} 行（path={}）: {e}",
                     st.queue.len(),
@@ -610,22 +591,6 @@ fn reverse_log_blocks(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ==================== 审查 P2-7：read_log 日期白名单 ====================
-
-    #[test]
-    fn log_date_whitelist() {
-        // 合法：YYYY-MM-DD 形态
-        assert!(ApiLogger::is_valid_log_date("2026-08-14"));
-        // 非法：分隔符错位 / 非 10 字节 / 非数字分隔符混入 / 路径注入
-        assert!(!ApiLogger::is_valid_log_date("2026-8-14"));
-        assert!(!ApiLogger::is_valid_log_date("20260814"));
-        assert!(!ApiLogger::is_valid_log_date("2026/08/14"));
-        assert!(!ApiLogger::is_valid_log_date("2026-08-1a"));
-        assert!(!ApiLogger::is_valid_log_date("../etc/passwd"));
-        assert!(!ApiLogger::is_valid_log_date(""));
-        assert!(!ApiLogger::is_valid_log_date("2026-08-141"));
-    }
 
     fn today() -> String {
         let now = Local::now();

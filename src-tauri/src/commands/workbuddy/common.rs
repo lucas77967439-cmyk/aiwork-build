@@ -13,8 +13,8 @@ use crate::state::AppState;
 // ── 路径常量（与 wb_common.py / trae-switch-bridge.ps1 保持一致）────────────
 
 pub(super) fn auth_file_path() -> PathBuf {
-    // F-75 跨平台收口：Windows=%LOCALAPPDATA%，mac=~/Library/Application Support
-    crate::platform::local_data_root_lossy()
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    PathBuf::from(local)
         .join("CodeBuddyExtension")
         .join("Data")
         .join("Public")
@@ -35,32 +35,12 @@ pub(super) fn auth_file_path_of(state: &AppState) -> PathBuf {
 }
 
 pub(super) fn wb_data_dir() -> PathBuf {
-    // ~/.workbuddy 跨平台 HOME 基根（Windows=%USERPROFILE%，mac=$HOME）
-    crate::platform::home_dir().join(".workbuddy")
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    PathBuf::from(home).join(".workbuddy")
 }
 
 pub(super) fn snapshot_json_path() -> PathBuf {
     wb_data_dir().join("storage").join("skeleton").join("account-snapshot.json")
-}
-
-/// WorkBuddy 端 live 登录 uid：客户端运行时优先 skeleton 登录快照 primary.uid
-/// （现版本登录后只重写快照、不回写 auth 文件，auth 可能停在上个账号），未运行
-/// 时快照是上次会话残留、不采用，回退 auth 文件 uid（恢复后的登录态由它承载）。
-/// 账号列表在线判定（accounts_list_inner）与切换守卫 WorkBuddy 预探测
-///（commands::switch）共用，避免两处 live 口径漂移。
-pub fn wb_live_uid() -> Option<String> {
-    let live = if is_running() {
-        crate::switcher::authfile::snapshot_field(
-            &fs_utils::read_json::<serde_json::Value>(&snapshot_json_path()),
-            "uid",
-            &["uid", "accountId"],
-        )
-    } else {
-        None
-    };
-    live.or_else(|| {
-        crate::switcher::authfile::auth_file_uid(&crate::switcher::authfile::wb_auth_file())
-    })
 }
 
 pub(super) fn account_id_of(token: &str) -> String {
@@ -258,18 +238,11 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
     crate::notify::notify_all(app, data_dir, title, body, &channels);
 }
 
-/// 后台线程版 push_notify（审查修复 M，托盘专用）：开关过滤留在调用线程快路径
-///（过滤命中直接返回，零开销），四渠道 HTTP 分发（最坏 ~40s）移交后台线程——
-/// 托盘菜单回调运行在主线程，同步版会让 UI 事件循环（托盘/菜单响应）最长卡
-/// 40s（#157 PushPlus 加第四渠道后阻塞面进一步放大）。同步版保持原语义供
-/// 后台任务线程与同步时序测试使用。
-pub fn push_notify_bg(
-    app: Option<AppHandle>,
-    data_dir: std::path::PathBuf,
-    title: &str,
-    body: &str,
-    event: crate::notify::NotifyEvent,
-) {
+/// 后台线程版 push_notify（issue：托盘主线程阻塞防放大）：开关过滤留在调用
+/// 线程快路径（过滤命中直接返回，零开销），四渠道 HTTP 分发（最坏 ~40s）移交
+/// 后台线程——托盘菜单回调运行在主线程，同步版会让 UI 事件循环（托盘/菜单
+/// 响应）最长卡 40s。同步版保持原语义供后台任务线程与同步时序测试使用。
+pub fn push_notify_bg(app: Option<AppHandle>, data_dir: std::path::PathBuf, title: &str, body: &str, event: crate::notify::NotifyEvent) {
     let Some(channels) = resolve_notify_channels(&data_dir, event) else {
         return;
     };
@@ -309,21 +282,9 @@ fn resolve_notify_channels(
 }
 
 pub(super) fn is_running() -> bool {
-    #[cfg(windows)]
-    {
-        // 原 tasklist 子进程（单次实测 ~260ms）改为 sysinfo 进程表枚举 + 短 TTL 复用
-        // （见 switcher::proc::any_running）；概览页与顶栏同轮切换会各问一次
-        crate::switcher::proc::any_running(&["WorkBuddy"])
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // M-1 ⑥：映像名均为 Electron，按 bundle 主进程路径段匹配
-        crate::commands::process::mac_app_running(&["WorkBuddy"])
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        false
-    }
+    // 原 tasklist 子进程（单次实测 ~260ms）改为 sysinfo 进程表枚举 + 短 TTL 复用
+    // （见 switcher::proc::any_running）；概览页与顶栏同轮切换会各问一次
+    crate::switcher::proc::any_running(&["WorkBuddy"])
 }
 
 // 宽容字段提取统一走 fs_utils::dig（含 data/result/resp/response/info/auth/account
@@ -493,7 +454,8 @@ pub(super) fn restore_cli_settings(previous: &str) {
 
 /// CodeBuddy CLI settings.json 路径（.codebuddy/settings.json）。
 pub(super) fn cli_settings_path() -> PathBuf {
-    crate::platform::home_dir().join(".codebuddy").join("settings.json")
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    PathBuf::from(home).join(".codebuddy").join("settings.json")
 }
 
 // ── M8 会话三件套命令的 uid 防护（审查 P0-1）───────────────────────────────

@@ -19,8 +19,7 @@ const WB_ACCESS_TOKEN_SECRET_KEY: &str =
     r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}"#;
 
 fn wb_roaming_dir() -> PathBuf {
-    // F-75 跨平台收口：Windows=%APPDATA%\WorkBuddy（零变化），mac=~/Library/Application Support/WorkBuddy
-    crate::platform::app_support_root_lossy().join("WorkBuddy")
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("WorkBuddy")
 }
 
 fn wb_state_vscdb() -> PathBuf {

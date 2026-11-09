@@ -33,26 +33,6 @@ impl ApiServerHandle {
             }
         }
     }
-
-    /// 异步优雅停止（审查 P2-10）：语义与 stop 一致（发信号 → 等优雅退出 →
-    /// 超时 abort），但等待改 tokio::time::timeout + await——供 Tauri 命令链
-    /// （commands/api_server.rs do_stop）在 tokio worker 内调用，不再以
-    /// thread::sleep 轮询阻塞 worker 线程。Drop / 应用退出路径仍用同步版 stop
-    /// （无异步上下文可用）。
-    pub async fn stop_async(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(mut h) = self.join_handle.take() {
-            // JoinHandle: Unpin，可借用等待（&mut h）；超时后句柄仍可 abort
-            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut h)
-                .await
-                .is_err()
-            {
-                h.abort();
-            }
-        }
-    }
 }
 
 /// 轮询任务是否已结束（每 50ms 一次，最多 max）；P2 修复9 优雅停机用
@@ -207,7 +187,8 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         // issue #21：axum 对 `Bytes` 提取器默认限制 2MiB，超限请求在进 handler 前
         // 就被 413 纯文本拒绝（handler 内检查不可达）；显式放开到
         // routes::max_body_bytes()，与 handler 内检查阈值保持一致（issue #138 P1：
-        // 默认 8MiB，环境变量 AIWORK_MAX_BODY_BYTES 可覆盖，区间 [256KiB, 64MiB]）
+        // 环境变量 AIWORK_MAX_BODY_BYTES 可覆盖，区间 [256KiB, 64MiB]；
+        // issue #181：默认回调 32MiB，agent CLI 大包不再被 413 误判为超上下文窗口）
         .layer(DefaultBodyLimit::max(routes::max_body_bytes()))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))
         .with_state(state)
@@ -288,8 +269,6 @@ mod tests {
 /// 同口径再探一次，结果写 state.buddy_ai_probe_* 供 /status buddy_ai 块透出——
 /// 国际档开关独立于 CN，CN 可达 ≠ Intl 可达，双上游各自画像。
 /// 频控红线：单次单请求、不重试、不批量，探活流量可忽略。
-/// 持 Weak 引用（审查 P1-2）：服务停止、共享状态被释放后线程自动退出
-/// （重启服务重建新线程），避免重启循环泄漏线程。
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
     // 与 spawn_persistence_flusher 同构：持 Weak 引用，服务停止、共享状态被释放后
@@ -420,7 +399,6 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
             if !intl_ok {
                 eprintln!("[buddy-ai-probe] 国际上游健康检测失败: {BUDDY_AI_PROBE_URL}");
             }
-            // 轮末释放本轮强引用（下一轮睡眠期间不持有）
         }
     });
 }

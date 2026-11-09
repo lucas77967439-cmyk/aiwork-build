@@ -72,15 +72,8 @@ export default function BuddyAiApiService() {
   // 调度参数最近一次落库值（审查修复 P3 同源：onBlur 未改动不重复保存——原实现每次
   // 失焦都触发 poolSet + 「已保存」toast，用户仅点击路过输入框也会弹保存噪音）
   const savedParamsRef = useRef<Record<string, number>>({});
-  // 分组/标签 chip 乐观回滚序号门控（审查修复：慢败旧操作的失败回滚不得覆盖
-  // 其后已成功落库并回读的新状态——每次乐观 set 递增序号，回滚仅当序号未变时执行）
-  const scopeSeqRef = useRef(0);
-  // flags 慢败回滚序号门控（审查修复 #6）：saveFlags 乐观 setFlags 的失败回滚不得
-  // 覆盖其后已成功落库/已被外部回读覆盖的新状态——saveFlags 入口与 refresh() 外部
-  // 回读均递增，回滚仅当序号未变时执行（与 scopeSeqRef 同法）
-  const flagsSeqRef = useRef(0);
-  // 保存请求序号守卫（审查 #6，与 ResourceSummary F2 同类竞态）：saving 复位仅限
-  // 最新一次请求——被取代的旧保存失败时静默（console.warn 诊断），不得弹虚假错误
+  // 保存请求序号守卫（审查 #6，与 ResourceSummary F2 同类竞态）：连续保存时旧请求
+  // 慢败返回，陈旧快照回滚会覆盖其后已成功保存的字段并可能经下次 onBlur 写回后端
   const saveSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
@@ -120,8 +113,6 @@ export default function BuddyAiApiService() {
       setTagDefs(tags);
       setPendingEnabled({});
       if (pf) {
-        // 外部回读将整体覆盖 flags：递增序号使任何在途保存的慢败回滚失效（#6）
-        flagsSeqRef.current++;
         setFlags({
           buddyAiEnabled: pf.buddy_ai_enabled ?? false,
           buddyAiStickyEnabled: pf.buddy_ai_sticky_enabled ?? false,
@@ -180,73 +171,34 @@ export default function BuddyAiApiService() {
     // 乐观更新（审查 P2：原在 await 之后 setFlags，保存进行中（≥400ms）再点
     // 另一个开关会基于旧 flags 快照提交，把第一次改动静默回退）
     const prev = flags;
-    // M10b：分组/标签 chip 是独立 state，失败回滚需各自的调用时快照
-    const prevGroups = poolGroupScope;
-    const prevTags = poolTagScope;
-    // 序号门控：入口记录当前序号，回滚仅当此后无新的乐观 set（序号未变）时执行
-    const seqAtCall = scopeSeqRef.current;
-    // flags 独立单调序号（#6）：saveFlags 自身做乐观 setFlags 故入口递增，
-    // 其后的并发保存或 refresh() 回读都会使本次慢败回滚失效
-    const flagsSeqAtCall = ++flagsSeqRef.current;
     setFlags(next);
     try {
       await withMinDelay(
         api.apiServer.poolSet(pool.enabled_uids, pool.strategy, pool.group_ids, next),
         400,
       );
-      // H-3 修复（与 Buddy/Qoder 页同款）：保存成功后回读池快照——本页常驻期间
-      // 他端可能改过池配置，旧快照下次保存原样回传会静默覆盖他端配置
-      try {
-        setPool(await api.apiServer.poolList());
-      } catch {
-        /* 回读失败保留旧快照 */
-      }
       pushToast(
         'success',
         next.buddyAiEnabled ? 'buddy-ai 国际档已开启（独立池参与调度）' : '已保存 buddy-ai 调度配置',
       );
       return true;
     } catch (err) {
-      if (flagsSeqRef.current === flagsSeqAtCall) {
-        // 慢败回滚序号门控（审查修复 #6）：本保存失败时若其后已有新的乐观 set/外部
-        // 回读（序号已变），调用时陈旧快照的回滚会把并发已成功落库的新值（如 chip
-        // 保存 A 在途时保存 B 成功的 buddyAiEnabled）抹回旧值，后续保存还会把回退值
-        // 写回后端——仅当序号未变时回滚
-        // 回滚值优先回读最新池快照（只回滚本次 patch 涉及的 key）：并发保存可能已
-        // 成功写入同 key 新值，最新落库值即应为回滚目标；回读失败退回调用时快照
-        let latest: ApiPoolFile | null = null;
-        try {
-          latest = await api.apiServer.poolList();
-        } catch {
-          /* 回读失败退回调用时快照 */
-        }
-        // 回读期间可能又有新的乐观 set（序号已变）：同样放弃回滚
-        if (flagsSeqRef.current === flagsSeqAtCall) {
-          const revert: typeof flags = latest
-            ? {
-                buddyAiEnabled: latest.buddy_ai_enabled ?? false,
-                buddyAiStickyEnabled: latest.buddy_ai_sticky_enabled ?? false,
-                buddyAiPoolStickyTtlSecs: latest.buddy_ai_pool_sticky_ttl_secs,
-              }
-            : { ...flags };
-          if (!latest) {
-            for (const k of Object.keys(next) as Array<keyof typeof next>) {
-              (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
-            }
+      if (seq === saveSeqRef.current) {
+        // 按本次 patch 字段函数式回滚（审查修复）：不用陈旧快照整份覆盖，基于最新
+        // state 仅回滚本次 patch 键，避免连带抹掉并发已成功落库的其他字段
+        setFlags((cur) => {
+          const revert = { ...cur };
+          for (const k of Object.keys(next) as Array<keyof typeof next>) {
+            (revert as Record<string, unknown>)[k] = prev[k as keyof typeof prev];
           }
-          setFlags(revert);
-        }
+          return revert;
+        });
         pushToast('error', `保存失败：${String(err).slice(0, 160)}`);
       } else {
-        // 复审 No.2：本次失败已被更新的保存/回读取代，静默不上报（后续保存成功
-        // 会自动收敛，弹 toast 反成虚假提示）；仅补诊断日志便于排查
+        // 复审 No.2：本次失败已被更新的保存取代，静默不上报（后续保存成功以全量
+        // payload 提交会自动收敛，弹 toast 反成虚假提示）；仅补诊断日志便于排查
         console.warn('[BuddyAiApiService] 保存请求已被更新的保存取代，失败已静默：', err);
       }
-      // M10b 修复：chip 乐观高亮随本次 patch 回滚（原只回滚 flags，chip 保持
-      // 高亮但后端未落库，展示与实际状态分叉）；scopeSeqRef 序号门控防止慢败
-      // 回滚覆盖其后已成功的乐观 set（审查修复）
-      if (next.buddyAiGroupIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolGroupScope(prevGroups);
-      if (next.buddyAiTagIds !== undefined && scopeSeqRef.current === seqAtCall) setPoolTagScope(prevTags);
       return false;
     } finally {
       if (seq === saveSeqRef.current) setSaving(false);
@@ -300,14 +252,14 @@ export default function BuddyAiApiService() {
         buddy_ai_catalog_sync_enabled: next.enabled,
         buddy_ai_catalog_sync_hhmm: next.hhmm || '05:55',
       });
-      // 写操作成功可见反馈（M10a，审查 L27）：原只有失败 toast；文案含触发时刻
+      await useAppStore.getState().refreshSettings().catch(() => {
+        /* 全局设置快照刷新失败不阻塞本地保存结果，下次刷新自愈 */
+      });
+      // 审查修复（L27）：保存成功补反馈，文案含触发时刻
       pushToast(
         'success',
         next.enabled ? `每日定时同步已保存（每天 ${next.hhmm || '05:55'} 触发）` : '每日定时同步已关闭',
       );
-      await useAppStore.getState().refreshSettings().catch(() => {
-        /* 全局设置快照刷新失败不阻塞本地保存结果，下次刷新自愈 */
-      });
     } catch (err) {
       pushToast('error', `保存定时同步配置失败：${String(err).slice(0, 120)}`);
     }
@@ -468,13 +420,11 @@ export default function BuddyAiApiService() {
                           const next = active
                             ? poolGroupScope.filter((x) => x !== g.id)
                             : [...poolGroupScope, g.id];
-                          // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
-                          // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
+                          // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
                           const prev = poolGroupScope;
-                          const mySeq = ++scopeSeqRef.current;
                           setPoolGroupScope(next);
                           void saveFlags({ ...flags, buddyAiGroupIds: next }).then((ok) => {
-                            if (!ok && scopeSeqRef.current === mySeq) setPoolGroupScope(prev);
+                            if (!ok) setPoolGroupScope(prev);
                           });
                         }}
                       >
@@ -486,13 +436,11 @@ export default function BuddyAiApiService() {
                     <button
                       className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                       onClick={() => {
-                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
-                        // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
                         const prev = poolGroupScope;
-                        const mySeq = ++scopeSeqRef.current;
                         setPoolGroupScope([]);
                         void saveFlags({ ...flags, buddyAiGroupIds: [] }).then((ok) => {
-                          if (!ok && scopeSeqRef.current === mySeq) setPoolGroupScope(prev);
+                          if (!ok) setPoolGroupScope(prev);
                         });
                       }}
                     >
@@ -520,13 +468,11 @@ export default function BuddyAiApiService() {
                             const next = active
                               ? poolTagScope.filter((x) => x !== t.id)
                               : [...poolTagScope, t.id];
-                            // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
-                            // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
+                            // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
                             const prev = poolTagScope;
-                            const mySeq = ++scopeSeqRef.current;
                             setPoolTagScope(next);
                             void saveFlags({ ...flags, buddyAiTagIds: next }).then((ok) => {
-                              if (!ok && scopeSeqRef.current === mySeq) setPoolTagScope(prev);
+                              if (!ok) setPoolTagScope(prev);
                             });
                           }}
                         >
@@ -538,13 +484,11 @@ export default function BuddyAiApiService() {
                       <button
                         className="btn-ghost px-1.5 py-0.5 text-[11px] text-slate-400"
                         onClick={() => {
-                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮；
-                        // 序号门控防止慢败回滚覆盖其后已成功的乐观 set
+                        // 审查修复（L28）：调用前捕获快照，保存失败按 patch 回滚乐观高亮
                         const prev = poolTagScope;
-                        const mySeq = ++scopeSeqRef.current;
                         setPoolTagScope([]);
                         void saveFlags({ ...flags, buddyAiTagIds: [] }).then((ok) => {
-                          if (!ok && scopeSeqRef.current === mySeq) setPoolTagScope(prev);
+                          if (!ok) setPoolTagScope(prev);
                         });
                       }}
                       >
@@ -691,7 +635,7 @@ export default function BuddyAiApiService() {
                       value: poolTtl,
                       setValue: setPoolTtl,
                       // 审查修复（L29）：原文案「60s–24h」与输入框 min=0 矛盾，改为对齐 0 值语义
-                      desc: '0 = 关闭池粘性；否则 TTL 内同会话路由同一账号（上游 KV cache 复用），有效范围 60–86400 秒',
+                      desc: 'TTL 内同会话路由同一账号（上游 KV cache 复用）；0 = 关闭；60–86400 秒',
                       save: (v: number) => ({ buddyAiPoolStickyTtlSecs: v }),
                     },
                     {
@@ -836,7 +780,7 @@ export default function BuddyAiApiService() {
                         {vendorMap.get(m.id) || inferVendor(m.id) || '—'}
                       </td>
                       <td className="py-2 pr-3 text-xs tabular-nums text-amber-600 dark:text-amber-400">
-                        {m.rate != null ? m.rate.toFixed(2) : '—'}
+                        {m.rate.toFixed(2)}
                       </td>
                       <td className="py-2 pr-3 text-xs text-slate-500">
                         {m.supported_efforts?.length ? m.supported_efforts.join(' / ') : '—'}

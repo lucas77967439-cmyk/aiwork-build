@@ -339,11 +339,10 @@ fn merge_static_fallback(models: Vec<WbModel>) -> Vec<WbModel> {
                 m.effort_override = b.and_then(|b| b.effort_override.clone());
             }
             if m.rate.is_nan() {
-                // 审查修复（M2/M5 防假定价）：NaN 哨兵=元数据缺失，仅在内置表
-                // 命中时继承内置倍率；未命中保留哨兵不强转 1.0——占位值会被
-                // unified_catalog rate_of 的 is_finite() 放行成假定价（既有缺陷
-                // 即在此处强转后 is_finite() 放行）；NaN 序列化为 null，
-                // 前端目录表按「—」显示
+                // 审查修复（M5）：NaN 哨兵=元数据缺失，仅在内置表命中时继承内置
+                // 倍率；未命中保留哨兵不强转 1.0——unified_catalog rate_of 的
+                // is_finite() 检查会把 NaN 挡为 None，强转 1.0 则绕过该防线放行
+                // 假定价（既有缺陷即在此处强转后 is_finite() 放行）
                 if let Some(b) = b {
                     m.rate = b.rate;
                 }
@@ -1089,8 +1088,7 @@ mod tests {
 
     /// 元数据缺失兜底（data.models 未覆盖 / 旧形态纯 id 清单）：
     /// 内置表命中 → 继承 display/rate/上下文；未命中 → 保留 NaN 哨兵
-    ///（审查 M2/M5 防假定价：不再 1.0 占位——占位值会被 unified_catalog
-    /// rate_of 的 is_finite() 放行成假定价；NaN 序列化为 null，前端按「—」显示）
+    /// （M5 防假定价：unified_catalog rate_of 的 is_finite() 保持 None）
     #[test]
     fn parse_v3_config_static_fallback_for_missing_metadata() {
         let body: Value = serde_json::json!({
@@ -1108,7 +1106,7 @@ mod tests {
         assert_eq!(ds.display, "DeepSeek V4.1 Flash", "内置表继承 display");
         let k3 = m.iter().find(|x| x.id == "brand-new-model").unwrap();
         assert_eq!(k3.display, "brand-new-model");
-        assert!(k3.rate.is_nan(), "未命中内置表 → 保留 NaN 哨兵（M2/M5 防假定价）");
+        assert!(k3.rate.is_nan(), "未命中内置表 → 保留 NaN 哨兵（M5 防假定价）");
     }
 
     #[test]

@@ -41,14 +41,10 @@ export default function ToolAliasPanel() {
   // 「恢复内置默认」两段式确认（同指纹清洗面板内联模式）
   const [confirmReset, setConfirmReset] = useState(false);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 规则行删除两段式确认（3.8.5 审查 L5）：按行 key 定位，计时器独立于恢复默认
-  const [confirmDeleteKey, setConfirmDeleteKey] = useState<number | null>(null);
-  const deleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
     () => () => {
       if (confirmTimer.current) clearTimeout(confirmTimer.current);
-      if (deleteTimer.current) clearTimeout(deleteTimer.current);
     },
     [],
   );
@@ -162,8 +158,8 @@ export default function ToolAliasPanel() {
             仅收特定客户端独家命名，glob/grep 等通用名不改。规则为逐字精确匹配（无正则）；
             别名必须非空且请求/响应双向一致，不支持留空剥离与多候选；别名不得与请求中
             其他真实工具名重名（重名时该规则自动跳过、原名透传）。生效面：Trae 池
-            （SOLO 管线）与 Qoder 池（issue #158，受「指纹清洗」tab 池级开关门控，
-            默认开）；WB 池未接入。规则表为增量覆盖：
+            （SOLO 管线）、Qoder 池（issue #158）与 WB 族池（Buddy CN / BuddyAI Intl），
+            三者均受「指纹清洗」tab 对应池级开关门控（默认开）。规则表为增量覆盖：
             内置默认表始终生效，此处可覆盖、追加或停用（停用 = 原名透传）。保存即对下一条请求生效，
             无需重启网关；
             {builtin ? '当前生效内置默认表，保存后成为自定义覆盖副本。' : '当前为自定义覆盖副本（默认表仍在其下生效）。'}
@@ -245,23 +241,10 @@ export default function ToolAliasPanel() {
                 停用
               </label>
               <button
-                onClick={() => {
-                  if (deleteTimer.current) clearTimeout(deleteTimer.current);
-                  if (confirmDeleteKey === key) {
-                    deleteTimer.current = null;
-                    setConfirmDeleteKey(null);
-                    setRows((rs) => rs.filter((row) => row.key !== key));
-                  } else {
-                    setConfirmDeleteKey(key);
-                    deleteTimer.current = setTimeout(() => {
-                      setConfirmDeleteKey(null);
-                      deleteTimer.current = null;
-                    }, 3000);
-                  }
-                }}
+                onClick={() => setRows((rs) => rs.filter((_, k) => k !== i))}
                 className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
               >
-                {confirmDeleteKey === key ? '确认删除？' : '删除'}
+                删除
               </button>
             </div>
           );

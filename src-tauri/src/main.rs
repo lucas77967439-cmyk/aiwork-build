@@ -4,13 +4,13 @@
 mod commands;
 mod checkin_results;
 mod device_proxy;
+mod doubao_checkin_results;
 mod events;
 mod fs_utils;
 mod icube_auth;
 mod jwt;
 mod models;
 mod notify;
-mod platform;
 mod pe_version;
 mod state;
 mod store;
@@ -54,8 +54,155 @@ fn hide_main_window(app: &tauri::AppHandle) -> bool {
     }
 }
 
+/// 窗口几何失效判定阈值（issue #183）：与任一显示器工作区的交叠区域宽高均不足
+/// 150 物理像素即视为不可用——涵盖「窗口整体落在已断开的显示器坐标上」
+/// 和「仅露出一条边」（任务栏缩略图呈一条线）两种休眠唤醒后的典型损坏形态
+const MIN_VISIBLE_PX: i32 = 150;
+
+/// 尺寸退化判定阈值（物理像素）：正常 resize 受 minWidth/minHeight（960x600 逻辑）
+/// 约束，物理宽高不可能低于此值；低于即视为几何损坏
+const MIN_SIZE_PX: u32 = 200;
+
+/// 显示器几何快照（物理像素）：纯数据结构便于单测（tauri::Monitor 无法在测试中构造）
+struct MonitorGeom {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    scale: f64,
+}
+
+impl MonitorGeom {
+    fn from_monitor(m: &tauri::Monitor) -> Self {
+        let wa = m.work_area();
+        Self {
+            x: wa.position.x,
+            y: wa.position.y,
+            w: wa.size.width as i32,
+            h: wa.size.height as i32,
+            scale: m.scale_factor(),
+        }
+    }
+}
+
+/// 窗口矩形与显示器工作区矩形的交叠宽高（无交叠时对应维为负值）
+fn overlap_dims(wx: i32, wy: i32, ww: i32, wh: i32, m: &MonitorGeom) -> (i32, i32) {
+    (
+        (wx + ww).min(m.x + m.w) - wx.max(m.x),
+        (wy + wh).min(m.y + m.h) - wy.max(m.y),
+    )
+}
+
+/// 几何有效性纯判定：尺寸非退化，且与任一显示器工作区交叠宽高均 ≥ MIN_VISIBLE_PX
+fn geometry_valid(wx: i32, wy: i32, ww: i32, wh: i32, monitors: &[MonitorGeom]) -> bool {
+    if ww < MIN_SIZE_PX as i32 || wh < MIN_SIZE_PX as i32 {
+        return false;
+    }
+    monitors.iter().any(|m| {
+        let (dw, dh) = overlap_dims(wx, wy, ww, wh, m);
+        dw >= MIN_VISIBLE_PX && dh >= MIN_VISIBLE_PX
+    })
+}
+
+/// 校验窗口几何是否有效：尺寸非退化，且与任一显示器工作区有足够交叠。
+/// 枚举显示器失败时不误伤（返回 true），交由原有的最大化重建逻辑兜底。
+fn window_geometry_valid(window: &tauri::WebviewWindow) -> bool {
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    if size.width < MIN_SIZE_PX || size.height < MIN_SIZE_PX {
+        return false;
+    }
+    let Ok(monitors) = window.available_monitors() else {
+        return true;
+    };
+    if monitors.is_empty() {
+        return true;
+    }
+    let geoms: Vec<MonitorGeom> = monitors.iter().map(MonitorGeom::from_monitor).collect();
+    geometry_valid(pos.x, pos.y, size.width as i32, size.height as i32, &geoms)
+}
+
+/// 几何失效后的修复（issue #183，审查问题 1/2/3）：保留用户尺寸，仅把窗口
+/// 平移回「交叠面积最大（无交叠时中心距离最近）」的显示器工作区内并钳制可见；
+/// 尺寸退化（一条线）时才按目标显示器 DPI 重置默认尺寸。全程物理坐标，
+/// 无跨 DPI 换算不一致；工作区对齐 Tauri 启动居中行为（不遮挡任务栏）。
+/// 目标显示器纯选择：交叠面积最大者；全部无交叠（如窗口挂在已断开的显示器上）
+/// 时取中心距离最近者（调用方保证 monitors 非空）
+fn pick_best_monitor<'a>(
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    monitors: &'a [MonitorGeom],
+) -> &'a MonitorGeom {
+    monitors
+        .iter()
+        .max_by_key(|m| {
+            let (dw, dh) = overlap_dims(wx, wy, ww, wh, m);
+            let area = (dw.max(0) as i64) * (dh.max(0) as i64);
+            let (dx, dy) = (wx + ww / 2 - (m.x + m.w / 2), wy + wh / 2 - (m.y + m.h / 2));
+            let dist = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
+            (area, -dist)
+        })
+        .expect("调用方保证 monitors 非空")
+}
+
+/// 修复后几何纯计算（物理像素 x, y, w, h）：保留用户尺寸并钳制到工作区；
+/// 仅退化时按目标显示器 DPI 重置默认尺寸；nw ≤ mw 保证 clamp 区间合法
+fn repaired_geometry(
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    m: &MonitorGeom,
+) -> (i32, i32, u32, u32) {
+    let (nw, nh) = if ww < MIN_SIZE_PX as i32 || wh < MIN_SIZE_PX as i32 {
+        (
+            ((1180.0 * m.scale) as i32).min(m.w),
+            ((760.0 * m.scale) as i32).min(m.h),
+        )
+    } else {
+        (ww.min(m.w), wh.min(m.h))
+    };
+    // 位置：原坐标钳制进工作区，保留用户相对摆放
+    let x = wx.clamp(m.x, m.x + m.w - nw);
+    let y = wy.clamp(m.y, m.y + m.h - nh);
+    (x, y, nw as u32, nh as u32)
+}
+
+fn repair_window_geometry(window: &tauri::WebviewWindow) {
+    // API 失败（Windows 上实际不可达，tao 对 GetWindowRect 失败直接 panic）
+    // 时的最后兜底：默认尺寸 + 居中
+    let fallback = || {
+        let _ = window.set_size(tauri::LogicalSize::new(1180.0, 760.0));
+        let _ = window.center();
+    };
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        fallback();
+        return;
+    };
+    let Ok(monitors) = window.available_monitors() else {
+        fallback();
+        return;
+    };
+    if monitors.is_empty() {
+        fallback();
+        return;
+    }
+    let geoms: Vec<MonitorGeom> = monitors.iter().map(MonitorGeom::from_monitor).collect();
+    let (wx, wy, ww, wh) = (pos.x, pos.y, size.width as i32, size.height as i32);
+    let best = pick_best_monitor(wx, wy, ww, wh, &geoms);
+    let (x, y, nw, nh) = repaired_geometry(wx, wy, ww, wh, best);
+    let _ = window.set_size(tauri::PhysicalSize::new(nw, nh));
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
 /// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则强制
 /// unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
+/// show 前校验窗口几何，失效（休眠唤醒/显示器变更后落到屏外或尺寸退化）则
+/// 平移回最近显示器工作区并保留用户尺寸（issue #183：表现为任务栏有图标但
+/// 主页面无法显示、缩略图只有一条线）。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let was_maximized = app
@@ -63,6 +210,16 @@ fn show_main_window(app: &tauri::AppHandle) {
             .map(|f| f.0.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(false);
         let _ = window.unminimize();
+        if !window_geometry_valid(&window) {
+            if let Some(st) = app.try_state::<AppState>() {
+                fs_utils::app_log(
+                    &st.data_dir,
+                    "显示主窗口：检测到窗口几何失效（疑似休眠唤醒/显示器变更），已平移回最近显示器工作区",
+                );
+            }
+            let _ = window.unmaximize();
+            repair_window_geometry(&window);
+        }
         let _ = window.show();
         let _ = window.set_focus();
         if was_maximized {
@@ -99,24 +256,18 @@ fn main() {
     }
 
     // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
-    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过。
-    // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
-    // 也不会空跑注定失败的 cmd 子进程）
-    if cfg!(windows) {
-        if let Some(note) = commands::misc::try_migrate_legacy_task() {
-            fs_utils::app_log(&state.data_dir, &note);
-        }
+    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
+    if let Some(note) = commands::misc::try_migrate_legacy_task() {
+        fs_utils::app_log(&state.data_dir, &note);
     }
     // 计划任务 /TR 现代化迁移（issue #112）：历史 `cmd /c set … &&` 包裹与豆包 .cmd
     // 启动器在 Task Scheduler 触发时必弹黑框（cmd.exe 是控制台程序），后台线程一次性
     // 重建为主 exe 直调（GUI 子系统，无控制台）。部分失败不置位完成标记，下次启动重试。
     // 后台执行：任务枚举 + 逐任务 XML 查询可达数秒，不阻塞启动（取代原 PS 桥启动器迁移）。
-    // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
-    // 也不会每启动空跑注定失败的 cmd 子进程——该路径无完成标记可提前短路）。
-    // 先延迟 120s 再扫描（合并 origin/main #137 修复）：迁移链路会 spawn cmd/schtasks
-    // 控制台程序，开机自启登录早期 spawn 控制台程序可能撞系统初始化窗口期报
-    // 0xc0000142；迁移有一次性完成标记兜底，失败不置位、下次启动自动重试，故延迟无功能损害
-    if cfg!(windows) {
+    // 先延迟 120s 再扫描：迁移链路会 spawn cmd/schtasks 控制台程序，开机自启登录早期
+    // spawn 控制台程序可能撞系统初始化窗口期报 0xc0000142（issue #137 同类风险）；
+    // 迁移有一次性完成标记兜底，失败不置位、下次启动自动重试，故延迟无功能损害
+    {
         let data_dir = state.data_dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(120));
@@ -155,11 +306,9 @@ fn main() {
         ))
         .manage(state)
         .manage(MainWindowMaximized(std::sync::atomic::AtomicBool::new(false)))
-        .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
-            commands::env::platform_info,
             commands::env::app_locate,
             commands::env::open_doubao_app,
             commands::env::open_trae_website,
@@ -321,6 +470,12 @@ fn main() {
             commands::doubao::doubao_quota_task_register,
             commands::doubao::doubao_quota_task_status,
             commands::doubao::doubao_quota_task_unregister,
+            commands::doubao::doubao_checkin_run,
+            commands::doubao::doubao_dashboard_stats,
+            commands::doubao::doubao_checkin_results_detail,
+            commands::doubao::doubao_checkin_task_register,
+            commands::doubao::doubao_checkin_task_status,
+            commands::doubao::doubao_checkin_task_unregister,
             commands::doubao::doubao_open_as_account,
             commands::doubao::doubao_snapshot_meta,
             commands::doubao::doubao_chatdata_backup,
@@ -343,8 +498,6 @@ fn main() {
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
-            commands::updater::update_restart_app,
-            commands::updater::update_quit_app,
             commands::workbuddy::workbuddy_env_check,
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,
@@ -456,39 +609,6 @@ fn main() {
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
-            // F-75：macOS 无边框窗口（decorations:false，前端自绘标题栏）下 tauri.conf
-            // 的 "maximized": true 不生效（Tauri v2 已知缺陷：borderless 样式忽略
-            // maximize），窗口退回 1180×760 原始尺寸显得过大。此处按所在屏幕手动
-            // 铺满可视区（下移菜单栏高度，避免自绘标题栏被系统菜单栏遮挡）；
-            // Windows 走 conf 原生最大化，不受本段影响（行为零变化）。
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(win) = app.get_webview_window("main") {
-                    let monitor = win
-                        .current_monitor()
-                        .ok()
-                        .flatten()
-                        .or_else(|| win.primary_monitor().ok().flatten());
-                    if let Some(monitor) = monitor {
-                        let mpos = monitor.position();
-                        let msize = monitor.size();
-                        let scale = monitor.scale_factor();
-                        // 菜单栏高度经验值 ~25 逻辑 px（Retina/普通屏通用近似）
-                        let menu_h = (25.0 * scale) as i32;
-                        let _ = win.hide();
-                        let _ = win.set_position(tauri::PhysicalPosition::new(
-                            mpos.x,
-                            mpos.y + menu_h,
-                        ));
-                        let _ = win.set_size(tauri::PhysicalSize::new(
-                            msize.width,
-                            msize.height - menu_h as u32,
-                        ));
-                        let _ = win.show();
-                    }
-                }
-            }
-
             let state = app.state::<AppState>();
 
             // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
@@ -534,15 +654,15 @@ fn main() {
 
             // P2（审查）：调度按 chrono::Local 触发，生效时区不可观测——TZ 被
             // 覆盖/清空时签到时刻会静默偏移，启动日志输出生效时区偏移与本地时间
-            let now = chrono::Local::now();
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
                     "生效时区: 偏移{}，本地时间 {}",
-                    now.format("%:z"),
-                    now.format("%Y-%m-%d %H:%M:%S")
+                    chrono::Local::now().format("%:z"),
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                 ),
             );
+
             // issue #46：配置已声明 maximized:true，此处程序化最大化做兜底——
             // 若创建期最大化未生效或状态失同步，启动时强制重建一次
             if let Some(window) = app.get_webview_window("main") {
@@ -683,25 +803,17 @@ fn main() {
                             "proxy-toggle" => {
                                 // 托盘启停代理：与前端共用 proxy_start/proxy_stop 命令
                                 //（菜单文本由 proxy.rs 内 sync_tray_proxy_text 统一同步，覆盖托盘/前端/自动启动三条路径）
-                                let running = app
-                                    .state::<Mutex<Option<commands::proxy::ProxyHandle>>>()
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .is_some();
+                                let running = commands::proxy::proxy_is_running();
                                 let result = if running {
                                     let st = app.state::<AppState>();
-                                    let ps =
-                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-                                    commands::proxy::proxy_stop(app.clone(), st, ps).map(|_| ())
+                                    commands::proxy::proxy_stop(app.clone(), st).map(|_| ())
                                 } else {
                                     let port = app.state::<AppState>().settings().proxy_port;
                                     let st = app.state::<AppState>();
-                                    let ps =
-                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
                                     // P4 Rust 化：proxy_start 已是异步命令（进程内代理启动含异步绑定），
                                     // 托盘回调运行在主线程，用 block_on 等待（与 API 服务托盘同款模式）
                                     tauri::async_runtime::block_on(commands::proxy::proxy_start(
-                                        app.clone(), st, ps, port,
+                                        app.clone(), st, port,
                                     ))
                                     .map(|_| ())
                                 };
@@ -850,8 +962,7 @@ fn main() {
         if let tauri::RunEvent::Exit = event {
             // 应用退出时停止进程内代理（P4 Rust 化），防止端口占用
             commands::proxy::mark_intentional_stop();
-            let proxy_state = app_handle.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-            let mut g = proxy_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = commands::proxy::proxy_handle_lock();
             let mut proxy_was_running = false;
             if let Some(h) = g.take() {
                 proxy_was_running = true;
@@ -890,18 +1001,75 @@ fn main() {
                 std::process::exit(0);
             });
         }
-        // F-75：mac 点击 Dock 图标重新打开（Reopen 变体带 #[cfg(target_os = "macos")]，
-        // Windows 编译不存在该变体，匹配须整体门控）。无边框窗口（decorations:false）
-        // 最小化后，macOS 不会自动恢复窗口——手动 unminimize + show + 置前聚焦。
-        #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
-            if !has_visible_windows {
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
-        }
     });
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn mon(x: i32, y: i32, w: i32, h: i32) -> MonitorGeom {
+        MonitorGeom {
+            x,
+            y,
+            w,
+            h,
+            scale: 1.0,
+        }
+    }
+
+    /// issue #183：正常窗口（完全落在工作区内 / 跨屏两侧均有足够交叠）不误判
+    #[test]
+    fn valid_window_not_misjudged() {
+        let monitors = vec![mon(0, 0, 1920, 1040), mon(1920, 0, 1920, 1040)];
+        assert!(geometry_valid(100, 100, 1280, 800, &monitors));
+        // 跨屏窗口：对主屏交叠恰为 150px（阈值边界含等号）
+        assert!(geometry_valid(1770, 100, 300, 800, &monitors));
+    }
+
+    /// issue #183：整窗挂在已断开的显示器坐标上 → 无足够交叠 → 失效；
+    /// 仅露出一条边（< 150px，任务栏缩略图一条线形态）同样失效
+    #[test]
+    fn offscreen_or_sliver_window_invalid() {
+        let monitors = vec![mon(0, 0, 1920, 1040)];
+        assert!(!geometry_valid(-4000, 0, 1280, 800, &monitors));
+        assert!(!geometry_valid(1910, 100, 1280, 800, &monitors));
+    }
+
+    /// 退化尺寸（一条线窗口）直接判失效，与位置无关
+    #[test]
+    fn degenerate_size_invalid_even_on_screen() {
+        let monitors = vec![mon(0, 0, 1920, 1040)];
+        assert!(!geometry_valid(100, 100, 120, 800, &monitors));
+        assert!(!geometry_valid(100, 100, 1280, 5, &monitors));
+    }
+
+    /// 修复目标显示器：有交叠 → 面积最大者；全部无交叠 → 中心距离最近者
+    #[test]
+    fn best_monitor_by_overlap_then_distance() {
+        let monitors = vec![mon(0, 0, 1920, 1040), mon(1920, 0, 1920, 1040)];
+        // 窗口整体在双屏之外右侧：无交叠 → 距中心更近的副屏
+        assert_eq!(pick_best_monitor(4000, 100, 800, 600, &monitors).x, 1920);
+        // 跨屏窗口：主屏交叠 220px > 副屏 80px → 主屏
+        assert_eq!(pick_best_monitor(1700, 100, 300, 600, &monitors).x, 0);
+    }
+
+    /// 修复几何：屏外窗口仅平移保留用户尺寸；超大窗口钳制到工作区；
+    /// 退化尺寸按目标显示器 DPI 重置默认尺寸并钳制
+    #[test]
+    fn repaired_geometry_clamps_into_work_area() {
+        let m = mon(0, 0, 1920, 1040);
+        // 屏外窗口：仅平移回工作区原点，尺寸原样保留
+        assert_eq!(repaired_geometry(-4000, -3000, 1280, 800, &m), (0, 0, 1280, 800));
+        // 超大窗口：尺寸钳制到工作区，位置钳到原点（nw == mw 时 clamp 区间收缩为单点，合法）
+        assert_eq!(repaired_geometry(-500, -500, 4000, 3000, &m), (0, 0, 1920, 1040));
+        // 退化尺寸：1180*1.5=1770 > 1360 → 按工作区钳制；760*1.5=1140 > 768 同理
+        let hidpi = MonitorGeom {
+            scale: 1.5,
+            ..mon(0, 0, 1360, 768)
+        };
+        assert_eq!(repaired_geometry(100, 100, 100, 800, &hidpi), (0, 0, 1360, 768));
+        // 未越界窗口不改变位置（保留用户相对摆放）
+        assert_eq!(repaired_geometry(300, 200, 1280, 800, &m), (300, 200, 1280, 800));
+    }
 }

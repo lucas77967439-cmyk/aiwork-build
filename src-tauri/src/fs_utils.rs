@@ -1,7 +1,7 @@
 //! 文件读写工具：原子替换 + 容错加载 + 时间辅助。
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 读取 JSON，文件不存在或解析失败返回默认值。
 /// P1（审查）：解析前剥 UTF-8 BOM（Windows 记事本编辑过的配置带 EF BB BF 前缀，
@@ -27,14 +27,13 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 /// 无 data_dir 入参场景的兜底 app_log：fs_utils 多数调用方只持文件路径，按
-/// state.rs 同源规则（platform::app_support_root：Windows=%APPDATA%、macOS=
-/// $HOME/Library/Application Support）定位数据目录；定位失败或写日志失败均
-/// 静默放弃（日志失败不影响读取主流程）。
-/// 审查修复（main 侧并入）：改为公开，供无 data_dir 上下文的一次性降级观测
+/// state.rs 同源规则（%APPDATA%\AIWorkAssistant）定位数据目录；解析失败静默
+/// 放弃（日志失败不影响读取主流程）。
+/// 审查修复：改为公开，供无 data_dir 上下文的一次性降级观测
 /// （如 Qoder 原生风控身份解析失败时落 app.log）。
 pub fn app_log_default(msg: &str) {
-    if let Ok(root) = crate::platform::app_support_root() {
-        app_log(&root.join(crate::state::DATA_DIR_NAME), msg);
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        app_log(&PathBuf::from(appdata).join(crate::state::DATA_DIR_NAME), msg);
     }
 }
 
@@ -297,23 +296,6 @@ fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a 
             .find_map(|item| dig_key(item, key, depth + 1)),
         _ => None,
     }
-}
-
-/// 生成并行测试专用的唯一临时目录（仅测试可用）：`<temp>/<tag>_<pid>_<自增序号>`。
-///
-/// 唯一性必须用进程内原子计数器保证，不依赖系统时钟——macOS 实时时钟粒度约
-/// 1µs，cargo 并行测试在同一微秒窗口内各自建 fixture 时会得到同名目录（同
-/// pid），共享同一 SQLite 后 kv 种子互相覆盖，偶发断言失败（CI 实录：
-/// unified_catalog t02 读到 t03 的种子 → len 3≠1）。
-#[cfg(test)]
-pub fn test_temp_dir(tag: &str) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "{tag}_{}_{}",
-        std::process::id(),
-        n
-    ))
 }
 
 #[cfg(test)]

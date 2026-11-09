@@ -33,6 +33,8 @@ import { copyText } from '../lib/clipboard';
 import type { AccountView, DiscoveredAccount, ImportPreview, TagView } from '../types';
 import { AddAccountModal } from './accounts/AddAccountModal';
 import { CooldownBadge } from './accounts/CooldownBadge';
+import { PoolStatusBadge } from './accounts/PoolStatusBadge';
+import { usePoolStatus } from '../hooks/usePoolStatus';
 import { CreditCell } from './accounts/CreditCell';
 import { CreditsExpireBadge } from './accounts/CreditsExpireBadge';
 import { DeleteAccountConfirmModal, DeleteSlotConfirmModal } from './accounts/DeleteConfirmModals';
@@ -83,6 +85,8 @@ export default function Accounts() {
   const profileDelete = useAppStore((s) => s.profileDelete);
   const oauthLogin = useAppStore((s) => s.oauthLogin);
   const refreshProfiles = useAppStore((s) => s.refreshProfiles);
+  // 运行期限流/冷却徽标（issue #178）：429 软冷却/积分耗尽硬冷却只在网关内存池，联表注入
+  const poolStatus = usePoolStatus('trae');
 
   const [filter, setFilter] = useState<string>('all');
   const [addOpen, setAddOpen] = useState(false);
@@ -592,11 +596,15 @@ export default function Accounts() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      {a.cooldown_type ? (
-                        <CooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
-                      ) : (
-                        <span className="text-xs text-slate-300">-</span>
-                      )}
+                      <div className="flex flex-wrap items-center gap-1">
+                        {a.cooldown_type ? (
+                          <CooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
+                        ) : (
+                          <span className="text-xs text-slate-300">-</span>
+                        )}
+                        {/* 运行期限流/冷却（issue #178）：与持久表签到冷却并存，无则不渲染 */}
+                        <PoolStatusBadge status={poolStatus.get(a.user_id)} />
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-right">
                       <CreditCell account={a} />
@@ -625,10 +633,9 @@ export default function Accounts() {
                         >
                           {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                         </button>
-                        {/* SessionDead（JWT 被服务端吊销）/AuthRejected（服务端拒绝认证，
-                            issue #128）时 exp 往往未到，必须常显续期入口，否则与签到/
-                            切换失败的「点续期 JWT」指引断链（issue #9 审查项 + #128 审查修复） */}
-                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead' || a.cooldown_type === 'AuthRejected') && (
+                        {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
+                            否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
+                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
                           <button
                             /* issue #126 语义澄清：本按钮是「被动捕获」，依赖 TRAE 重新鉴权才有新 JWT */
                             title={
@@ -657,13 +664,10 @@ export default function Accounts() {
                         )}
                         {/* 重新 OAuth 登录：无 refresh_token / RT 失效 / RT 已过期
                             的账号无法自动续期，定向重新授权更新凭证（后端按 uid 校验防登错）。
-                            AuthRejected（issue #128，审查修复）常显：恢复指引要求重新 OAuth，
-                            而该类账号 RT 往往仍有效，无此入口则指引断链。
                             地球图标语义=打开浏览器授权；sky 配色在全部 6 个主题（含暗夜紫/
                             琥珀暖夜）上均有足够对比 */}
                         {(!a.has_refresh_token ||
                           a.refresh_token_invalid ||
-                          a.cooldown_type === 'AuthRejected' ||
                           (a.refresh_token_expires_at != null &&
                             a.refresh_token_expires_at > 0 &&
                             a.refresh_token_expires_at <= Math.floor(Date.now() / 1000))) && (

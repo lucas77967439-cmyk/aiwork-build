@@ -4,6 +4,8 @@ import {
   Users,
   PlayCircle,
   Coins,
+  CalendarCheck,
+  TrendingUp,
   Settings,
   Server,
   KeyRound,
@@ -36,10 +38,12 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'settings', label: '环境配置', icon: Settings },
 ];
 
-/** 豆包应用菜单（doubao-trae-switch-plan.md：概述 / 账号管理 / 环境配置） */
+/** 豆包应用菜单：概述 / 账号管理 / 一键签到 / 额度看板 / 环境配置 */
 const DOUBAO_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'doubao-overview', label: '概述', icon: LayoutDashboard },
   { key: 'doubao-accounts', label: '账号管理', icon: Users },
+  { key: 'doubao-checkin', label: '一键签到', icon: CalendarCheck },
+  { key: 'doubao-quota', label: '额度看板', icon: TrendingUp },
   { key: 'doubao-settings', label: '环境配置', icon: Settings },
 ];
 
@@ -145,8 +149,7 @@ export default function Sidebar({
     if (!settings) return;
     const next = nextTheme(settings.theme);
     try {
-      // Low 修复（patch 纪律，审查 L34）：只发主题字段——saveSettings 即 patch 语义，
-      // 原整份 settings 快照回传，会用陈旧快照静默覆盖面板打开期间他端已落库的其他设置
+      // 审查修复（L34）：saveSettings 即 patch 语义，只提交 theme 字段，不回传整份 settings 快照（patch 纪律）
       await saveSettings({ theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
     } catch {

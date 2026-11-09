@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
-  Users,
   UserPlus,
   RefreshCw,
   LogIn,
   Rocket,
   Timer,
   Coins,
+  CalendarCheck,
   Save,
   Pencil,
   Trash2,
@@ -16,6 +16,9 @@ import {
   DatabaseBackup,
   ArchiveRestore,
   Download,
+  Tags,
+  FolderCog,
+  Loader2,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SwitchProgressPanel from '../../components/SwitchProgressPanel';
@@ -23,12 +26,18 @@ import { Badge, Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
+import { GroupSelect } from '../accounts/GroupSelect';
+import { GroupsModal } from '../accounts/GroupsModal';
+import { TagChips } from '../accounts/TagSelect';
+import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
 import type {
   DoubaoAccountView,
   DoubaoChatdataInfo,
   DoubaoQuotaResult,
   DoubaoRenewSummary,
   DoubaoSnapshotMeta,
+  GroupView,
+  TagView,
 } from '../../types';
 
 function fmtSize(bytes: number): string {
@@ -55,12 +64,6 @@ export default function DoubaoAccounts() {
   const switchingTo = useAppStore((s) => s.switchingTo);
   const savingLogin = useAppStore((s) => s.savingLogin);
   const proxy = useAppStore((s) => s.proxy);
-  const platform = useAppStore((s) => s.platform);
-  /** uid 自动探测来源文件提示（后端 commands/doubao.rs::detect_uid_from_public_config 按平台解析 Doubao 数据根） */
-  const publicConfigHint =
-    platform === 'macos'
-      ? '~/Library/Application Support/Doubao/public_config.json'
-      : '%APPDATA%\\Doubao\\public_config.json';
 
   const [accounts, setAccounts] = useState<DoubaoAccountView[]>([]);
   const [snapshotMetas, setSnapshotMetas] = useState<Record<string, DoubaoSnapshotMeta | null>>({});
@@ -76,14 +79,26 @@ export default function DoubaoAccounts() {
   // done 事件异常缺失时解除按钮互斥并清空 store 进行中状态
   const [lockTimedOut, setLockTimedOut] = useState(false);
   const [keepaliveProgress, setKeepaliveProgress] = useState<string[]>([]);
-  const [quotaRunningFor, setQuotaRunningFor] = useState<string | null>(null);
+  // 额度查询：行级忙碌标记（按账号 uid 键控，函数式更新避免连续操作不同账号时互相覆盖忙碌态）
+  const [quotaRunningFor, setQuotaRunningFor] = useState<Record<string, boolean>>({});
   const [quotaResult, setQuotaResult] = useState<{ userId: string; result: DoubaoQuotaResult } | null>(null);
+  // 每日签到：行级签到忙碌标记（按账号 uid 键控，同上防互踩）
+  const [checkinRunningFor, setCheckinRunningFor] = useState<Record<string, boolean>>({});
+  // 分组/标签（共享分组体系 shg_*，标签 uid 跨池通用；对齐 Trae/BuddyAI 列表设计）
+  const [groups, setGroups] = useState<GroupView[]>([]);
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
+  const [chipFilter, setChipFilter] = useState('all');
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagEditTarget, setTagEditTarget] = useState<DoubaoAccountView | null>(null);
   // 保存当前登录态表单
   const [uidInput, setUidInput] = useState('');
   const [nameInput, setNameInput] = useState('');
   // 编辑别名/备注表单
   const [editName, setEditName] = useState('');
   const [editNote, setEditNote] = useState('');
+  const [editGroupId, setEditGroupId] = useState<string | null>(null);
   const [editSessionId, setEditSessionId] = useState('');
   const [editSidGuard, setEditSidGuard] = useState('');
   const [editTtwid, setEditTtwid] = useState('');
@@ -97,6 +112,10 @@ export default function DoubaoAccounts() {
   // 编辑弹框凭证回填：loading 态 + 请求序号守卫（快速切换账号时仅最后一次请求回填）
   const [credLoading, setCredLoading] = useState(false);
   const credReqRef = useRef(0);
+  // 凭证读取失败标记：失败时禁止提交，防止把回填失败的空凭证当"清空"上送（后端对空凭证为无条件清空语义）
+  const [credLoadFailed, setCredLoadFailed] = useState(false);
+  // 列表刷新请求序号守卫：并发触发（挂载/事件/20s 轮询/操作完成）时仅最新一次 reload 落盘，防旧响应覆盖新列表
+  const reloadSeqRef = useRef(0);
 
   /** 到期提醒：
    *  ① 池级保活：距 last_keepalive_at 超过 25 天（sid_guard 30 天滑动窗口临近耗尽）；
@@ -114,7 +133,13 @@ export default function DoubaoAccounts() {
     if (soon.length > 0) {
       pushToast('warn', `${soon.length} 个豆包账号会话 7 天内到期：${soon.map((a) => a.name).join('、')}`);
     }
-    const lastKa = list.find((a) => a.last_keepalive_at)?.last_keepalive_at;
+    // 保活是池级全局任务（对齐 Overview 口径）：取所有账号中最新一次保活时间，
+    // find 取首个非空值会被老账号滞留的旧时间戳误报「超 25 天未保活」
+    const lastKa = list
+      .map((a) => a.last_keepalive_at)
+      .filter((v): v is string => !!v)
+      .sort()
+      .pop();
     if (!lastKa && list.length > 0) {
       // 无记录不提醒（老数据/未注册任务）
       return;
@@ -128,9 +153,21 @@ export default function DoubaoAccounts() {
   };
 
   const reload = async (notifyExpiry = false) => {
+    // 请求序号守卫（仿 openEditDialog 的 credReqRef 模式）：旧响应到达时直接丢弃，不覆盖新一轮列表
+    const seq = ++reloadSeqRef.current;
     setLoading(true);
     try {
+      // 共享分组 + 标签（增强面：失败不阻塞账号列表，保留旧值）
+      void Promise.all([api.groups.sharedList(), api.tags.list(), api.tags.map()])
+        .then(([gs, tds, tm]) => {
+          if (seq !== reloadSeqRef.current) return;
+          setGroups(gs);
+          setTagDefs(tds);
+          setTagMap(tm);
+        })
+        .catch(() => undefined);
       const list = await api.doubao.accountsList();
+      if (seq !== reloadSeqRef.current) return;
       setAccounts(list);
       if (notifyExpiry) checkExpiry(list);
       // C3：加载快照版本元数据（有快照的账号并行读取本地 JSON，供快照列悬停展示）
@@ -145,6 +182,7 @@ export default function DoubaoAccounts() {
             }
           }),
         );
+        if (seq !== reloadSeqRef.current) return;
         setSnapshotMetas(Object.fromEntries(entries));
       } else {
         setSnapshotMetas({});
@@ -159,11 +197,14 @@ export default function DoubaoAccounts() {
           }
         }),
       );
+      if (seq !== reloadSeqRef.current) return;
       setChatdataInfos(Object.fromEntries(chatEntries));
     } catch (err) {
+      if (seq !== reloadSeqRef.current) return;
       pushToast('error', `读取豆包账号失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      // 过期请求不回落 loading：loading 归属最新一次 reload
+      if (seq === reloadSeqRef.current) setLoading(false);
     }
   };
 
@@ -232,15 +273,29 @@ export default function DoubaoAccounts() {
    *  结果缓存进账号池（后端回写），账号名后即显示会员/免费标识。
    *  查到额度窗口已用完时弹一次提醒（含重置时间）。 */
   const quotaAutoFetched = useRef(false);
+  // 组件级挂载守卫：仅卸载置 false（setup 复位 true，StrictMode 双跑安全）。
+  // 不用随 deps 变化的 effect cleanup（stopped 模式）——循环执行期间同页 20s 凭证
+  // 回写 / done 事件任一 reload 都会中止在途串行查询，且 quotaAutoFetched ref 阻止
+  // 补跑 → pending 账号本次会话漏查
+  const mountedRef = useRef(true);
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const runQuotaAutoFetch = () => {
     if (quotaAutoFetched.current || loading || accounts.length === 0) return;
     const pending = accounts.filter((a) => a.session_state !== 'none' && !a.quota_checked_at);
     quotaAutoFetched.current = true;
     if (pending.length === 0) return;
+    // 卸载守卫：只防组件卸载（mountedRef），同页 reload 不再误中止在途查询
     (async () => {
       for (const a of pending) {
+        if (!mountedRef.current) return;
         try {
           const r = await api.doubao.fetchQuota(a.user_id);
+          if (!mountedRef.current) return;
           const exhaustedWin = (r.parsed?.items ?? []).find(
             (it) => 'used_percent' in it && (it.exhausted || it.used_percent >= 100),
           );
@@ -251,12 +306,18 @@ export default function DoubaoAccounts() {
             );
           }
         } catch (err) {
+          if (!mountedRef.current) return;
           // 查询失败不再静默：提示原因（常见：凭证过期 710012001 / 接口未配置），下次进入页面会重试
           pushToast('warn', `账号 ${a.name} 额度自动查询失败：${String(err)}`);
         }
       }
+      if (!mountedRef.current) return;
       void reload();
     })();
+  };
+
+  useEffect(() => {
+    runQuotaAutoFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, loading]);
 
@@ -273,7 +334,7 @@ export default function DoubaoAccounts() {
     }
   };
 
-  /** 打开「保存当前登录态」弹框：自动探测当前登录 uid（Doubao 数据目录 public_config.json，平台路径见弹框文案）预填 */
+  /** 打开「保存当前登录态」弹框：自动探测当前登录 uid（%APPDATA%\Doubao\public_config.json）预填 */
   const openSaveLoginDialog = async () => {
     setUidInput('');
     setNameInput('');
@@ -305,14 +366,28 @@ export default function DoubaoAccounts() {
     });
   };
 
+  /** 行内改分组：doubao_account_save 仅传 groupId（name/note 不传 = 保持不变） */
+  const moveGroup = async (uid: string, gid: string | null) => {
+    try {
+      await api.doubao.accountSave(uid, undefined, undefined, gid);
+      setAccounts((prev) => prev.map((a) => (a.user_id === uid ? { ...a, group_id: gid } : a)));
+      pushToast('success', '分组已更新');
+    } catch (err) {
+      pushToast('error', `更新分组失败：${String(err)}`);
+    }
+  };
+
   /** 打开编辑弹框：凭证字段按需从后端取完整值回填（列表接口只回掩码值，不可直接当原文编辑） */
   const openEditDialog = (a: DoubaoAccountView) => {
     setEditName(a.name === a.user_id ? '' : a.name);
     setEditNote(a.note);
+    setEditGroupId(a.group_id);
     setEditSessionId('');
     setEditSidGuard('');
     setEditTtwid('');
     setDialog({ mode: 'edit', userId: a.user_id, name: a.name, note: a.note });
+    // 打开时重置读取失败标记（重新打开弹框会重新拉取凭证，恢复可保存）
+    setCredLoadFailed(false);
     const seq = ++credReqRef.current;
     setCredLoading(true);
     api.doubao
@@ -322,9 +397,11 @@ export default function DoubaoAccounts() {
         setEditSessionId(c.session_id ?? '');
         setEditSidGuard(c.sid_guard ?? '');
         setEditTtwid(c.ttwid ?? '');
+        setCredLoadFailed(false);
       })
       .catch((err) => {
         if (credReqRef.current !== seq) return;
+        setCredLoadFailed(true);
         pushToast('error', `读取会话凭证失败：${String(err)}`);
       })
       .finally(() => {
@@ -358,15 +435,26 @@ export default function DoubaoAccounts() {
 
   const submitEdit = async () => {
     if (!dialog || dialog.mode !== 'edit') return;
+    // 凭证回填进行中禁止提交：输入框尚未回填完整值，此时提交会把空串当"清空"上送
+    if (credLoading) return;
     try {
-      await api.doubao.accountSave(dialog.userId, editName.trim() || dialog.userId, editNote.trim());
-      // 凭证字段已回填现有值：修改即覆盖，清空后保存即删除凭证（ttwid 仅非空时更新，清空不影响）
-      await api.doubao.accountSetCredential(
+      // 分组：editGroupId 为 null（未分组）时传 '' 清空，非空串传 id；均与弹框选择一致
+      await api.doubao.accountSave(
         dialog.userId,
-        editSessionId.trim() || undefined,
-        editSidGuard.trim() || undefined,
-        editTtwid.trim() || undefined,
+        editName.trim() || dialog.userId,
+        editNote.trim(),
+        editGroupId ?? '',
       );
+      // 凭证读取失败时跳过凭证保存（防误清空），别名/备注/分组仍按上方 accountSave 路径照常保存
+      if (!credLoadFailed) {
+        // 凭证字段已回填现有值：修改即覆盖，清空后保存即删除凭证（ttwid 仅非空时更新，清空不影响）
+        await api.doubao.accountSetCredential(
+          dialog.userId,
+          editSessionId.trim() || undefined,
+          editSidGuard.trim() || undefined,
+          editTtwid.trim() || undefined,
+        );
+      }
       pushToast('success', '账号信息已更新');
       setDialog(null);
       void reload();
@@ -473,7 +561,8 @@ export default function DoubaoAccounts() {
       );
       return;
     }
-    setQuotaRunningFor(a.user_id);
+    // 函数式更新按 uid 置位：连续操作不同账号时忙碌态互不覆盖
+    setQuotaRunningFor((m) => ({ ...m, [a.user_id]: true }));
     setQuotaResult(null);
     try {
       const r = await api.doubao.fetchQuota(a.user_id);
@@ -482,7 +571,44 @@ export default function DoubaoAccounts() {
     } catch (err) {
       pushToast('error', `额度查询失败：${String(err)}`);
     } finally {
-      setQuotaRunningFor(null);
+      // 仅清除本账号标记（函数式更新，不抹掉其它账号的忙碌态）
+      setQuotaRunningFor((m) => {
+        const next = { ...m };
+        delete next[a.user_id];
+        return next;
+      });
+    }
+  };
+
+  /** 单账号每日签到（landing/checkin 端点；已签当天幂等跳过，成功后回写总额度缓存并刷新看板） */
+  const doCheckin = async (a: DoubaoAccountView) => {
+    if (a.session_state === 'none') {
+      pushToast('warn', `账号 ${a.name} 尚无会话凭证，无法签到：开启代理自动写入或编辑弹框手动录入`);
+      return;
+    }
+    // 函数式更新按 uid 置位：连续操作不同账号时忙碌态互不覆盖
+    setCheckinRunningFor((m) => ({ ...m, [a.user_id]: true }));
+    try {
+      // 返回契约：single → { ok, outcome: { status, message, ... }, finished_at }
+      const r = (await api.doubao.checkinRun(a.user_id)) as {
+        outcome?: { status?: string; message?: string };
+      };
+      const o = r.outcome;
+      if (o?.status === 'fail') {
+        pushToast('error', `账号 ${a.name} 签到失败：${o.message ?? '未知错误'}`);
+      } else {
+        pushToast('success', `账号 ${a.name} 签到完成：${o?.message ?? 'OK'}`);
+      }
+    } catch (err) {
+      pushToast('error', `签到失败：${String(err)}`);
+    } finally {
+      // 仅清除本账号标记（函数式更新，不抹掉其它账号的忙碌态）
+      setCheckinRunningFor((m) => {
+        const next = { ...m };
+        delete next[a.user_id];
+        return next;
+      });
+      await reload();
     }
   };
 
@@ -621,6 +747,13 @@ export default function DoubaoAccounts() {
       .join('\n');
   };
 
+  /** 分组筛选（chips 单选，对齐 Trae 账号列表）：all / ungrouped / 分组 id */
+  const filtered = useMemo(() => {
+    if (chipFilter === 'all') return accounts;
+    if (chipFilter === 'ungrouped') return accounts.filter((a) => !a.group_id);
+    return accounts.filter((a) => a.group_id === chipFilter);
+  }, [accounts, chipFilter]);
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -648,6 +781,12 @@ export default function DoubaoAccounts() {
             </button>
             <button onClick={() => void openSaveLoginDialog()} className="btn-outline" disabled={anyBusy}>
               <Save size={15} /> 保存当前登录态
+            </button>
+            <button onClick={() => setGroupOpen(true)} className="btn-outline" disabled={anyBusy}>
+              <FolderCog size={15} /> 分组管理
+            </button>
+            <button onClick={() => setTagsOpen(true)} className="btn-outline" disabled={anyBusy}>
+              <Tags size={15} /> 标签管理
             </button>
           </>
         }
@@ -701,45 +840,96 @@ export default function DoubaoAccounts() {
         </div>
       )}
 
-      {/* 账号列表 */}
+      {/* 账号列表（分组筛选 chips，对齐 Trae 账号列表设计；分组/标签管理入口在页头） */}
       <div className="mt-5 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Users size={16} className="text-violet-500" />
-          <span className="text-sm font-medium">账号池</span>
-          <span className="text-xs text-slate-400">{accounts.length} 个账号</span>
-        </div>
+        {/* 分组筛选 chips：全部 / 未分组 / 各分组（带色点 + 计数） */}
+        {accounts.length > 0 && groups.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
+            <button
+              onClick={() => setChipFilter('all')}
+              className={`chip border ${chipFilter === 'all' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+            >
+              全部 ({accounts.length})
+            </button>
+            <button
+              onClick={() => setChipFilter('ungrouped')}
+              className={`chip border ${chipFilter === 'ungrouped' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+            >
+              未分组 ({accounts.filter((a) => !a.group_id).length})
+            </button>
+            {groups.map((g) => (
+              <button
+                key={g.id}
+                onClick={() => setChipFilter(g.id)}
+                className={`chip border ${chipFilter === g.id ? 'text-brand-600 dark:text-brand-400' : 'border-slate-300 text-slate-500'}`}
+                style={{ borderColor: chipFilter === g.id ? g.color : undefined }}
+              >
+                <span className="inline-block h-2 w-2 rounded-full" style={{ background: g.color }} />
+                {g.name} ({accounts.filter((a) => a.group_id === g.id).length})
+              </button>
+            ))}
+          </div>
+        )}
+
         {accounts.length === 0 ? (
           <div className="py-8 text-center text-xs text-slate-400">
             暂无账号。登录豆包后点击右上角「保存当前登录态」建立首个快照。
           </div>
+        ) : filtered.length === 0 ? (
+          <div className="py-8 text-center text-xs text-slate-400">当前筛选条件下暂无账号。</div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
                 <tr>
                   <th className="whitespace-nowrap px-3 py-2 text-left">账号</th>
-                  <th className="whitespace-nowrap px-3 py-2 text-left">备注</th>
-                  <th className="whitespace-nowrap px-3 py-2 text-left">快照</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">分组</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">标签</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">额度</th>
                   <th className="whitespace-nowrap px-3 py-2 text-left">会话</th>
-                  <th className="whitespace-nowrap px-3 py-2 text-left">最后修改</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">快照</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">备注</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">修改时间</th>
                   <th className="whitespace-nowrap px-3 py-2 text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {accounts.map((a) => (
+                {filtered.map((a) => (
                   <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-3 py-2">
                       <div className="flex items-center gap-2" title={quotaTip(a)}>
                         <span className="font-medium">{a.name}</span>
                         {a.is_current && <Badge tone="green">当前</Badge>}
                         {quotaBadge(a)}
-                        {quotaRunningFor === a.user_id && <Badge tone="violet">查询中…</Badge>}
+                        {quotaRunningFor[a.user_id] && <Badge tone="violet">查询中…</Badge>}
                       </div>
                       <div className="font-mono text-xs text-slate-400">{a.user_id}</div>
                     </td>
-                    <td className="max-w-40 truncate px-3 py-2 text-xs text-slate-500" title={a.note}>
-                      {a.note || '—'}
+                    <td className="px-3 py-2">
+                      <span className={anyBusy ? 'pointer-events-none opacity-50' : ''}>
+                        <GroupSelect value={a.group_id} groups={groups} onChange={(gid) => void moveGroup(a.user_id, gid)} />
+                      </span>
                     </td>
+                    <td className="px-3 py-2">
+                      <TagChips tagIds={tagMap[a.user_id] ?? []} allTags={tagDefs} onEdit={() => setTagEditTarget(a)} />
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-xs">
+                      {a.quota_total != null ? (
+                        <div title={`最近签到：${a.checkin_last_date ?? '—'}${a.checkin_last_run_at ? ` · 巡检 ${a.checkin_last_run_at}` : ''}`}>
+                          <div className="font-medium text-amber-600 dark:text-amber-400">
+                            {a.quota_total.toLocaleString()}
+                          </div>
+                          {a.checkin_continuous_days != null && a.checkin_continuous_days > 0 && (
+                            <div className="text-slate-400">连续签 {a.checkin_continuous_days} 天</div>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-slate-400" title="额度巡检/数据同步后自动回写（与签到无关）">
+                          —
+                        </span>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2">{sessionBadge(a)}</td>
                     <td className="px-3 py-2 text-xs">
                       {a.has_snapshot ? (
                         <div title={snapshotTip(a)}>
@@ -760,7 +950,9 @@ export default function DoubaoAccounts() {
                         </div>
                       )}
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2">{sessionBadge(a)}</td>
+                    <td className="max-w-40 truncate px-3 py-2 text-xs text-slate-500" title={a.note}>
+                      {a.note || '—'}
+                    </td>
                     <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-500">
                       {a.last_modified || a.added_at || '—'}
                     </td>
@@ -770,7 +962,7 @@ export default function DoubaoAccounts() {
                           title="一键以该账号打开豆包：恢复快照后直接启动（代理运行中自动注入代理）"
                           onClick={() => void openDoubaoAs(a.user_id, proxy.running ? proxy.port : undefined)}
                           disabled={anyBusy || !a.has_snapshot}
-                          className="btn-ghost !p-2 text-violet-500 hover:bg-violet-50 disabled:opacity-30 dark:hover:bg-violet-500/10"
+                          className="btn-ghost !p-2 text-violet-500 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-violet-500/10"
                         >
                           <Rocket size={14} />
                         </button>
@@ -778,17 +970,33 @@ export default function DoubaoAccounts() {
                           title="切换到此账号（自动备份当前登录态到 last 槽 + 原账号槽）"
                           onClick={() => void switchTo(a.user_id, 'Doubao')}
                           disabled={anyBusy || !a.has_snapshot}
-                          className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
+                          className="btn-ghost !p-2 text-emerald-600 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40 dark:text-emerald-400 dark:hover:bg-emerald-500/10"
                         >
                           <LogIn size={14} />
                         </button>
                         <button
                           title="查询/刷新会员额度（结果缓存后悬停账号名可查看额度状态 / 会员 / 到期时间）"
                           onClick={() => void doFetchQuota(a)}
-                          disabled={anyBusy || quotaRunningFor === a.user_id}
-                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:opacity-30 dark:hover:bg-amber-500/10"
+                          disabled={anyBusy || !!quotaRunningFor[a.user_id]}
+                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"
                         >
-                          <Coins size={14} className={quotaRunningFor === a.user_id ? 'animate-pulse' : ''} />
+                          {quotaRunningFor[a.user_id] ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <Coins size={14} />
+                          )}
+                        </button>
+                        <button
+                          title="每日签到（landing/checkin；当天已签幂等跳过，成功后回写总额度）"
+                          onClick={() => void doCheckin(a)}
+                          disabled={anyBusy || !!checkinRunningFor[a.user_id]}
+                          className="btn-ghost !p-2 text-rose-400 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-rose-500/10"
+                        >
+                          {checkinRunningFor[a.user_id] ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <CalendarCheck size={14} />
+                          )}
                         </button>
                         <button
                           title={
@@ -798,9 +1006,13 @@ export default function DoubaoAccounts() {
                           }
                           onClick={() => void doChatBackup(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id}
-                          className="btn-ghost !p-2 text-teal-500 hover:bg-teal-50 disabled:opacity-30 dark:hover:bg-teal-500/10"
+                          className="btn-ghost !p-2 text-teal-500 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-teal-500/10"
                         >
-                          <DatabaseBackup size={14} className={chatBusyFor === a.user_id ? 'animate-pulse' : ''} />
+                          {chatBusyFor === a.user_id ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <DatabaseBackup size={14} />
+                          )}
                         </button>
                         <button
                           title={
@@ -810,7 +1022,7 @@ export default function DoubaoAccounts() {
                           }
                           onClick={() => void doChatRestore(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id || !chatdataInfos[a.user_id]?.backed}
-                          className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
+                          className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-sky-500/10"
                         >
                           <ArchiveRestore size={14} />
                         </button>
@@ -818,7 +1030,7 @@ export default function DoubaoAccounts() {
                           title="导出对话记录（官方接口拉取会话与消息 → data/exports/ 生成 markdown + json；需已录入凭证）"
                           onClick={() => void doExportChats(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id}
-                          className="btn-ghost !p-2 text-indigo-500 hover:bg-indigo-50 disabled:opacity-30 dark:hover:bg-indigo-500/10"
+                          className="btn-ghost !p-2 text-indigo-500 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-indigo-500/10"
                         >
                           <Download size={14} />
                         </button>
@@ -834,7 +1046,7 @@ export default function DoubaoAccounts() {
                           title="删除账号（含快照，不可恢复）"
                           onClick={() => doRemove(a.user_id)}
                           disabled={anyBusy}
-                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-500/10"
+                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-rose-500/10"
                         >
                           <Trash2 size={14} />
                         </button>
@@ -850,6 +1062,7 @@ export default function DoubaoAccounts() {
           「以账号打开」= 恢复该账号快照后直接启动豆包（代理运行中自动注入代理）；「切换」= 关闭豆包 →
           当前登录态自动备份（last 槽 + 原账号槽）→ 恢复目标快照 → 重启豆包。
           会话保活与每日定时任务在「环境配置」页设置；有会话凭证的账号会自动查询会员额度并在账号名后显示会员/免费标识，悬停账号名可查看详情。
+          「日历」图标 = 单账号每日签到（当日已签幂等跳过）；签到成功后回写总额度与连续签到天数，定时签到在「环境配置 → 每日签到」开启。
           账号行新增的「备份对话数据 / 恢复对话数据 / 导出对话」图标用于对话历史保护与迁移，详见右上角帮助。
         </div>
       </div>
@@ -965,6 +1178,16 @@ export default function DoubaoAccounts() {
               className="input font-mono"
             />
           </div>
+          {(() => {
+            const cur = accounts.find((a) => a.is_current);
+            const mismatch = !!uidInput.trim() && !!cur && uidInput.trim() !== cur.user_id;
+            return mismatch ? (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                ⚠ 检测到的 user_id 与「当前账号」标记（{cur.name}）不一致。若你刚切换/重新登录过豆包但客户端尚未重启，
+                自动探测可能读到旧会话——请核对豆包里实际登录的账号后再保存，必要时手动修正 user_id。
+              </div>
+            ) : null;
+          })()}
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">别名（可选）</label>
             <input
@@ -976,7 +1199,7 @@ export default function DoubaoAccounts() {
           </div>
           <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
             保存时会先关闭豆包，将当前登录态白名单快照到该账号槽位后重启豆包。user_id 可在
-            <span className="mx-1 font-mono">{publicConfigHint}</span>
+            <span className="mx-1 font-mono">%APPDATA%\Doubao\public_config.json</span>
             中查看。
           </div>
           <div className="flex justify-end gap-2">
@@ -1012,6 +1235,10 @@ export default function DoubaoAccounts() {
                 rows={2}
                 className="input resize-none"
               />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">分组（共享分组体系，可跨应用复用）</label>
+              <GroupSelect value={editGroupId} groups={groups} onChange={setEditGroupId} />
             </div>
             <div>
               <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
@@ -1052,12 +1279,21 @@ export default function DoubaoAccounts() {
               <p className="mt-1 text-xs text-slate-400">
                 凭证等同密码，仅存本地。清空 sessionid 与 sid_guard 后保存即删除该账号凭证（ttwid 仅在非空时更新）。
               </p>
+              {credLoadFailed && (
+                <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 dark:border-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                  ⚠ 凭证读取失败，为防误清空本次不保存凭证
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setDialog(null)} className="btn-outline">
                 取消
               </button>
-              <button onClick={() => void submitEdit()} className="btn-primary">
+              <button
+                onClick={() => void submitEdit()}
+                className="btn-primary"
+                disabled={credLoading || credLoadFailed}
+              >
                 保存
               </button>
             </div>
@@ -1153,6 +1389,114 @@ export default function DoubaoAccounts() {
         )}
       </Modal>
 
+      {/* 分组管理弹框（复用共享 GroupsModal；豆包分组走共享分组体系） */}
+      <GroupsModal
+        open={groupOpen}
+        onClose={() => setGroupOpen(false)}
+        groups={groups}
+        onCreate={async (name, color) => {
+          try {
+            await api.groups.create(name, color);
+            setGroups(await api.groups.sharedList());
+          } catch (err) {
+            pushToast('error', `创建分组失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.groups.update(id, { name });
+            setGroups(await api.groups.sharedList());
+          } catch (err) {
+            pushToast('error', `重命名失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.groups.update(id, { color });
+            setGroups(await api.groups.sharedList());
+          } catch (err) {
+            pushToast('error', `改色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.groups.remove(id);
+            if (chipFilter === id) setChipFilter('all');
+            setGroups(await api.groups.sharedList());
+            await reload();
+          } catch (err) {
+            pushToast('error', `删除分组失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+
+      {/* 共享标签管理 + 账号标签编辑（跨池通用组件复用） */}
+      <TagsModal
+        open={tagsOpen}
+        onClose={() => setTagsOpen(false)}
+        tags={tagDefs}
+        onCreate={async (name, color) => {
+          try {
+            await api.tags.create(name, color);
+            setTagDefs(await api.tags.list());
+          } catch (err) {
+            pushToast('error', `创建标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.tags.update(id, { name });
+            setTagDefs(await api.tags.list());
+          } catch (err) {
+            pushToast('error', `重命名失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.tags.update(id, { color });
+            setTagDefs(await api.tags.list());
+          } catch (err) {
+            pushToast('error', `改色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.tags.remove(id);
+            const [tds, tm] = await Promise.all([api.tags.list(), api.tags.map()]);
+            setTagDefs(tds);
+            setTagMap(tm);
+          } catch (err) {
+            pushToast('error', `删除标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+      <AccountTagsEditModal
+        open={tagEditTarget != null}
+        onClose={() => setTagEditTarget(null)}
+        accountName={tagEditTarget?.name || tagEditTarget?.user_id || ''}
+        tags={tagDefs}
+        selected={tagEditTarget ? (tagMap[tagEditTarget.user_id] ?? []) : []}
+        onSave={async (ids) => {
+          if (!tagEditTarget) return;
+          try {
+            await api.tags.setAccountTags(tagEditTarget.user_id, ids);
+            setTagMap(await api.tags.map());
+            pushToast('success', '标签已更新');
+          } catch (err) {
+            pushToast('error', `标签保存失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+
       {/* 使用帮助弹框 */}
       <DoubaoHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
@@ -1161,11 +1505,6 @@ export default function DoubaoAccounts() {
 
 /** 豆包账号管理使用帮助（快照机制 / 保存 / 切换 / 保活 / 额度） */
 function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const platform = useAppStore((s) => s.platform);
-  const publicConfigHint =
-    platform === 'macos'
-      ? '~/Library/Application Support/Doubao/public_config.json'
-      : '%APPDATA%\\Doubao\\public_config.json';
   return (
     <Modal
       open={open}
@@ -1182,7 +1521,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             在豆包中登录某个账号后，点击右上角「保存当前登录态」。系统会自动识别当前账号 user_id
-            （读取 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">{publicConfigHint}</code>
+            （读取 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">%APPDATA%\Doubao\public_config.json</code>
             ，识别失败时可手动输入），然后关闭豆包 → 将登录核心文件白名单快照到
             <code className="mx-1 rounded bg-slate-100 px-1 dark:bg-zinc-800">data/profiles_doubao/&lt;uid&gt;/</code>
             → 重新启动豆包。每个账号的登录态独立存储，互不干扰。
@@ -1222,7 +1561,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             <li>点击目标账号行的「切换」图标</li>
-            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 与 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak2</code> 可回退两代，但不在列表中显示）</li>
+            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 可回退一代，但不在列表中显示）</li>
             <li>恢复目标账号的快照（Cookies、Local State、Local Storage、saman 账号体系等）</li>
             <li>重新启动豆包，自动以目标账号登录</li>
           </ol>

@@ -67,6 +67,14 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
+    // 豆包数据同步（2026-10-28，对齐 Trae/Buddy/Qoder 积分同步五模式）：额度巡检
+    // run_batch（quota + detail 探针）→ 池回写；页面全部读本地池，不再每次打开都
+    // 依赖远端/重扫。默认 every_hours 每 2 小时（settings.doubao_sync_mode/hours/hhmm，
+    // 环境配置-任务配置可改）
+    SchedTask { key: "doubao-sync", name: "豆包额度数据同步", hhmm: "23:50", kind: "credits" },
+    // 豆包每日签到（landing/checkin）：默认 09:15 错峰 quota 09:30，环境配置页可改
+    //（settings.doubao_checkin_hhmm）；结果按日落库（doubao_checkin_results）
+    SchedTask { key: "doubao-checkin", name: "豆包每日签到", hhmm: "09:15", kind: "fix" },
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
     //（§2.2 调度设计结论；settings.qoder_checkin_hhmm 可改，任务配置页）
     SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15", kind: "fix" },
@@ -94,9 +102,8 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 积分数据同步：与 Buddy/Trae 同款四模式（off/hourly/daily/every_hours，
     // settings.qoder_credits_sync_mode；daily 时刻可改，默认 23:40；mode 缺失时 state 按旧 enabled 派生）
     SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分数据同步", hhmm: "23:40", kind: "credits" },
-    // F-80 Qoder 凭证兜底刷新（kind "refresh" → EveryHours(间隔可配)；hhmm 不参与判定）。
-    // 空池空转；开关/间隔独立（settings.qoder_token_renew_enabled /
-    // qoder_token_renew_interval_hours，默认开/6h，环境配置页可改）
+    // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
+    // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
     // Qoder 会话流水定时合并（kind "compact" → EveryHours(6)；hhmm 不参与判定）：
     // 每 6 小时把「7 天前」的请求级流水按 (date, uid, preview) 合并为单行
@@ -121,12 +128,9 @@ const TASKS: &[SchedTask] = &[
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(90));
-        // 审查 #14：buddy-ai 打卡逐账号连击内存态——跨 tick 存活于调度线程，
-        // 只在调度线程访问（单线程串行 tick），无需加锁
-        let mut buddy_acct_streaks = BuddyAiAcctFailStreaks::default();
         loop {
             let st = app.state::<AppState>();
-            tick(&app, &st, &mut buddy_acct_streaks);
+            tick(&app, &st);
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
     });
@@ -140,21 +144,16 @@ const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
 const TICK_STAGGER_SECS: u64 = 30;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走退避冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
-/// qoder-refresh 档位（默认 6 小时）说明：客户端 token 惰性窗 7h，间隔 ≤7h 即可
-/// 确保过期令牌在窗口内被续上；真实缺省值在 models.rs serde default
-/// （settings.qoder_token_renew_interval_hours，环境配置页可改 1~24h）
+/// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
+/// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
+const REFRESH_INTERVAL_HOURS: i64 = 6;
 /// qoder-sessions-compact 档位：每 6 小时合并一次「当天之前」的会话流水
 /// （当天数据由查询层读时聚合即时呈现，无等待诉求）
 const COMPACT_INTERVAL_HOURS: i64 = 6;
-/// 审查修复（第6项；#14 起按账号粒度累计）：buddy-ai 打卡单账号连续失败轮数暂停
-/// 阈值——失效凭证（封禁/会话失效/refresh 永久拒绝）触发的账号失败不可自愈
-///（T7/BL-5「401 可自愈」只覆盖凭证类瞬时失效），全天 30min 冷却重试 + 每日首败
-/// 通知是纯噪声；单账号连击达阈值当日暂停，次日自动重置
+/// 审查修复（第6项）：buddy-ai 打卡整轮连续全败暂停阈值——失效凭证（封禁/会话失效/
+/// refresh 永久拒绝）触发的整轮失败不可自愈（T7/BL-5「401 可自愈」只覆盖凭证类瞬时
+/// 失效），全天 30min 冷却重试 + 每日首败通知是纯噪声；达阈值当日暂停，次日自动重置
 const BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT: i64 = 3;
-/// 审查 #16：buddy-ai-renew 全败轮连击当日暂停阈值（与打卡 LIMIT 同值）。
-/// Intl 刷新失败有意不标 needs_relogin（防误杀真实凭证），永久失效账号会每日 +
-/// 每 30 分钟重试——调度侧熔断：连续 3 轮全败当日暂停，次日自动恢复
-const BUDDY_AI_RENEW_FAIL_STREAK_LIMIT: i64 = 3;
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -176,6 +175,7 @@ fn credits_sync_mode(st: &AppState, key: &str) -> String {
         "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_mode.as_str(),
         "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_mode.as_str(),
+        "doubao-sync" => s.doubao_sync_mode.as_str(),
         _ => s.trae_credits_sync_mode.as_str(),
     };
     match raw.trim() {
@@ -191,6 +191,7 @@ fn credits_sync_hours(st: &AppState, key: &str) -> i64 {
         "wb-credits-snapshot" => s.wb_credits_sync_hours.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_hours.as_str(),
         "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_hours.as_str(),
+        "doubao-sync" => s.doubao_sync_hours.as_str(),
         _ => s.trae_credits_sync_hours.as_str(),
     };
     raw.trim().parse::<i64>().unwrap_or(2).clamp(1, 24)
@@ -223,12 +224,8 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
             "every_days" => SchedPlan::EveryDays(credits_sync_days(st, t.key)),
             _ => SchedPlan::Daily(effective_hhmm(st, t)),
         },
-        // Qoder 凭证兜底刷新：每 N 小时（间隔 settings.qoder_token_renew_interval_hours
-        // 可配，环境配置页；state 加载已 clamp 1~24，此处 max(1) 兜底防越界值直达）
-        "refresh" => {
-            let hours = (st.settings().qoder_token_renew_interval_hours.max(1)) as i64;
-            SchedPlan::EveryHours(hours)
-        }
+        // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
+        "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
         // Qoder 会话流水合并：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_sessions_compact_enabled）
         "compact" => SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
@@ -253,12 +250,7 @@ fn board_platform(key: &str) -> Option<&'static str> {
 
 /// 单轮 tick：按各任务生效调度计划检查触发条件 → 执行
 /// （AppHandle 仅用于看板数据同步成功后的前端事件联动，任务执行本身不依赖）
-/// `buddy_acct_streaks`：buddy-ai 打卡逐账号连击内存态（审查 #14，调度线程独占）
-fn tick(
-    app: &AppHandle,
-    st: &AppState,
-    buddy_acct_streaks: &mut BuddyAiAcctFailStreaks,
-) {
+fn tick(app: &AppHandle, st: &AppState) {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
@@ -320,7 +312,7 @@ fn tick(
         }
         ran_this_tick += 1;
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_task(t.key, st, Some(api_runtime.inner()), buddy_acct_streaks, Some(app))
+            run_task(t.key, st, Some(api_runtime.inner()), Some(app))
         })) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
@@ -336,21 +328,19 @@ fn tick(
                 // 调度补打。skipped_busy 落日志（低频、值得留痕）；空轮纯静默
                 //（池空期间每 tick 触发，落日志会刷屏，对齐「空池静默空转」定调）
                 //
-                // 其余普通 skipped（含豆包/trae/wb/qoder 各任务空池 `{"ok":true,
-                // "skipped":"无 X 账号"}`，issue #147 口径）走 mark_run + 落日志——
-                // 有意取舍（定调）：这类任务无奖励属性、空池空转无收益，mark_run
-                // 关闭当日重复触发可防空转；当日新增账号次日生效可接受（需即刻
-                // 巡检可手动触发）。仅 buddy-ai 每日活跃打卡豁免（漏打=丢奖励），
-                // 新增空池任务若同属「漏跑=丢收益」语义，须改打 skipped_empty_pool
+                // 其余普通 skipped（含豆包额度巡检/保活、各池目录/快照/流水同步
+                // 任务空池 `{"ok":true,"skipped":"无 X 账号"}`，issue #147 口径）走
+                // mark_run + 落日志——有意取舍（定调）：这类任务无奖励属性、空池
+                // 空转无收益，mark_run 关闭当日重复触发可防空转；当日新增账号次日
+                // 生效可接受（需即刻巡检可手动触发）。奖励型签到任务豁免
+                //（漏跑=丢收益）：buddy-ai 每日活跃打卡、豆包/trae/wb/qoder 每日
+                // 签到空池改打 skipped_empty_pool，当日导入账号后下一 tick 正常
+                // 补打。新增空池任务若同属「漏跑=丢收益」语义，须同款豁免
                 if v.get("skipped_busy").is_some() {
                     fs_utils::app_log(
                         &st.data_dir,
                         &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
                     );
-                // 审查 #15：skipped_empty_pool（buddy-ai 打卡空轮 / 豆包续期与巡检
-                // 空池或客户端缺失，本轮无账号参与）同样不 mark_run——mark_run 会写
-                // last_run_date=今日，当日新增账号不再被调度（补打窗口被吞）。仅记
-                // 日志；账号导入/客户端就绪后下一 tick 正常执行
                 } else if v.get("skipped_empty_pool").is_none() {
                     mark_run(st, t.key, &today, &summary);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
@@ -418,6 +408,8 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
         "qoder-catalog-sync" => Some(st.settings().qoder_catalog_sync_hhmm),
+        "doubao-checkin" => Some(st.settings().doubao_checkin_hhmm),
+        "doubao-sync" => Some(st.settings().doubao_sync_hhmm),
         _ => None,
     };
     let Some(v) = configured else {
@@ -466,10 +458,12 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "doubao-keepalive" => st.settings().doubao_keepalive_enabled,
         // 豆包会员额度每日巡检（issue #147）：环境配置页可关（默认开）
         "doubao-quota" => st.settings().doubao_quota_enabled,
+        // 豆包每日签到：环境配置页可关（默认开）
+        "doubao-checkin" => st.settings().doubao_checkin_enabled,
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（其余模式均视为启用；
         // buddy-ai 旧 enabled 布尔已由 state 归一化派生进 mode）
         "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot"
-        | "buddy-ai-credits-sync" => {
+        | "buddy-ai-credits-sync" | "doubao-sync" => {
             credits_sync_mode(st, key) != "off"
         }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
@@ -485,14 +479,12 @@ fn enabled(st: &AppState, key: &str) -> bool {
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）。
 /// `runtime`：GUI 进程内的网关运行态句柄（tick 经 AppHandle 取得），
 /// 供积分类任务运行中回写池快照（issue #67）；CLI 侧传 None。
-/// `buddy_acct_streaks`：buddy-ai 打卡逐账号连击内存态（审查 #14，仅调度线程读写）
 /// `app`：GUI 进程 AppHandle（issue #134 方案1：wb-checkin/wb-growth 后台轮次
 /// 同步转发 wb-checkin-progress 事件，前端运行态可见）；测试传 None
 fn run_task(
     key: &str,
     st: &AppState,
     runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
-    buddy_acct_streaks: &mut BuddyAiAcctFailStreaks,
     app: Option<&AppHandle>,
 ) -> Result<Value, String> {
     match key {
@@ -503,39 +495,16 @@ fn run_task(
         //  AuthRejected=服务端拒绝认证（issue #128）/ DeviceSigned=设备当日去重）
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
-            let retry = st.settings().retry.max(0) as u32;
-            // 审查修复 M2：调度轮跳过冷却中账号（until > now，含 SessionDead/
-            // AuthRejected 永久冷却与 DeviceSigned 当日去重）——冷却账号每轮真实
-            // 请求只会再失败再冷却，对齐 UI 签到路径「冷却中跳过」口径
-            let now_ts = chrono::Utc::now().timestamp();
-            let cooled: std::collections::HashSet<String> =
-                crate::store::docs::account_cooldowns_load(&crate::store::db(&st.data_dir))
-                    .cooldowns
-                    .into_iter()
-                    .filter(|(_, e)| e.until > now_ts)
-                    .map(|(uid, _)| uid)
-                    .collect();
-            let mut skipped_cooldown = 0usize;
-            let active: Vec<_> = accounts
-                .accounts
-                .into_iter()
-                .filter(|a| match a.user_id.as_deref() {
-                    Some(uid) if cooled.contains(uid) => {
-                        skipped_cooldown += 1;
-                        false
-                    }
-                    _ => true,
-                })
-                .collect();
-            if skipped_cooldown > 0 {
-                crate::fs_utils::app_log(
-                    &st.data_dir,
-                    &format!("Trae 签到：跳过 {skipped_cooldown} 个冷却中账号"),
-                );
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：签到漏跑
+            // =丢积分，mark_run 固化「当日已跑」会让当日导入账号失去调度补打——
+            // 空池提前返回 skipped_empty_pool，tick 不 mark_run、下一 tick 补打
+            if accounts.accounts.is_empty() {
+                return Ok(json!({ "ok": true, "skipped": "无 Trae 账号", "skipped_empty_pool": true }));
             }
+            let retry = st.settings().retry.max(0) as u32;
             let mut events: Vec<Value> = Vec::new();
             let done =
-                super::trae_checkin::run_round(st, &active, retry, &mut |ev| events.push(ev.clone()));
+                super::trae_checkin::run_round(st, &accounts.accounts, retry, &mut |ev| events.push(ev.clone()));
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
             let failed_permanent = events
                 .iter()
@@ -567,6 +536,18 @@ fn run_task(
         // 审查 P2：同 trae-checkin——可重试失败返 Err 交 30 分钟冷却重试；
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）。
+            // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
+            //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
+            let pool = crate::store::docs::wb_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("WorkBuddy 账号池读取失败：{e}"))?;
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
+            }
             let _round = match crate::commands::workbuddy::try_acquire_wb_round("调度器签到", &st.data_dir) {
                 Ok(g) => g,
                 Err(why) => {
@@ -653,7 +634,6 @@ fn run_task(
             // run_growth_round 为 NDJSON 推进式输出（无汇总返回值）。审查修复：失败事件
             // 此前被空回调丢弃（恒 Ok：当日不重试不通知）——现累计事件，可重试失败返
             // Err 交 30 分钟冷却重试；永久性凭证失败剔除（对齐 wb-checkin 口径）。
-            // main 侧改进：按 type=="growth" 精确过滤，非 growth 的 fail 事件不误计入；
             // issue #134 方案1：后台轮次同步转发进度事件（同 wb-checkin）
             let mut events: Vec<Value> = Vec::new();
             super::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| {
@@ -690,7 +670,7 @@ fn run_task(
             if retryable > 0 {
                 return Err(format!("WB 成长：{retryable} 个账号失败（稍后自动重试）"));
             }
-            Ok(json!({ "ok": true, "failed": failed }))
+            Ok(json!({ "ok": true }))
         }
         // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
@@ -699,10 +679,8 @@ fn run_task(
         // Buddy 国际版每日活跃打卡（阶段 3b）：抢轮次锁与 UI 路径互斥（skipped_busy
         // 幂等跳过同 wb-checkin）；失败返 Err 交 30 分钟冷却重试（401 可经网关自愈，
         // 不判永久剔除，见下方 T7/BL-5 定调注释）。
-        // 审查修复（第6项；#14 改按账号粒度）：瞬时失效之外还存在不可自愈的永久失效
-        //（封禁/会话失效/refresh 永久拒绝）——原「整轮连击」在混合轮（失效账号混在
-        // 健康账号中）永不达阈值，全天 30min 重试空转；#14 起逐账号累计（内存态），
-        // 任一账号连击达阈值当日暂停（复用整轮暂停标记）
+        // 审查修复（第6项）：瞬时失效之外还存在不可自愈的永久失效（封禁/会话失效/
+        // refresh 永久拒绝），连续 ≥3 整轮全败当日暂停，不再全天冷却空转
         "buddy-ai-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_buddy_ai_round() else {
                 return Ok(json!({ "ok": true, "skipped": "已有 buddy-ai 打卡任务在执行中，本轮跳过", "skipped_busy": true }));
@@ -717,18 +695,11 @@ fn run_task(
             if prev_streak >= BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT {
                 return Ok(json!({
                     "ok": true,
-                    "skipped": "连续多轮打卡失败（疑似凭证永久失效），当日暂停打卡，次日自动恢复",
+                    "skipped": "连续多轮全部失败（疑似凭证永久失效），当日暂停打卡，次日自动恢复",
                     "skipped_fail_streak": true,
                 }));
             }
-            // 审查 #14：内存态连击跨日清零（kv 门禁靠 date 字段惰性归零，内存态
-            // 以轮次起点日期为准；date == 今日表示连击延续自本轮次之前）
-            if buddy_acct_streaks.date != today {
-                buddy_acct_streaks.date = today.clone();
-                buddy_acct_streaks.map.clear();
-            }
             let mut events: Vec<Value> = Vec::new();
-            // runtime 透传（审查 #4）：打卡到账快照回写运行期 buddy_ai_pool
             let done = super::buddy_ai_checkin::run_checkin_round(st, runtime, &mut |ev| events.push(ev.clone()));
             // 审查 #15：空池空轮透传 skipped_empty_pool——tick 据此不 mark_run 且
             // 静默（当日新增账号保留调度补打机会）；连击统计无需更新（ok/already/
@@ -739,28 +710,11 @@ fn run_task(
             let ok_count = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
             let already_count = done.get("already").and_then(Value::as_i64).unwrap_or(0);
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
-            // 审查 #14：逐账号连击——本轮事件中该账号既无 success 也无 already 则
-            // +1，有则清零；任一账号达阈值 → 当日暂停（复用整轮暂停标记：kv 连击置
-            // 为阈值，后续 tick 门禁 skipped_fail_streak 生效），日志注明失效账号
-            let dead = buddy_ai_acct_streaks_apply(
-                &mut buddy_acct_streaks.map,
-                &events,
-                BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
-            );
-            if !dead.is_empty() {
-                buddy_ai_checkin_streak_save(st, &today, BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT);
-                let uids = dead.join(", ");
-                crate::fs_utils::app_log(
-                    &st.data_dir,
-                    &format!(
-                        "buddy-ai: 账号 {uids} 连续 {BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT} 轮打卡失败（疑似永久失效），当日暂停打卡，次日自动恢复"
-                    ),
-                );
-                return Ok(json!({
-                    "ok": true,
-                    "skipped": format!("账号 {uids} 连续多轮打卡失败（疑似永久失效），当日暂停打卡，次日自动恢复"),
-                    "skipped_fail_streak": true,
-                }));
+            // 审查修复（第6项）：轮末更新连击——任一成功（含 already，混合轮亦然）
+            // 清零；全轮失败 +1；两者皆 0（空池空转）不动。值不变不落库，省一次 kv 写
+            let new_streak = buddy_ai_streak_next(prev_streak, ok_count + already_count, failed);
+            if new_streak != prev_streak {
+                buddy_ai_checkin_streak_save(st, &today, new_streak);
             }
             // 逐账号失败明细落 app_log（与 UI 路径 buddy_ai_checkin_start 同口径）：
             // 定时路径此前只记计数——「2 失败」无原因，180s 超时/401/ACP 挂死不可辨
@@ -799,6 +753,16 @@ fn run_task(
         }
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
+            let pool = crate::store::docs::qoder_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("Qoder 账号池读取失败：{e}"))?;
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
+            }
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
             // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
             let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
@@ -806,7 +770,6 @@ fn run_task(
                 return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
-            // runtime 透传（issue #102 补缺）：签到奖励增量回写运行池余额
             let done = super::qoder_checkin::run_checkin_round(st, &opts, runtime, &mut |_| {});
             // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
             // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
@@ -825,7 +788,13 @@ fn run_task(
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent > 0 {
+            // 风控信任未建立（issue #190）：BLOCKED 恢复需用户操作（切换账号 +
+            // 客户端建信任），自动重试注定失败且徒增风控暴露——一并剔除
+            let failed_blocked = done
+                .get("failed_blocked")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(
@@ -856,43 +825,8 @@ fn run_task(
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
-        // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试。
-        // 审查 #16：Intl 刷新失败有意不标 needs_relogin（防误杀真实凭证），永久失效
-        // 账号会每日 + 每 30 分钟重试——调度侧熔断：连续 3 轮全败当日暂停（kv 与打卡
-        // 连击同款 {streak, date} 文档，跨日自动归零），成功/空转轮清零连击
-        "buddy-ai-renew" => {
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let prev = day_scoped_streak(st, BUDDY_AI_RENEW_STREAK_KEY, &today);
-            if prev >= BUDDY_AI_RENEW_FAIL_STREAK_LIMIT {
-                return Ok(json!({
-                    "ok": true,
-                    "skipped": "buddy-ai 续期连续多轮全部失败，当日暂停续期，次日自动恢复",
-                    "skipped_fail_streak": true,
-                }));
-            }
-            match crate::commands::workbuddy::buddy_ai_renew_task(st) {
-                Err(e) => {
-                    let next = prev + 1;
-                    day_scoped_streak_save(st, BUDDY_AI_RENEW_STREAK_KEY, &today, next);
-                    if next >= BUDDY_AI_RENEW_FAIL_STREAK_LIMIT {
-                        fs_utils::app_log(
-                            &st.data_dir,
-                            &format!(
-                                "buddy-ai: 凭证续期连续 {next} 轮全部失败（{e}），当日暂停续期，次日自动恢复"
-                            ),
-                        );
-                    }
-                    Err(e)
-                }
-                Ok(v) => {
-                    // 成功（含「无临期账号」空转轮）清零连击；值不变不写库
-                    if prev != 0 {
-                        day_scoped_streak_save(st, BUDDY_AI_RENEW_STREAK_KEY, &today, 0);
-                    }
-                    Ok(v)
-                }
-            }
-        }
+        // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试
+        "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
         // Buddy 国际版积分数据同步（get-user-resource 全池取数 → 池回写 + 快照）：
         // 空池自然空转；runtime 传网关运行态（运行池三键拨新，issue #109 同类）。
         // 顺带官网用量聚合刷新（force 跳过 10min 缓存，国内 wb-credits-snapshot 同款）——
@@ -930,11 +864,10 @@ fn run_task(
         }
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
-            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过。3.8.5 审查修复
-            // （M-D）：透传 skipped_empty_pool（对齐 #15 空池豁免口径）——普通
-            // skipped 语义会 mark_run 吞掉当日补装客户端/导入账号的补打窗口
+            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过（普通 skipped 语义：
+            // mark_run + 一条 info 日志，无失败记录、无通知、不拉起客户端）
             if let Some(reason) = super::doubao_keepalive_skip_reason(st) {
-                return Ok(json!({ "ok": true, "skipped_empty_pool": reason }));
+                return Ok(json!({ "ok": true, "skipped": reason }));
             }
             let sink = crate::switcher::CliSink::new(&st.data_dir);
             match crate::switcher::run_action(
@@ -951,17 +884,19 @@ fn run_task(
                 &sink,
             ) {
                 Ok(_) => Ok(json!({ "ok": true })),
-                // 审查修复（M5/M15）：互斥忙态特判转 skipped_busy（对齐 wb-checkin/
-                // qoder/buddy-ai-checkin/wb-growth 等任务的幂等跳过口径）——切换互斥忙
-                // （action_gate 被占）是幂等跳过而非任务失败，原样上抛会按失败收场，
-                // 当日首败误推 Server酱；带 skipped_busy 标志让调度器不 mark_run，
-                // 保留当日后续 tick 重试机会
+                // 审查修复（M15）：互斥忙态特判转 skipped_busy（对齐 wb-checkin/wb-growth
+                // 等任务的幂等跳过惯例）——原样上抛会按失败收场，当日首败误推 Server酱
                 Err(e) if e.contains("已有切换/备份操作进行中") => Ok(json!({ "ok": true, "skipped": "已有切换/备份操作进行中，本轮跳过", "skipped_busy": true })),
                 Err(e) => Err(e),
             }
         }
         // 豆包会员额度每日巡检：与 `--task-run doubao-quota` 同款
         "doubao-quota" => super::doubao_quota::run_batch(st),
+        // 豆包额度数据同步：同 run_batch（quota + detail 探针 → 池回写）；
+        // 页面读本地池，远端刷新收敛到本任务（2026-10-28 性能专项）
+        "doubao-sync" => super::doubao_quota::run_batch(st),
+        // 豆包每日签到：与 `--task-run doubao-checkin` 同款（空池跳过不计失败）
+        "doubao-checkin" => super::doubao_checkin::run_batch(st, app),
         // WorkBuddy 积分与 Token 数据同步（看板定时同步）：积分 fresh 拉取+池回写+快照为主目标
         // （空池自然空转不报错）；顺带 Token 统计重扫（本地增量缓存）与官方请求用量刷新——
         // 统计尽力而为不上抛（页面打开时本就有各自缓存/降级链路）；用量刷全账号聚合缓存
@@ -1065,99 +1000,34 @@ fn retry_cooldown_ms(st: &AppState, key: &str) -> i64 {
     RETRY_COOLDOWN_MS << shift
 }
 
-// ── 审查修复（第6项）+ #14/#16：buddy-ai 打卡/续期失败连击 ──────────────────
+// ── 审查修复（第6项）：buddy-ai 打卡整轮失败连击（kv 持久化，跨日重置）────────
 // scheduler_state 的 fail_streak 服务于退避冷却且被 mark_run 整体覆盖清零，无法表达
-// 「跨冷却周期的连续失败」，故用独立 kv 文档承载（阈值见
-// BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT / BUDDY_AI_RENEW_FAIL_STREAK_LIMIT）。
-// #14 起打卡连击改为逐账号内存态累计（BuddyAiAcctFailStreaks），kv 文档退化为
-// 「当日暂停闩锁」：任一账号连击达阈值时置为 LIMIT，后续 tick 门禁据此跳过
+// 「跨冷却周期的连续整轮失败」，故用独立 kv 文档承载（阈值见
+// BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT）
 
-/// 逐账号连击内存态（审查 #14）：uid → 连续失败轮数；date 门槛跨日清零
-///（内存态无日期字段，以最近一次打卡轮的日期为准；仅调度线程访问，无需加锁）
-#[derive(Default)]
-struct BuddyAiAcctFailStreaks {
-    date: String,
-    map: std::collections::HashMap<String, u32>,
-}
-
-/// 通用当日连击 kv：`{ "streak": 连续失败次数, "date": 计数日期 }`——计数与日期
-/// 同文档单次 kv_set 写入（无半写分叉）；跨日（date ≠ 今日）读时惰性归零
+/// kv 键：`{ "streak": 连续整轮全败次数, "date": 计数日期 }`——计数与日期同文档
+/// 单次 kv_set 写入（无半写分叉）；跨日（date ≠ 今日）读时惰性归零
 const BUDDY_AI_CHECKIN_STREAK_KEY: &str = "buddy_ai_checkin_fail_streak";
-/// 审查 #16：buddy-ai-renew 全败轮连击 kv 键（与打卡连击同款文档，独立计数互不干扰）
-const BUDDY_AI_RENEW_STREAK_KEY: &str = "buddy_ai_renew_fail_streak";
 
-/// 读当日连击：date ≠ 今日（跨日/无记录/损坏）→ 从 0 起；date == 今日 → 计数值
-fn day_scoped_streak(st: &AppState, kv_key: &str, today: &str) -> i64 {
-    let v: Value = crate::store::db(&st.data_dir).kv_get(kv_key);
+/// 读当前连击数：date ≠ 今日（跨日/无记录/损坏）→ 从 0 起；date == 今日 → 计数值
+fn buddy_ai_checkin_streak(st: &AppState, today: &str) -> i64 {
+    let v: Value = crate::store::db(&st.data_dir).kv_get(BUDDY_AI_CHECKIN_STREAK_KEY);
     if v.get("date").and_then(Value::as_str) != Some(today) {
         return 0;
     }
     v.get("streak").and_then(Value::as_i64).unwrap_or(0).max(0)
 }
 
-/// 持久化当日连击（计数与日期同一把 kv 写入）。落库失败静默：连击丢失仅回到
+/// 持久化连击数（计数与日期同一把 kv 写入）。落库失败静默：连击丢失仅回到
 /// 多试几轮的自愈起点，无重试风暴/重复执行风险（严重度远低于 write_entry 的 C6）
-fn day_scoped_streak_save(st: &AppState, kv_key: &str, today: &str, streak: i64) {
+fn buddy_ai_checkin_streak_save(st: &AppState, today: &str, streak: i64) {
     let _ = crate::store::db(&st.data_dir).kv_set(
-        kv_key,
+        BUDDY_AI_CHECKIN_STREAK_KEY,
         &json!({ "streak": streak, "date": today }),
     );
 }
 
-/// buddy-ai 打卡连击 kv 门禁读写包装（沿用旧键名，升级前的持久化数据自然延续）
-fn buddy_ai_checkin_streak(st: &AppState, today: &str) -> i64 {
-    day_scoped_streak(st, BUDDY_AI_CHECKIN_STREAK_KEY, today)
-}
-
-fn buddy_ai_checkin_streak_save(st: &AppState, today: &str, streak: i64) {
-    day_scoped_streak_save(st, BUDDY_AI_CHECKIN_STREAK_KEY, today, streak);
-}
-
-/// 纯函数（审查 #14）：按本轮事件聚合逐账号连击表，返回达阈值的失效账号 uid。
-/// 事件中该账号既无 success 也无 already → +1，有则清零；不在本轮事件中的账号
-/// 不动。原「整轮连击任一成功清零」语义（buddy_ai_streak_next）在混合轮失效：
-/// 永久失效账号混在健康账号中时连击永不累计，全天 30 分钟重试空转、当日暂停
-/// 永不触发——故改按账号粒度（独立纯函数便于单测）
-fn buddy_ai_acct_streaks_apply(
-    map: &mut std::collections::HashMap<String, u32>,
-    events: &[Value],
-    limit: u32,
-) -> Vec<String> {
-    let mut dead: Vec<String> = Vec::new();
-    for e in events {
-        let Some(uid) = e.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if uid.is_empty() {
-            continue;
-        }
-        let ok = matches!(
-            e.get("status").and_then(Value::as_str),
-            Some("success") | Some("already")
-        );
-        let next = buddy_ai_acct_streak_next(map.get(uid).copied().unwrap_or(0), ok);
-        if next == 0 {
-            map.remove(uid);
-        } else {
-            map.insert(uid.to_string(), next);
-            if next >= limit {
-                dead.push(uid.to_string());
-            }
-        }
-    }
-    dead
-}
-
-/// 纯函数（审查 #14）：单账号连击推导——本轮 success/already 清零，否则 +1
-fn buddy_ai_acct_streak_next(prev: u32, ok: bool) -> u32 {
-    if ok {
-        0
-    } else {
-        prev + 1
-    }
-}
-
-/// 整轮粒度连击推导纯函数（issue #134 方案3，wb-checkin/wb-growth 共用）：
+/// 纯函数：按本轮 成功数（含 already）/失败数 推导新连击值（独立便于单测）。
 /// 任一成功（含 already）→ 清零；混合轮不计数（随任一成功一并清零，绝不 +1）；
 /// 全轮失败 → +1；两者皆 0（空池空转）→ 原值不动
 fn buddy_ai_streak_next(prev: i64, ok_count: i64, failed_count: i64) -> i64 {
@@ -1270,16 +1140,6 @@ fn summarize(v: &Value, task_key: &str) -> String {
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
             let unit = if task_key == "buddy-ai-checkin" { "已打" } else { "已签" };
             return format!("成功 {o}，{unit} {a}，失败 {f}");
-        }
-        // 豆包额度巡检（ok 为 bool、计数为 success/failed/exhausted，3.8.5 审查 L2：
-        // 旧逻辑只认 i64 ok 三元组，巡检轮次落入 JSON 截断展示、明细不可读）
-        if let (Some(true), Some(succ), Some(fail)) = (
-            v.get("ok").and_then(Value::as_bool),
-            get("success"),
-            get("failed"),
-        ) {
-            let exh = get("exhausted").unwrap_or(0);
-            return format!("巡检成功 {succ}，失败 {fail}，额度耗尽 {exh}");
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
@@ -1466,30 +1326,13 @@ mod tests {
         );
     }
 
-    /// 豆包额度巡检空池跳过（issue #147）：`skipped_empty_pool` 豁免口径（审查 #15
-    /// 对齐，不 mark_run 保留当日补打窗口），不返 Err
+    /// 豆包额度巡检空池跳过（issue #147）：`{"ok":true,"skipped":...}` 惯例，不返 Err
     #[test]
     fn doubao_quota_empty_pool_skips() {
         let st = temp_state("doubao_qsk");
         let out = crate::tasks::doubao_quota::run_batch(&st).unwrap();
         assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            out.get("skipped_empty_pool").and_then(Value::as_str),
-            Some("无豆包账号")
-        );
-    }
-
-    /// 3.8.5 审查修复（L2）：豆包巡检结果（bool ok + success/failed/exhausted）
-    /// 走可读摘要分支，不再落入 JSON 截断展示；签到类 i64 三元组不受影响
-    #[test]
-    fn summarize_doubao_quota_bool_ok() {
-        let v = json!({ "ok": true, "mode": "all", "total": 4, "success": 3, "failed": 1, "exhausted": 2 });
-        assert_eq!(summarize(&v, "doubao-quota"), "巡检成功 3，失败 1，额度耗尽 2");
-        let v2 = json!({ "ok": true, "success": 1, "failed": 0 });
-        assert_eq!(summarize(&v2, "doubao-quota"), "巡检成功 1，失败 0，额度耗尽 0");
-        // 签到类 ok/already/failed（i64）仍走第一分支
-        let v3 = json!({ "ok": 2, "already": 1, "failed": 0 });
-        assert_eq!(summarize(&v3, "trae-checkin"), "成功 2，已签 1，失败 0");
+        assert_eq!(out.get("skipped").and_then(Value::as_str), Some("无豆包账号"));
     }
 
     /// 看板同步/模型同步的调度计划：默认 every_hours 每2小时（issue #82）；
@@ -1650,10 +1493,10 @@ mod tests {
         assert_eq!(retry_cooldown_ms(&st, key), 60 * 60_000);
     }
 
-    // ── 审查修复（第6项）+ #14/#16：buddy-ai 打卡/续期失败连击 ──────────────────
+    // ── 审查修复（第6项）：buddy-ai 打卡整轮失败连击 ──────────────────────────
 
-    /// 连击纯函数（issue #134 方案3，整轮粒度）：全轮失败 +1；任一成功清零；
-    /// 混合轮不计数；两者皆 0（空池空转）原值不动
+    /// 连击纯函数：任一成功（含 already）清零；全轮失败 +1；混合轮不计数（随任一
+    /// 成功清零，绝不 +1）；两者皆 0（空池空转）原值不动
     #[test]
     fn buddy_ai_streak_next_rules() {
         // 全轮失败：+1
@@ -1669,69 +1512,8 @@ mod tests {
         assert_eq!(buddy_ai_streak_next(0, 0, 0), 0);
     }
 
-    /// 连击纯函数（#14 新语义）：单账号粒度——本轮 success/already 清零，否则 +1。
-    /// 原 buddy_ai_streak_next（整轮粒度、任一成功即清零）单测固化「混合轮清零」，
-    /// 但该语义使永久失效账号混在健康账号中时连击永不达阈值（全天 30 分钟重试
-    /// 空转、当日暂停永不触发）——按账号粒度重写：混合轮中失效账号照常累计，
-    /// 健康账号照常清零，互不影响
-    #[test]
-    fn buddy_ai_acct_streak_next_rules() {
-        // 失败：+1
-        assert_eq!(buddy_ai_acct_streak_next(0, false), 1);
-        assert_eq!(buddy_ai_acct_streak_next(2, false), 3);
-        // 本轮 success/already：清零
-        assert_eq!(buddy_ai_acct_streak_next(2, true), 0);
-        assert_eq!(buddy_ai_acct_streak_next(0, true), 0);
-    }
-
-    /// 连击聚合（#14）：混合轮中失效账号逐轮累计至阈值并列入 dead，健康账号
-    /// 同轮清零互不影响；连击中断（恢复成功）后重新从 0 累计
-    #[test]
-    fn buddy_ai_acct_streaks_apply_mixed_rounds() {
-        let mut map = std::collections::HashMap::new();
-        let ev = |id: &str, status: &str| {
-            json!({ "id": id, "status": status })
-        };
-        // 第 1 轮：A 失败、B 成功 → A=1、B 移除
-        let dead = buddy_ai_acct_streaks_apply(
-            &mut map,
-            &[ev("A", "fail"), ev("B", "success")],
-            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
-        );
-        assert!(dead.is_empty());
-        assert_eq!(map.get("A"), Some(&1));
-        assert!(!map.contains_key("B"), "健康账号不留在连击表");
-        // 第 2 轮：A 再失败 → A=2；同轮 C already（混合轮失效账号仍累计——旧
-        // 整轮语义在此轮清零，正是 #14 修复点）
-        let dead = buddy_ai_acct_streaks_apply(
-            &mut map,
-            &[ev("A", "fail"), ev("C", "already")],
-            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
-        );
-        assert!(dead.is_empty());
-        assert_eq!(map.get("A"), Some(&2));
-        // 第 3 轮：A 三连败达阈值 → 进 dead；B 成功事件照常清零
-        let dead = buddy_ai_acct_streaks_apply(
-            &mut map,
-            &[ev("A", "fail"), ev("B", "success")],
-            BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT as u32,
-        );
-        assert_eq!(dead, vec!["A".to_string()]);
-        // 恢复成功：连击清零，不再进 dead
-        let dead = buddy_ai_acct_streaks_apply(&mut map, &[ev("A", "success")], 3);
-        assert!(dead.is_empty());
-        assert!(!map.contains_key("A"));
-        // 事件缺 id / 空 id：跳过不计
-        let dead = buddy_ai_acct_streaks_apply(
-            &mut map,
-            &[json!({ "status": "fail" }), ev("", "fail")],
-            1,
-        );
-        assert!(dead.is_empty());
-    }
-
     /// 连击 kv 持久化 + 跨日重置：date == 今日读回计数值；date ≠ 今日（跨日）从 0 起；
-    /// 无记录/损坏文档兜底 0（打卡与 renew 各自独立键位，#16）
+    /// 无记录/损坏文档兜底 0
     #[test]
     fn buddy_ai_checkin_streak_persist_and_day_reset() {
         let st = temp_state("buddy_streak");
@@ -1761,8 +1543,7 @@ mod tests {
         let st = temp_state("buddy_gate");
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         buddy_ai_checkin_streak_save(&st, &today, BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT);
-        let v = run_task("buddy-ai-checkin", &st, None, &mut BuddyAiAcctFailStreaks::default(), None)
-            .expect("门禁跳过应为 Ok");
+        let v = run_task("buddy-ai-checkin", &st, None, None).expect("门禁跳过应为 Ok");
         assert_eq!(v.get("skipped_fail_streak").and_then(Value::as_bool), Some(true));
         assert!(
             v.get("skipped").and_then(Value::as_str).unwrap_or("").contains("当日暂停"),
@@ -1770,27 +1551,21 @@ mod tests {
         );
     }
 
-    /// 审查 #16：buddy-ai-renew 全败轮连击熔断——Err 轮逐次累计，达阈值后门禁
-    /// 返回 skipped_fail_streak 当日暂停（不执行续期轮）；成功/空转轮清零连击
+    /// 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：trae/wb/qoder
+    /// 签到空池时 run_task 返回 skipped_empty_pool——tick 据此不 mark_run，当日
+    /// 导入账号下一 tick 正常补打；早退在轮次锁/网络请求之前，测试无副作用
     #[test]
-    fn buddy_ai_renew_streak_circuit_breaker() {
-        let st = temp_state("buddy_renew_cb");
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        // 前两轮全败（模拟：直接写连击值，覆盖 Err 分支的 save 语义）
-        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 2);
-        // 第 3 轮全败：Err 分支累计至 3（门禁阈值）——此后暂停
-        //（不实际执行续期轮：空池 renew 返回 Ok(skipped)，此处仅验连击语义）
-        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 3);
-        assert_eq!(day_scoped_streak(&st, BUDDY_AI_RENEW_STREAK_KEY, &today), 3);
-        // 达阈值 → 门禁跳过（Ok + skipped_fail_streak，不执行任务体）
-        let v = run_task("buddy-ai-renew", &st, None, &mut BuddyAiAcctFailStreaks::default(), None)
-            .expect("熔断门禁应为 Ok");
-        assert_eq!(v.get("skipped_fail_streak").and_then(Value::as_bool), Some(true));
-        // 成功/空转轮清零：Ok 分支 prev != 0 时写 0
-        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 0);
-        assert_eq!(day_scoped_streak(&st, BUDDY_AI_RENEW_STREAK_KEY, &today), 0);
-        // 与打卡连击键位隔离：renew 连击不影响打卡门禁读数
-        day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 3);
-        assert_eq!(buddy_ai_checkin_streak(&st, &today), 0);
+    fn reward_checkin_empty_pool_exemption() {
+        for key in ["trae-checkin", "wb-checkin", "qoder-checkin"] {
+            let st = temp_state("reward_empty_pool");
+            let v = run_task(key, &st, None, None).expect("空池应为 Ok 跳过");
+            assert_eq!(
+                v.get("skipped_empty_pool").and_then(Value::as_bool),
+                Some(true),
+                "{key} 空池须打 skipped_empty_pool（否则 mark_run 固化当日已跑，当日导入账号丢补打）"
+            );
+            assert!(v.get("skipped").and_then(Value::as_str).is_some(), "{key} 空池须带跳过原因");
+            assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
+        }
     }
 }

@@ -35,6 +35,8 @@ import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
 import { TagChips } from '../accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
+import { PoolStatusBadge } from '../accounts/PoolStatusBadge';
+import { usePoolStatus } from '../../hooks/usePoolStatus';
 import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../../lib/tauri';
@@ -105,6 +107,8 @@ type ChatMetaEntry = [string, { backed: boolean; files?: number; backed_at?: str
 
 export default function BuddyAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
+  // 运行期限流/冷却徽标（issue #178）：429 软冷却/积分耗尽硬冷却只在网关内存池，联表注入
+  const poolStatus = usePoolStatus('wb');
   const clearSwitchLocks = useAppStore((s) => s.clearSwitchLocks);
   const switchTo = useAppStore((s) => s.switchTo);
   const switchingTo = useAppStore((s) => s.switchingTo);
@@ -152,8 +156,8 @@ export default function BuddyAccounts() {
   //（桥 current_account.txt 标记）驱动 CB当前 徽标
   // 双应用切换/保存菜单（复刻 Trae Accounts appMenu）：{ id, kind } —— kind='switch' 切换登录态 / 'save' 保存登录态
   const [appMenu, setAppMenu] = useState<{ id: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
-  // 行内异步操作互斥（凭证续期 / CLI 桥接 / 会话备份 / 清除需重登标记）：执行期间该行异步按钮禁用 + spinner
-  const [rowOp, setRowOp] = useState<{ id: string; kind: 'refresh' | 'cli' | 'backup' | 'clear_relogin' } | null>(null);
+  // 行内异步操作互斥（凭证续期 / CLI 桥接 / 会话备份）：执行期间该行异步按钮禁用 + spinner
+  const [rowOp, setRowOp] = useState<{ id: string; kind: 'refresh' | 'cli' | 'backup' } | null>(null);
   // 各弹框确认按钮 pending 态（防连点重复触发）
   const [confirmImportBusy, setConfirmImportBusy] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -503,22 +507,14 @@ export default function BuddyAccounts() {
     }
   };
 
-  /** 人工清除「需重登」标记（不动凭证）：标记可能是过期误判，或用户想强行试一次切换。
-      rowOp 互斥防连点（后端幂等，但并发重复请求 + 重复 toast 无意义） */
+  /** 人工清除「需重登」标记（不动凭证）：标记可能是过期误判，或用户想强行试一次切换 */
   const handleClearRelogin = async (a: WorkBuddyAccountView) => {
-    if (rowOp) {
-      pushToast('warn', '已有账号操作执行中，请稍候');
-      return;
-    }
-    setRowOp({ id: a.id, kind: 'clear_relogin' });
     try {
-      await withMinDelay(api.workbuddy.clearRelogin(a.id), 500);
+      await api.workbuddy.clearRelogin(a.id);
       pushToast('success', `已清除「需重登」标记：${a.nickname || a.id}（凭证未改动）`);
       await refresh();
     } catch (err) {
       pushToast('error', `清除标记失败：${String(err)}`);
-    } finally {
-      setRowOp(null);
     }
   };
 
@@ -534,10 +530,6 @@ export default function BuddyAccounts() {
   };
 
   const handleRefreshToken = async (a: WorkBuddyAccountView) => {
-    if (rowOp) {
-      pushToast('warn', '已有账号操作执行中，请稍候');
-      return;
-    }
     setRowOp({ id: a.id, kind: 'refresh' });
     try {
       await withMinDelay(api.workbuddy.refreshToken(a.id, true), 1000);
@@ -552,10 +544,6 @@ export default function BuddyAccounts() {
 
   // 设为 CLI 账号（F-06）：token store 凭证 → ~/.codebuddy/settings.json env
   const handleSetCli = async (a: WorkBuddyAccountView) => {
-    if (rowOp) {
-      pushToast('warn', '已有账号操作执行中，请稍候');
-      return;
-    }
     setRowOp({ id: a.id, kind: 'cli' });
     try {
       await withMinDelay(api.workbuddy.cliBridgeSet(a.id), 800);
@@ -974,6 +962,10 @@ export default function BuddyAccounts() {
                             <ShieldAlert size={12} />
                           </span>
                         )}
+                        {/* 运行期限流/冷却（issue #178）：网关内存池状态，无则不渲染。
+                            池条目以内部账号 id（wb-<hash>）为键——wb_upstream_accounts
+                            的 uid=a.id，而非真实用户 uuid（View.uid），勿用 a.uid 联表 */}
+                        <PoolStatusBadge status={poolStatus.get(a.id)} />
                       </div>
                       <div className="font-mono text-xs text-slate-400">{maskUid(a.uid)}</div>
                     </td>
@@ -988,13 +980,8 @@ export default function BuddyAccounts() {
                               prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)),
                             );
                             reloadGroups();
-                            // Low 修复（审查 L38）：写操作成功可见反馈（原先仅失败有提示）
-                            pushToast(
-                              'success',
-                              gid
-                                ? `「${a.nickname || a.id}」分组已调整`
-                                : `「${a.nickname || a.id}」已移出分组`,
-                            );
+                            // 审查修复（L38）：行内分组调整成功补可见反馈（原先仅失败有提示）
+                            pushToast('success', `「${a.nickname || a.id}」分组已调整`);
                           }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
                         }}
                       />
@@ -1089,9 +1076,9 @@ export default function BuddyAccounts() {
                           <span
                             className={
                               a.snapshot_verify_failed_workbuddy_ms || a.snapshot_invalid_workbuddy
-                                ? 'text-rose-500 dark:text-rose-400'
+                                ? 'text-rose-500'
                                 : a.snapshot_verify_timeout_workbuddy_ms
-                                  ? 'text-amber-500 dark:text-amber-400'
+                                  ? 'text-amber-500'
                                   : a.has_snapshot
                                     ? 'text-emerald-600 dark:text-emerald-400'
                                     : 'text-slate-300 dark:text-zinc-600'
@@ -1100,9 +1087,9 @@ export default function BuddyAccounts() {
                               a.snapshot_invalid_workbuddy
                                 ? '快照不可用：槽内没有有效登录态，或登录身份与该账号不符（被其它账号的登录态覆盖）；切换回来必然失败，请在客户端登录该账号后重新「保存当前登录态」'
                                 : a.snapshot_verify_failed_workbuddy_ms
-                                  ? `上次切换到 WorkBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString('zh-CN')}）；建议重新登录后「保存当前登录态」`
+                                  ? `上次切换到 WorkBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
                                   : a.snapshot_verify_timeout_workbuddy_ms
-                                    ? `上次切换到 WorkBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_workbuddy_ms).toLocaleString('zh-CN')}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    ? `上次切换到 WorkBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_workbuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
                                     : a.has_snapshot
                                       ? `WorkBuddy 登录态快照保存于 ${a.snapshot_saved_at_workbuddy_ms ? new Date(a.snapshot_saved_at_workbuddy_ms).toLocaleString() : '未知时间'}`
                                       : '没有 WorkBuddy 登录态快照'
@@ -1113,9 +1100,9 @@ export default function BuddyAccounts() {
                           <span
                             className={
                               a.snapshot_verify_failed_codebuddy_ms || a.snapshot_invalid_codebuddy
-                                ? 'text-rose-500 dark:text-rose-400'
+                                ? 'text-rose-500'
                                 : a.snapshot_verify_timeout_codebuddy_ms
-                                  ? 'text-amber-500 dark:text-amber-400'
+                                  ? 'text-amber-500'
                                   : a.has_snapshot_codebuddy
                                     ? 'text-emerald-600 dark:text-emerald-400'
                                     : 'text-slate-300 dark:text-zinc-600'
@@ -1124,9 +1111,9 @@ export default function BuddyAccounts() {
                               a.snapshot_invalid_codebuddy
                                 ? '快照不可用：槽内没有有效登录态，或登录身份与该账号不符（被其它账号的登录态覆盖）；切换回来必然失败，请在客户端登录该账号后重新「保存当前登录态」'
                                 : a.snapshot_verify_failed_codebuddy_ms
-                                  ? `上次切换到 CodeBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString('zh-CN')}）；建议重新登录后「保存当前登录态」`
+                                  ? `上次切换到 CodeBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
                                   : a.snapshot_verify_timeout_codebuddy_ms
-                                    ? `上次切换到 CodeBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_codebuddy_ms).toLocaleString('zh-CN')}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    ? `上次切换到 CodeBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_codebuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
                                     : a.has_snapshot_codebuddy
                                       ? `CodeBuddy 登录态快照（含 vscdb 登录真源）保存于 ${a.snapshot_saved_at_codebuddy_ms ? new Date(a.snapshot_saved_at_codebuddy_ms).toLocaleString() : '未知时间'}`
                                       : '没有 CodeBuddy 登录态快照'
@@ -1143,7 +1130,7 @@ export default function BuddyAccounts() {
                           title={switching ? '操作执行中…' : a.needs_relogin ? '需重新登录后才能切换' : '设为当前（选择目标应用）'}
                           onClick={(e) => openAppMenu(a, 'switch', e)}
                           disabled={busy || a.needs_relogin}
-                          className={`btn-ghost !p-2 ${switching ? 'text-amber-500 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'} ${(busy || a.needs_relogin) && !switching ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          className={`btn-ghost !p-2 ${switching ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(busy || a.needs_relogin) && !switching ? 'opacity-40 cursor-not-allowed' : ''}`}
                         >
                           {switching ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
@@ -1153,17 +1140,17 @@ export default function BuddyAccounts() {
                           <button
                             title={`清除「需重登」标记（忽略即可切换，凭证不改）${a.relogin_reason ? `\n原因：${a.relogin_reason}` : ''}`}
                             onClick={() => void handleClearRelogin(a)}
-                            disabled={busy || rowOpKind != null}
+                            disabled={busy}
                             className="btn-ghost !p-2 text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-800"
                           >
-                            {rowOpKind === 'clear_relogin' ? <Loader2 size={14} className="animate-spin" /> : <Eraser size={14} />}
+                            <Eraser size={14} />
                           </button>
                         )}
                         <button
                           title={savingLogin === a.id ? '正在保存登录态…' : '保存当前登录态（选择目标应用）'}
                           onClick={(e) => openAppMenu(a, 'save', e)}
                           disabled={busy}
-                          className={`btn-ghost !p-2 ${savingLogin === a.id ? 'text-amber-500 dark:text-amber-400' : ''} ${busy && savingLogin !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          className={`btn-ghost !p-2 ${savingLogin === a.id ? 'text-amber-500' : ''} ${busy && savingLogin !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
                         >
                           {savingLogin === a.id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                         </button>
@@ -1269,27 +1256,6 @@ export default function BuddyAccounts() {
                     const { id, kind } = appMenu;
                     setAppMenu(null);
                     if (kind === 'switch') {
-                      // 无快照引导：该应用域从未保存过登录态，切换必然失败——
-                      // 直接提示补救路径，不发无效请求（后端 switch_account 同步预检兜底）
-                      const acc = accounts.find((x) => x.id === id);
-                      if (!acc) {
-                        // 菜单打开到点击之间账号可能被删除/列表已刷新，避免误提示「没保存过登录态」
-                        pushToast('warn', '账号信息已变化，请刷新列表后重试');
-                        return;
-                      }
-                      const snapOk = opt.app === 'WorkBuddy' ? acc.has_snapshot : acc.has_snapshot_codebuddy;
-                      if (!snapOk) {
-                        pushToast('warn', `该账号还没有保存过 ${opt.label} 登录态：请先在 ${opt.label} 客户端登录此账号，回到本页点击「保存当前登录态」，成功后即可一键切换`);
-                        return;
-                      }
-                      // invalid 门禁：快照不可用（槽内无有效登录态/身份不符）时切换必然
-                      // 失败——与徽标文案承诺一致，前端同样拦截（后端同步预检兜底）
-                      const snapInvalid =
-                        opt.app === 'WorkBuddy' ? acc.snapshot_invalid_workbuddy : acc.snapshot_invalid_codebuddy;
-                      if (snapInvalid) {
-                        pushToast('warn', `${opt.label} 快照异常（槽内无有效登录态或身份与该账号不符）：请在 ${opt.label} 客户端重新登录此账号后点「保存当前登录态」修复快照`);
-                        return;
-                      }
                       void switchTo(id, opt.app);
                     } else {
                       void saveCurrentLogin(id, opt.app);

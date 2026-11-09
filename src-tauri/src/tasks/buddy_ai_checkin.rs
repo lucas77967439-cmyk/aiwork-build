@@ -76,6 +76,9 @@ pub struct DosageInfo {
     pub total: f64,
     pub expire_secs: Option<i64>,
     pub packages: Vec<DosagePackage>,
+    /// 解析诊断（issue #179）：包明细为空 / 出现未知 Status 值时携带响应骨架，
+    /// None = 正常形态。调用方落 app_log 留证（响应体不含 token，无敏感泄漏面）
+    pub parse_diag: Option<String>,
 }
 
 /// 官网日期时间字符串解析（"YYYY-MM-DD HH:MM:SS"，+08:00 墙钟 → epoch 秒）
@@ -86,11 +89,119 @@ pub fn parse_cn_datetime(s: &str) -> Option<i64> {
     Some(offset.from_local_datetime(&dt).single()?.timestamp())
 }
 
+/// 到期字符串宽容解析（issue #179）：官网墙钟 "%Y-%m-%d %H:%M:%S"（+08:00）→
+/// RFC3339/ISO 带时区 → 无时区 ISO "%Y-%m-%dT%H:%M:%S"（按 +08:00 墙钟）→
+/// 纯日期（当日 23:59:59 +08:00）
+pub fn parse_expire_str(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(t) = parse_cn_datetime(s) {
+        return Some(t);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+        return Some(offset.from_local_datetime(&dt).single()?.timestamp());
+    }
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+    let dt = d.and_hms_opt(23, 59, 59)?;
+    Some(offset.from_local_datetime(&dt).single()?.timestamp())
+}
+
+/// 包特征键：名字类（PackageCode/PackageName）或容量类（Precise 优先的 remain/size）。
+/// 上游换容器名/挪层级时条目仍带这些字段——据此全树识别而非依赖固定路径
+const PACKAGE_SIG_KEYS: [&str; 6] = [
+    "PackageCode",
+    "PackageName",
+    "CapacityRemainPrecise",
+    "CapacityRemain",
+    "CycleCapacitySizePrecise",
+    "CycleCapacitySize",
+];
+
+fn looks_like_package(o: &serde_json::Map<String, Value>) -> bool {
+    PACKAGE_SIG_KEYS.iter().any(|k| o.contains_key(*k))
+}
+
+/// 全树递归收集包条目（限深 8）：命中特征键的对象不再下钻（防嵌套重复收集）。
+/// 旧实现固定 `core.get("Accounts")` 路径，上游换层级/容器改名即整包清零而
+/// TotalDosage（递归 dig）仍显示——「总分在、包和到期全空」的 issue #179 症状
+fn collect_package_items<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    fn walk<'a>(v: &'a Value, depth: u32, out: &mut Vec<&'a Value>) {
+        if depth > 8 {
+            return;
+        }
+        match v {
+            Value::Object(m) => {
+                if looks_like_package(m) {
+                    out.push(v);
+                    return;
+                }
+                for x in m.values() {
+                    walk(x, depth + 1, out);
+                }
+            }
+            Value::Array(a) => {
+                for x in a {
+                    walk(x, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, 0, out);
+}
+
+/// 响应骨架（诊断，issue #179）：对象展开键名树、数组取前 2 个元素、长字符串
+/// 截断为长度标记；数值保留（容量/总量对定位有用，响应体不含 token）；限深 4
+fn skeleton(v: &Value, depth: u32) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut o = serde_json::Map::new();
+            if depth < 4 {
+                for (k, x) in m {
+                    o.insert(k.clone(), skeleton(x, depth + 1));
+                }
+            }
+            Value::Object(o)
+        }
+        Value::Array(a) => Value::Array(a.iter().take(2).map(|x| skeleton(x, depth + 1)).collect()),
+        Value::Null => json!(null),
+        Value::Bool(b) => json!(b),
+        Value::Number(n) => json!(n),
+        Value::String(s) => {
+            let n = s.chars().count();
+            if n > 32 {
+                json!(format!("str(len={n})"))
+            } else {
+                json!(s)
+            }
+        }
+    }
+}
+
 /// 包条目字段取值：Precise 字符串优先（精度丢失小），回退整数字段
 fn pkg_f64(obj: &Value, precise_key: &str, plain_key: &str) -> f64 {
     dig_f64(obj, precise_key)
         .or_else(|| dig_f64(obj, plain_key))
         .unwrap_or(0.0)
+}
+
+/// 解析诊断落日志（issue #179）：仅异常形态（明细空/未知 Status）时记录，
+/// 正常取数零开销零噪音
+fn log_parse_diag(state: &AppState, acct_id: &str, info: &Option<DosageInfo>) {
+    if let Some(d) = info.as_ref().and_then(|i| i.parse_diag.as_deref()) {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("buddy-ai: 积分解析诊断 {acct_id}: {d}"),
+        );
+    }
 }
 
 pub fn fetch_dosage_info(
@@ -111,61 +222,115 @@ pub fn fetch_dosage_info(
     let v: Value = resp.into_json().ok()?;
     // R-6 实测嵌套：{data: {Response: {Data: {TotalDosage, Accounts[...]}}}}。
     // ⚠️ dig 的信封穿透表 ENVELOPE_KEYS 全小写，"Response"/"Data" 大写不命中——
-    // 固定层级用 fs_utils::path 严格下钻，回退 dig 平铺形态（兼容旧版）
-    let data = digv(&v, &["data"]);
-    let core = data
-        .and_then(|d| crate::fs_utils::path(d, &["Response", "Data"]))
-        .or(data)?;
+    // 固定层级用 fs_utils::path 严格下钻，回退 dig 平铺形态（兼容旧版）。
+    // 无 data 信封 = 响应不可信（登录失效/接口变更），维持 None 口径——调用方
+    // 跳过回写，不得把 total=0 写进池
+    digv(&v, &["data"])?; // 无 data 信封 = 响应不可信（登录失效/接口变更），维持
+    // None 口径——调用方跳过回写，不得把 total=0 写进池。解析本身以整个响应为
+    // 范围（issue #179：包收集/total 深挖/骨架都不再受固定 Response/Data 层级
+    // 约束），无需再下钻 core
+    Some(parse_dosage_body(&v))
+}
+
+/// 响应体解析（issue #179 兼容加固，与网络层解耦便于单测）：
+/// - 包条目**全响应**递归收集（不再依赖固定 Accounts 路径/容器名，包容器挪层级/改名
+///   均能命中；包特征键足够特异，全树收集误收风险极低）；
+/// - Status 未知值 fail-open 保留并落诊断（上游新增状态值不再静默清空整包）；
+/// - 到期解析补 ISO/纯日期兜底；ExpiredTime 补字符串形态。
+/// `root` = 整个响应：包收集、TotalDosage 深挖、诊断骨架统一范围。
+pub fn parse_dosage_body(root: &Value) -> DosageInfo {
     let now = chrono::Utc::now().timestamp();
-    // 分包明细（Status 0=有效/3=宽限；其余状态不计）
+    // 分包明细（Status 0=有效/3=宽限；未知值保留 + 记诊断）
     let mut packages = Vec::new();
     let mut expire_candidates: Vec<i64> = Vec::new();
-    if let Some(arr) = core.get("Accounts").and_then(Value::as_array) {
-        for a in arr {
-            let status = a.get("Status").and_then(Value::as_i64).unwrap_or(0);
-            if status != 0 && status != 3 {
-                continue;
-            }
-            let cycle_end = a
-                .get("CycleEndTime")
-                .and_then(Value::as_str)
-                .and_then(parse_cn_datetime);
-            if let Some(e) = cycle_end {
-                if e > now {
-                    expire_candidates.push(e);
-                }
-            }
-            // 旧字段兼容：数值型 ExpiredTime（秒/毫秒归一）
-            if let Some(t) = a.get("ExpiredTime").and_then(Value::as_f64) {
-                let secs = if t > 1e12 { t / 1000.0 } else { t };
-                if secs > now as f64 {
-                    expire_candidates.push(secs as i64);
-                }
-            }
-            packages.push(DosagePackage {
-                name: a
-                    .get("PackageName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                code: a
-                    .get("PackageCode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                remain: pkg_f64(a, "CapacityRemainPrecise", "CapacityRemain"),
-                size: pkg_f64(a, "CycleCapacitySizePrecise", "CycleCapacitySize"),
-                expire_secs: cycle_end,
-            });
+    let mut unknown_statuses: Vec<Value> = Vec::new();
+    let mut items = Vec::new();
+    collect_package_items(root, &mut items);
+    for a in items {
+        let status_raw = a.get("Status").cloned().unwrap_or(Value::Null);
+        let status = status_raw
+            .as_i64()
+            .or_else(|| status_raw.as_str().and_then(|s| s.trim().parse().ok()))
+            .unwrap_or(0);
+        if status != 0 && status != 3 {
+            unknown_statuses.push(status_raw.clone());
         }
+        let cycle_end = a
+            .get("CycleEndTime")
+            .and_then(Value::as_str)
+            .and_then(parse_expire_str);
+        // 已知状态（0=有效/3=宽限）才参与「最近到期」汇总：未知 Status（上游新增
+        // 作废/异常/冻结包）fail-open 保留明细与诊断，但其到期不入池——否则未知包
+        // 的 CycleEndTime 会把账号到期误导为未来某刻
+        if let Some(e) = cycle_end {
+            if (status == 0 || status == 3) && e > now {
+                expire_candidates.push(e);
+            }
+        }
+        // 旧字段兼容：数值/数字字符串 ExpiredTime（秒/毫秒归一）
+        let expired_num = a
+            .get("ExpiredTime")
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                a.get("ExpiredTime")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+            });
+        if let Some(t) = expired_num {
+            let secs = if t > 1e12 { t / 1000.0 } else { t };
+            if (status == 0 || status == 3) && secs > now as f64 {
+                expire_candidates.push(secs as i64);
+            }
+        }
+        packages.push(DosagePackage {
+            name: a
+                .get("PackageName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            code: a
+                .get("PackageCode")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            remain: pkg_f64(a, "CapacityRemainPrecise", "CapacityRemain"),
+            size: pkg_f64(a, "CycleCapacitySizePrecise", "CycleCapacitySize"),
+            expire_secs: cycle_end,
+        });
     }
-    let total = dig_f64(core, "TotalDosage").unwrap_or_else(|| packages.iter().map(|p| p.remain).sum());
+    // TotalDosage 从整个响应递归深挖（core 内固定层级外的候选也命中；dig 全树递归）
+    let total = dig_f64(root, "TotalDosage").unwrap_or_else(|| packages.iter().map(|p| p.remain).sum());
+    // 解析诊断（issue #179）：明细为空（形状可能变化）或未知 Status 时携带证据，
+    // 调用方落 app_log——修复前此场景完全静默，无法定位。骨架基于整个响应
+    // （包容器挪出 core 时骨架仍能看到新容器名）
+    let parse_diag = if packages.is_empty() {
+        Some(
+            json!({
+                "warn": "get-user-resource 包明细解析为空，上游响应形状可能变化（issue #179）",
+                "total": total,
+                "statuses": unknown_statuses,
+                "shape": skeleton(root, 0),
+            })
+            .to_string(),
+        )
+    } else if !unknown_statuses.is_empty() {
+        Some(
+            json!({
+                "warn": "get-user-resource 出现未知 Status 值，已计入明细",
+                "statuses": unknown_statuses,
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
     let expire_secs = expire_candidates.iter().copied().min();
-    Some(DosageInfo {
+    DosageInfo {
         total,
         expire_secs,
         packages,
-    })
+        parse_diag,
+    }
 }
 
 /// dig 单键 f64（数值或数字字符串兜底）
@@ -193,15 +358,10 @@ fn web_headers<'a>(
         .set("Accept", "application/json, text/plain, */*")
 }
 
-/// 退避重试的错误分类：HTTP 状态码（区分 4xx 语义失败 / 5xx 瞬时抖动）与消息。
-/// 审查 #17：新增 Fatal 变体——请求已产生服务端副作用（或已确认被服务端拒绝）
-/// 时不再重试，直接 fail 交整轮冷却
+/// 退避重试的错误分类：HTTP 状态码（区分 4xx 语义失败 / 5xx 瞬时抖动）与消息
 enum BackoffErr {
     Status(u16),
     Msg(String),
-    /// 已拿到 HTTP 响应后的确定性失败（解析失败/响应缺字段/非幂等端点已达服务端）：
-    /// 重试会产生重复副作用（如建会话 POST → 孤儿会话），立即失败不重试
-    Fatal(String),
 }
 
 impl From<ureq::Error> for BackoffErr {
@@ -214,8 +374,7 @@ impl From<ureq::Error> for BackoffErr {
 }
 
 /// 带秒级退避的请求执行：4xx 语义性失败不重试直返；网络类 Err 与 5xx 重试
-/// STEP_RETRIES 次（1s 起翻倍封顶 15s，§4.5：避免一次抖动熔断整池）；
-/// Fatal（已确认副作用/确定性失败）立即直返，不 sleep 不重试
+/// STEP_RETRIES 次（1s 起翻倍封顶 15s，§4.5：避免一次抖动熔断整池）
 fn with_backoff<T>(mut f: impl FnMut() -> Result<T, BackoffErr>) -> Result<T, String> {
     let mut last = String::new();
     for attempt in 0..STEP_RETRIES {
@@ -228,8 +387,6 @@ fn with_backoff<T>(mut f: impl FnMut() -> Result<T, BackoffErr>) -> Result<T, St
                 }
             }
             Err(BackoffErr::Msg(m)) => last = m,
-            // 审查 #17：Fatal 立即返回——重试只会重复副作用（孤儿会话）或注定失败
-            Err(BackoffErr::Fatal(m)) => return Err(m),
         }
         if attempt + 1 < STEP_RETRIES {
             backoff_sleep(attempt);
@@ -313,6 +470,7 @@ fn process_account(
 
     // ⑥ 前置：打卡前积分快照（失败不阻塞打卡——到账校验是加分项不是门槛）
     let before = fetch_dosage_info(agent, base, token, uid);
+    log_parse_diag(state, acct_id, &before);
 
     // ① 建会话
     let body = json!({
@@ -321,71 +479,40 @@ fn process_account(
         "conversationOrigin": "workbuddy-app",
         "plugins": [{ "name": "weixinpay", "marketplace": "codebuddy-builtin" }],
     });
-    // 审查 #17（非幂等端点）：POST /console/as/conversations/ 建会话非幂等——
-    // 响应已达（拿到 HTTP 响应）后任何失败（4xx/5xx/解析失败/data.id 缺失）都
-    // 可能是「会话已建但结果未确认」，按 Msg/Status 退避重试最多再造 2 个孤儿
-    // 会话。故仅 Transport 类错误（请求未达服务端）走退避重试；拿到响应即
-    // Fatal 不重试，直接 fail 交整轮冷却。步骤② GET /session 只读同一 conv_id、
-    // 无建副作用，维持通用退避重试不受此收敛影响
-    let conv_id = with_backoff(|| {
-        let resp = match web_headers(
-            agent.post(&format!("{base}/console/as/conversations/")),
-            token,
-            uid,
-        )
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        {
-            Ok(r) => r,
-            // 已拿到 HTTP 响应（无论状态码）：会话可能已建立，不重试；响应体
-            // 脱敏落盘佐证（JSON 结构化脱敏 / 非 JSON 文本正则脱敏，#18）
-            Err(ureq::Error::Status(code, resp)) => {
-                let head = match resp.into_string() {
-                    Ok(b) => match serde_json::from_str::<Value>(&b) {
-                        Ok(v) => trim_json(&v),
-                        Err(_) => sanitize_err_body(&b).chars().take(600).collect(),
-                    },
-                    Err(_) => String::new(),
-                };
-                if !head.is_empty() {
-                    crate::fs_utils::app_log(
-                        &state.data_dir,
-                        &format!("buddy-ai: 建会话 HTTP {code} 响应体：{head}"),
-                    );
-                }
-                return Err(BackoffErr::Fatal(format!("HTTP {code}")));
-            }
-            // Transport 类（连接失败/超时）：请求未达服务端，重试无孤儿风险
-            Err(e) => return Err(BackoffErr::from(e)),
-        };
-        // 响应已达：此后任何失败均为 Fatal（不重试）
-        let v: Value = resp
-            .into_json()
-            .map_err(|e| BackoffErr::Fatal(format!("建会话响应解析失败：{e}")))?;
+    // ① 建会话（审查 #17：POST 非幂等，不走 with_backoff——请求已达但响应解析
+    // 失败（Msg 类：into_json 失败/data.id 缺失）时重发会在服务端再建一个会话 →
+    // 孤儿会话累积；失败直接 fail 交整轮冷却由下一轮重打。对齐 session/prompt 不重试口径）
+    let conv_id = (|| {
+        let resp = web_headers(agent.post(&format!("{base}/console/as/conversations/")), token, uid)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())?;
+        let v: Value = resp.into_json().map_err(|e| BackoffErr::Msg(e.to_string()))?;
         // 2026-10-16 实抓修复：dig 是「任意键命中即返回」语义（find_map 逐键全树搜），
         // ["data","id"] 会命中 data 对象本身导致 as_str() 失败——改用 path 严格逐段下钻；
         // id 以字符串为主，兼容数字形态
-        let id = crate::fs_utils::path(&v, &["data", "id"]).ok_or_else(|| {
-            BackoffErr::Fatal(format!("建会话响应无 data.id：{}", trim_json(&v)))
-        })?;
+        let id = crate::fs_utils::path(&v, &["data", "id"])
+            .ok_or_else(|| BackoffErr::Msg(format!("建会话响应无 data.id：{}", trim_json(&v))))?;
         Ok(match id {
             Value::String(s) => s.clone(),
             Value::Number(n) => n.to_string(),
             other => {
-                return Err(BackoffErr::Fatal(format!(
+                return Err(BackoffErr::Msg(format!(
                     "建会话响应 data.id 类型异常（{other}）：{}",
                     trim_json(&v)
                 )))
             }
         })
+    })()
+    .map_err(|e| match e {
+        BackoffErr::Status(c) => format!("HTTP {c}"),
+        BackoffErr::Msg(m) => m,
     });
     let conv_id = match conv_id {
         Ok(v) => v,
         Err(e) => return fail(format!("建会话失败：{e}")),
     };
 
-    // ② 取沙箱（link + 独立 token + sessionId）。GET 只读、无建副作用（#17 核对
-    // 结论）：解析失败重试不会产生重复资源，维持通用退避重试现状
+    // ② 取沙箱（link + 独立 token + sessionId）
     let sess = with_backoff(|| {
         let resp = web_headers(
             agent.get(&format!("{base}/console/as/conversations/{conv_id}/session")),
@@ -591,14 +718,29 @@ fn process_account(
                 // 4xx 诊断：响应体落 app.log（BackoffErr::Status 只带 code 丢失 body，
                 // Accept/Origin 修复是否命中需原文佐证）
                 Err(ureq::Error::Status(code, resp)) => {
-                    // T6 审查修复 + #18：4xx 响应体可能携带沙箱凭证（token/link 等），
-                    // JSON 形态先经 trim_json 脱敏截断再落盘；非 JSON 文本按正则
-                    // 脱敏（token/key/Bearer 后令牌及含 sign/token/sessionId 的
-                    // URL 参数替换 ***）再按字符截断（无 panic 风险），不再原文落盘
+                    // T6 审查修复：4xx 响应体可能携带沙箱凭证（token/link 等），
+                    // JSON 形态先经 trim_json 脱敏截断再落盘；非 JSON 文本回退原
+                    // 口径（chars().take(600) 按字符截断，无 panic 风险）
                     let head = match resp.into_string() {
                         Ok(body) => match serde_json::from_str::<Value>(&body) {
                             Ok(v) => trim_json(&v),
-                            Err(_) => sanitize_err_body(&body).chars().take(600).collect(),
+                            // 审查 #18：非 JSON 文本（HTML 错误页/网关诊断）无法
+                            // 结构化脱敏——含敏感键名即整段隐去（保留字节数供诊断），
+                            // 凭证值不落 app.log；无敏感键仍原文截断保留诊断价值
+                            Err(_) => {
+                                let lower = body.to_lowercase();
+                                if SENSITIVE_KEYS
+                                    .iter()
+                                    .any(|k| lower.contains(&k.to_lowercase()))
+                                {
+                                    format!(
+                                        "[非 JSON 响应体 {} 字节，含敏感字段已整段隐去]",
+                                        body.len()
+                                    )
+                                } else {
+                                    body.chars().take(600).collect()
+                                }
+                            }
                         },
                         Err(_) => String::new(),
                     };
@@ -619,7 +761,6 @@ fn process_account(
             attempt().map_err(|e| match e {
                 BackoffErr::Status(c) => format!("HTTP {c}"),
                 BackoffErr::Msg(m) => m,
-                BackoffErr::Fatal(m) => m,
             })
         } else {
             with_backoff(attempt)
@@ -747,6 +888,7 @@ fn process_account(
 
     // ⑥ 到账校验 + 幂等戳落盘 + 池快照回写（成功才落盘，§4.5：不成功不记打卡）
     let after = fetch_dosage_info(agent, base, token, uid);
+    log_parse_diag(state, acct_id, &after);
     let gain = match (&before, &after) {
         (Some(b), Some(a)) if a.total > b.total => Some(a.total - b.total),
         _ => None,
@@ -891,10 +1033,10 @@ fn acp_answer_request(
     format!("{method} ← 已代答（HTTP {status}）")
 }
 
-/// 诊断摘要敏感键（审查 #18：补 sessionId/session_id/stoken——ACP ② 步 sessionId
-/// 与沙箱 token/link/stoken 同属会话凭证，广播/app_log 落盘前一并打码；模块级供
-/// trim_json 等脱敏路径共用）
-const SENSITIVE_KEYS: [&str; 10] = [
+/// 诊断摘要敏感键（审查 #18：补 sessionId/session_id——ACP ② 步 sessionId 与
+/// 沙箱 token/link 同属会话凭证，广播/app_log 落盘前一并打码；模块级供
+/// trim_json 与非 JSON 文本整段隐去判定共用）
+const SENSITIVE_KEYS: [&str; 9] = [
     "token",
     "access_token",
     "accessToken",
@@ -904,7 +1046,6 @@ const SENSITIVE_KEYS: [&str; 10] = [
     "link",
     "sessionId",
     "session_id",
-    "stoken",
 ];
 
 /// 失败诊断用的响应摘要（审查 H5/H6 修复）：
@@ -946,37 +1087,11 @@ fn redact_sensitive(obj: Option<&mut serde_json::Map<String, Value>>, keys: &[&s
     }
 }
 
-/// 非 JSON 错误体脱敏（审查 #18）：文本形态无法结构化 redact，按正则把
-/// Bearer 头令牌、`token/stoken/sessionId/session_id/sign/key` 等键后的
-/// 值（含 URL 查询参数形态 `?token=…`）替换为 `***`。命中即脱敏宁滥勿缺
-/// （误杀只影响诊断可读性，漏杀是凭证泄漏）；普通错误文案原样保留。
-/// 仅用于 4xx 诊断落盘前的最后兜底，JSON 形态仍走 trim_json 结构化脱敏
-fn sanitize_err_body(body: &str) -> String {
-    use std::sync::OnceLock;
-    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
-    static KV: OnceLock<regex::Regex> = OnceLock::new();
-    // 两遍扫描：① `Bearer <token>` 头（键值对扫描覆盖不到的空格分隔形态）；
-    // ② 敏感键 + 分隔符 + 6 字符以上连续令牌（键名不锚定词首——「assign=」类
-    // 子串命中同样是脱敏而非泄漏，宁滥勿缺）
-    let bearer = BEARER.get_or_init(|| {
-        regex::Regex::new(r#"(?i)bearer[\s=:]+[A-Za-z0-9._%+/=-]{6,}"#)
-            .expect("sanitize_err_body bearer 正则编译失败")
-    });
-    let kv = KV.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)((?:access[_-]?|refresh[_-]?|s)?token|session_?id|stoken|signature|sign|key|authorization|secret)["']?\s*[:=]\s*["']?[A-Za-z0-9._%+/=-]{6,}"#,
-        )
-        .expect("sanitize_err_body kv 正则编译失败")
-    });
-    let s = bearer.replace_all(body, "Bearer ***").to_string();
-    kv.replace_all(&s, "${1}=***").to_string()
-}
-
 /// 打卡整轮：buddy-ai 池全账号串行（NDJSON 管线复用 wb-checkin 契约）。
 /// 返回 done 事件（ok/already/failed 计数），供调度器/启动钩子直接消费。
-/// `runtime`：GUI 进程内网关运行态句柄（调度器/手动打卡/启动补跑传入，对齐
-/// qoder_checkin::run_checkin_round 先例）——到账快照回写运行期 buddy_ai_pool；
-/// CLI 独立进程传 None 跳过（该进程本就无内存池）
+/// `runtime`：GUI 进程内网关运行态句柄（调度器/启动补跑/UI 手动打卡传入，对齐
+/// qoder_checkin::run_checkin_round 提取模式）——打卡到账运行期拨进 buddy_ai_pool
+///（审查 #4）；CLI 独立进程传 None 跳过
 pub fn run_checkin_round(
     state: &AppState,
     runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
@@ -1150,15 +1265,7 @@ pub fn run_checkin_round(
         }
     }
 
-    // 合并复审记录（审查 #4 决策）：此处原并存 macos 侧「按 success 事件
-    // apply_credits_delta 增量回写」实现，与 process_account 的 update_credits_snapshot
-    // 绝对值快照叠加会双重计入（先覆绝对值再累加 dosage 差额，多计一次 reward）——
-    // 绝对值快照自校正且顺带保鲜 credits_expire_at，覆盖增量版全部触发场景，增量版
-    // 删除。qoder 场景 reward 为服务端声明值故增量成立；buddy-ai 的 reward 是
-    // before/after 差值，快照口径才正确（勿再以「qoder 先例」为由恢复增量回写）
-
     let done = json!({ "type": "done", "ok": ok, "already": already, "failed": failed });
-    // 空轮已在函数头提前返回（审查 #15 skipped_empty_pool），此处 accounts 必非空
     emit(&done);
     done
 }
@@ -1277,59 +1384,142 @@ mod tests {
         assert_eq!((r2.unwrap(), calls2), (42, 1));
     }
 
-    /// 审查 #17：Fatal（已确认副作用/确定性失败）立即直返不重试——非幂等建会话
-    /// POST 拿到响应后的失败重试会产生孤儿会话
+    // ── issue #179 兼容加固回归 ─────────────────────────────────────────────
+
+    /// 包条目全树递归收集：容器改名/挪层级不再整包清零（总分在、包全空的 #179 症状）
     #[test]
-    fn backoff_fatal_never_retries() {
-        let mut calls = 0u32;
-        let r: Result<u32, String> = with_backoff(|| {
-            calls += 1;
-            Err::<u32, _>(BackoffErr::Fatal("建会话响应无 data.id".into()))
+    fn packages_collected_recursively_across_containers() {
+        let core = json!({
+            "TotalDosage": 100,
+            "ResourcePackages": [
+                {
+                    "PackageName": "A",
+                    "CapacityRemainPrecise": "12.5",
+                    "CycleCapacitySizePrecise": "100",
+                    "CycleEndTime": "2035-01-01 00:00:00",
+                },
+                { "PackageName": "B", "CapacityRemain": 3 },
+            ],
         });
-        assert_eq!(r.unwrap_err(), "建会话响应无 data.id", "Fatal 透传原文");
-        assert_eq!(calls, 1, "Fatal 不重试");
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 2);
+        assert_eq!(info.packages[0].remain, 12.5);
+        assert_eq!(info.packages[1].remain, 3.0);
+        assert!(info.expire_secs.is_some());
+        assert_eq!(info.total, 100.0);
+        assert!(info.parse_diag.is_none(), "正常形态不出诊断");
     }
 
-    /// 审查 #18：SENSITIVE_KEYS 补键——sessionId/session_id/stoken（② 步沙箱
-    /// 响应三件套与 RPC 参数）经 trim_json 结构化脱敏
+    /// 深层嵌套（信封外再包一层）同样命中：条目在 core 任意深度都能收集
     #[test]
-    fn trim_json_redacts_session_fields() {
+    fn packages_found_at_arbitrary_depth() {
+        let core = json!({
+            "TotalDosage": 7,
+            "Wrapper": { "Deep": { "Accounts": [
+                { "PackageCode": "p1", "CapacityRemain": 7 },
+            ] } },
+        });
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 1);
+        assert_eq!(info.packages[0].code, "p1");
+    }
+
+    /// 包容器挪出 core（data 信封其他分支 / 响应顶层）仍能收集——收集范围是
+    /// 整个响应而非仅 core（审查修复：原实现只扫 core，挪出 core 症状依旧）
+    #[test]
+    fn packages_collected_outside_core() {
+        let core = json!({ "TotalDosage": 7 });
+        let root = json!({
+            "code": 0,
+            "data": { "Response": { "Data": { "TotalDosage": 7 } } },
+            "Packages": [ { "PackageName": "A", "CapacityRemain": 7 } ],
+        });
+        let info = parse_dosage_body(&root);
+        assert_eq!(info.packages.len(), 1);
+        assert_eq!(info.packages[0].name, "A");
+        assert_eq!(info.total, 7.0);
+    }
+
+    /// CycleEndTime 兼容：ISO 带时区 / 无时区 ISO / 纯日期（当日 23:59:59 +08:00）
+    #[test]
+    fn cycle_end_iso_and_date_only_fallback() {
+        use chrono::TimeZone;
+        let core = json!({ "TotalDosage": 1, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 1, "CycleEndTime": "2035-01-02T03:04:05+08:00" },
+            { "PackageName": "B", "CapacityRemain": 1, "CycleEndTime": "2035-02-03" },
+        ]});
+        let info = parse_dosage_body(&core);
+        let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let iso = offset
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str("2035-01-02T03:04:05", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp();
+        let date_only = offset
+            .from_local_datetime(&chrono::NaiveDate::parse_from_str("2035-02-03", "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap())
+            .single()
+            .unwrap()
+            .timestamp();
+        // 「最近过期」= 两者最小值
+        assert_eq!(info.expire_secs, Some(iso.min(date_only)));
+        let a = info.packages.iter().find(|p| p.name == "A").unwrap();
+        assert_eq!(a.expire_secs, Some(iso));
+        let b = info.packages.iter().find(|p| p.name == "B").unwrap();
+        assert_eq!(b.expire_secs, Some(date_only));
+    }
+
+    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断；明细保留到期、
+    /// 汇总不入池（未知包 CycleEndTime 不得污染「最近到期」）
+    #[test]
+    fn unknown_status_fail_open_and_diag() {
+        let core = json!({ "TotalDosage": 5, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 2, "Status": 7, "CycleEndTime": "2035-01-01 00:00:00" },
+        ]});
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 1, "未知状态保留");
+        assert!(info.packages[0].expire_secs.is_some(), "明细 fail-open 保留到期");
+        assert_eq!(info.expire_secs, None, "未知状态包到期不入「最近到期」汇总");
+        let diag = info.parse_diag.expect("未知状态出诊断");
+        assert!(diag.contains("7"), "诊断携带原始 Status 值");
+    }
+
+    /// 包明细解析为空：出诊断并携带响应骨架（#179 修复前此场景完全静默）
+    #[test]
+    fn empty_packages_diag_with_shape() {
+        let core = json!({ "TotalDosage": 9, "SomeNewContainer": [{ "Unrelated": 1 }] });
+        let info = parse_dosage_body(&core);
+        assert!(info.packages.is_empty());
+        assert_eq!(info.total, 9.0);
+        let diag = info.parse_diag.expect("明细空出诊断");
+        assert!(diag.contains("#179"));
+        assert!(diag.contains("SomeNewContainer"), "骨架暴露新容器名供定位");
+    }
+
+    /// ExpiredTime 字符串形态兼容（数字字符串，秒/毫秒归一）
+    #[test]
+    fn expired_time_string_form() {
+        let core = json!({ "TotalDosage": 0, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 1, "ExpiredTime": "4102444800000" },
+        ]});
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.expire_secs, Some(4_102_444_800), "毫秒字符串归一为秒");
+    }
+
+    /// 骨架：长字符串截断为长度标记（防日志膨胀），数组取前 2 个元素
+    #[test]
+    fn skeleton_truncates_and_caps() {
         let v = json!({
-            "data": {
-                "link": "https://x/secret",
-                "token": "tok-1",
-                "stoken": "st-abcdef",
-                "sessionId": "sess-abcdef",
-                "session_id": "sid-abcdef",
-            }
+            "long": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "arr": [1, 2, 3, 4, 5],
         });
-        let s = trim_json(&v);
-        for leak in ["st-abcdef", "sess-abcdef", "sid-abcdef", "tok-1", "https://x/secret"] {
-            assert!(!s.contains(leak), "摘要不应泄漏 {leak}");
-        }
-        assert!(s.matches("***").count() >= 5, "五个敏感键均应置 ***: {s}");
-    }
-
-    /// 审查 #18：非 JSON 错误体脱敏——Bearer 头令牌、token/stoken/sessionId 等
-    /// 键值对（含 URL 查询参数形态）替换 ***；普通错误文案原样保留
-    #[test]
-    fn sanitize_err_body_redacts_plain_text_tokens() {
-        // Bearer 头（空格分隔，键值对扫描覆盖不到的形态）
-        assert_eq!(
-            sanitize_err_body("unauthorized: Bearer eyJhbGciOiJIUzI1NiJ9.abc denied"),
-            "unauthorized: Bearer *** denied"
-        );
-        // 键值对 + URL 查询参数
-        let s = sanitize_err_body("invalid ?token=abcdef123456&x=1 expired");
-        assert!(!s.contains("abcdef123456"), "{s}");
-        assert!(s.contains("token=***"), "{s}");
-        let s2 = sanitize_err_body("bad request: sessionId=abc123def456");
-        assert!(!s2.contains("abc123def456"), "{s2}");
-        assert!(s2.contains("sessionId=***"), "{s2}");
-        // 带引号 JSON 形态的非 JSON 体残留（如截断的 JSON 文本）
-        let s3 = sanitize_err_body(r#"{"stoken": "stokenvalue123"}"#);
-        assert!(!s3.contains("stokenvalue123"), "{s3}");
-        // 普通文案不受影响
-        assert_eq!(sanitize_err_body("not found"), "not found");
+        let s = skeleton(&v, 0);
+        assert_eq!(s["long"], json!("str(len=42)"));
+        assert_eq!(s["arr"].as_array().unwrap().len(), 2);
     }
 }

@@ -141,11 +141,10 @@ pub fn workbuddy_open_auth_dir(state: State<AppState>) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("目录不存在：{}", dir.display()));
     }
-    // F-75：按平台分派打开目录——Windows explorer / macOS open（Finder 置顶）。
-    // 经 sys_command 收敛（Windows 侧获得 CREATE_NO_WINDOW，GUI 应用无害）
-    let mut cmd = crate::platform::cmd::sys_command(if cfg!(windows) { "explorer" } else { "open" });
-    cmd.arg(&dir);
-    cmd.spawn().map_err(|e| format!("打开目录失败: {e}"))?;
+    std::process::Command::new("explorer")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开目录失败: {e}"))?;
     Ok(())
 }
 
@@ -246,18 +245,16 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
             };
             let (snap_saved, snap_failed, snap_timeout) = meta(&snap_path, &a.id);
             let (snap_cb_saved, snap_cb_failed, snap_cb_timeout) = meta(&snap_cb_path, &a.id);
-            // 快照可用性自检（2026-10-30）：槽位承载身份与账号 uid 不一致 = 快照被别的
+            // 快照可用性自检（2026-10-30）：槽位 meta.uid 与账号 uid 不一致 = 快照被别的
             // 账号污染（实测 CodeBuddy 侧客户端回退后把 A 的登录态写进 A' 槽位）；
-            // 身份按 slot_held_uid 判定（CB 槽内 genie.userId 优先——存量槽 meta.uid
-            // 曾被 WorkBuddy uid 污染而槽内 vscdb 完好，按 meta.uid 会误标可用性）；
             // CodeBuddy 快照还要确认 vscdb 里确实有登录令牌（登出态快照切回来必失败）。
-            let mismatch = |dir: &std::path::Path, is_cb: bool| {
-                crate::switcher::authfile::slot_held_uid(&dir.join(&a.id), is_cb)
+            let mismatch = |dir: &std::path::Path| {
+                crate::switcher::authfile::read_slot_uid(dir, &a.id)
                     .map(|u| u != a.uid)
                     .unwrap_or(false)
             };
-            let snap_invalid = mismatch(&snap_path, false);
-            let snap_cb_invalid = mismatch(&snap_cb_path, true)
+            let snap_invalid = mismatch(&snap_path);
+            let snap_cb_invalid = mismatch(&snap_cb_path)
                 || cb_slot_missing_login(&snap_cb_path.join(&a.id));
             WorkBuddyAccountView {
                 id: a.id.clone(),
@@ -460,8 +457,7 @@ pub fn pool_account_id_by_uid(state: &AppState, uid: &str) -> Option<String> {
         .map(|a| a.id)
 }
 
-/// CodeBuddy 客户端 live 登录 uid：客户端应用支持目录
-/// `CodeBuddy CN/User/globalStorage/storage.json`（Windows=%APPDATA%，mac=Application Support）
+/// CodeBuddy 客户端 live 登录 uid：`%APPDATA%\CodeBuddy CN\User\globalStorage\storage.json`
 /// 的 `genie.userId`。F2-5：这是 CodeBuddy 当前登录的**真源信号**——共享 auth 文件属
 /// WorkBuddy（会被其覆盖），不能作为 CodeBuddy 的登录证据；genie.userId 由客户端随
 /// 登录/切换改写（实测：恢复某账号快照启动后该值变为该账号 uid）。
@@ -470,16 +466,15 @@ pub fn codebuddy_live_uid() -> Option<String> {
     cb_live_uid_inner("CodeBuddy CN")
 }
 
-/// 国际版 CodeBuddy AI 客户端 live uid（roaming 目录 CodeBuddy\User\globalStorage\
-/// storage.json genie.userId；2026-10-16 本机实测两客户端 roaming 目录隔离）。
-/// 跨平台路径根：Windows=%APPDATA%、mac=~/Library/Application Support（平台分派）
+/// 国际版 CodeBuddy AI 客户端 live uid（%APPDATA%\CodeBuddy\User\globalStorage\
+/// storage.json genie.userId；2026-10-16 本机实测两客户端 roaming 目录隔离）
 pub fn codebuddy_ai_live_uid() -> Option<String> {
     cb_live_uid_inner("CodeBuddy")
 }
 
 fn cb_live_uid_inner(roaming_dir: &str) -> Option<String> {
-    let p = crate::platform::app_support_root()
-        .ok()?
+    let appdata = std::env::var("APPDATA").ok()?;
+    let p = std::path::PathBuf::from(appdata)
         .join(roaming_dir)
         .join("User")
         .join("globalStorage")
@@ -771,10 +766,9 @@ pub fn workbuddy_refresh_token(
         "expires_at_ms": exp_ms,
         "refresh_expires_at_ms": rexp_ms,
     });
-    // 审查修复（M19，融合 L3）：上游未回发新 refreshToken（缺失/空串）时保留本次刷新
-    // 成功所用的旧 rt——upsert_token_store 是「非 null 才覆盖」的合并语义，空串非 null
-    // 会穿透覆盖 store 旧 rt，导致下轮刷新拿已作废的空串必然失败（被迫重登）。
-    // refresh 即本次刷新成功所用旧 rt（入口已保证非空），语义比回读 store 更直接
+    // 审查修复（M19）：上游未回发新 refreshToken（缺失/空串）时保留本次刷新成功
+    // 所用的旧 rt——upsert_token_store 是「非 null 才覆盖」的合并语义，空串非 null
+    // 会穿透覆盖 store 旧 rt，导致下轮刷新拿已作废的空串必然失败（被迫重登）
     if new_refresh.as_deref().map(str::trim).unwrap_or("").is_empty() {
         creds["refresh_token"] = serde_json::json!(refresh);
     }

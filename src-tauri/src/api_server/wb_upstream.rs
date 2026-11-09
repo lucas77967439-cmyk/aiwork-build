@@ -55,11 +55,8 @@ pub fn wb_client_fingerprint(global_region: bool) -> &'static WbClientFingerprin
 }
 
 fn resolve_client_fingerprint(global_region: bool) -> WbClientFingerprint {
-    // 版本读取走 env::version_of 三平台分派（Windows: PE 资源直读+powershell 兜底，
-    // mac: .app bundle Info.plist，共享 version_cached 缓存基建）——此前直调
-    // pe_version 在 mac 恒 None，动态版本失效落常量兜底
     let resolved = locate_client_exe(global_region)
-        .and_then(|exe| crate::commands::env::version_of(&exe));
+        .and_then(|exe| crate::pe_version::product_or_file_version(&exe));
     match resolved {
         Some(v) if !v.is_empty() => WbClientFingerprint {
             // Intl 实证格式（issue #123 BuddySwitch 对照）：
@@ -68,13 +65,7 @@ fn resolve_client_fingerprint(global_region: bool) -> WbClientFingerprint {
             ua: ua_template(global_region, &v),
             version: v,
         },
-        // 回落也按区域出模板：Intl 兜底若携带 CN 品牌 UA（CLI/CodeBuddy）恰是
-        // #123 要消除的指纹形态；CN 分支 ua_template(false, WB_CLI_VERSION)==WB_UA
-        // 零行为变化（fingerprint_ua_template_invariants 锁定）
-        _ => WbClientFingerprint {
-            ua: ua_template(global_region, WB_CLI_VERSION),
-            version: WB_CLI_VERSION.into(),
-        },
+        _ => WbClientFingerprint { ua: WB_UA.into(), version: WB_CLI_VERSION.into() },
     }
 }
 
@@ -88,11 +79,7 @@ fn ua_template(global_region: bool, v: &str) -> String {
 }
 
 /// 定位本机客户端 exe（口径同 commands::env app_locate：settings 自定义路径
-/// → 默认路径候选 → 注册表卸载键兜底；process 探测对指纹场景无意义不复制）。
-/// mac：自定义路径为 .app bundle 目录形态（custom_path_kv mac 变体 is_bundle_dir
-/// 校验）→ bundle 探测（/Applications、~/Applications）→ Spotlight mdfind 兜底，
-/// 档案名/CFBundleIdentifier 白名单与 app_locate_macos 同表；返回 bundle 根路径，
-/// env::version_of 对 .app 直读 Info.plist（起点即 bundle 分支已覆盖）
+/// → 默认路径候选 → 注册表卸载键兜底；process 探测对指纹场景无意义不复制）
 fn locate_client_exe(global_region: bool) -> Option<String> {
     let app = if global_region { "workbuddy_ai" } else { "workbuddy" };
     // 1) settings 自定义路径（用户在设置页手动指定的 exe）
@@ -101,51 +88,15 @@ fn locate_client_exe(global_region: bool) -> Option<String> {
             return Some(p);
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        use crate::switcher::locate::{locate_bundle_dir, mdfind_bundle};
-        let (display, proc_names, bundle_ids): (&str, &[&str], &[&str]) = if global_region {
-            (
-                "WorkBuddy AI",
-                &["WorkBuddyAI", "WorkBuddy AI"],
-                &["com.workbuddy.workbuddy-ai"],
-            )
-        } else {
-            ("WorkBuddy", &["WorkBuddy"], &["com.tencent.workbuddy.mac"])
-        };
-        let mut names: Vec<&str> = vec![display];
-        for n in proc_names {
-            if !names.contains(n) {
-                names.push(n);
-            }
-        }
-        // 2) bundle 探测（显示名 + 主进程名作目录名候选，白名单防串台）
-        for name in &names {
-            if let Some(found) = locate_bundle_dir(name, proc_names, bundle_ids) {
-                return Some(found.to_string_lossy().to_string());
-            }
-        }
-        // 3) Spotlight 兜底（mdfind 秒回；仅上面未命中时）
-        for name in &names {
-            if let Some(found) = mdfind_bundle(name, proc_names, bundle_ids) {
-                return Some(found.to_string_lossy().to_string());
-            }
-        }
-        None
+    // 2) 默认路径候选
+    if let Some(p) = default_exe_candidates(global_region) {
+        return Some(p);
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // 2) 默认路径候选
-        if let Some(p) = default_exe_candidates(global_region) {
-            return Some(p);
-        }
-        // 3) 注册表卸载键兜底
-        crate::commands::env::registry_app_path_for(app)
-    }
+    // 3) 注册表卸载键兜底
+    crate::commands::env::registry_app_path_for(app)
 }
 
 /// 默认路径候选（LOCALAPPDATA Programs 布局 + Program Files 系统级安装兜底）
-#[cfg(not(target_os = "macos"))]
 fn default_exe_candidates(global_region: bool) -> Option<String> {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let mut cands: Vec<String> = if global_region {
@@ -215,7 +166,7 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     let base = c.chat_base();
     let referer = format!("{}{}", base, WB_CHAT_PATH);
     // UA/X-IDE-Version 动态解析（issue #123）：优先本机客户端真实版本，
-    // 解析失败按区域模板回落常量版本（CN 形态即 WB_UA）
+    // 解析失败回落常量（WB_UA/WB_CLI_VERSION）
     let fp = wb_client_fingerprint(c.global_region);
     let mut h: Vec<(&'static str, String)> = vec![
         ("content-type", "application/json".into()),
@@ -518,24 +469,6 @@ fn relay_lines<R: Read + Send + 'static>(
             }
         }
     });
-}
-
-/// 断连感知退避等待（issue #41 系列补漏，macos_main 保留）：RetrySame 退避原为整段
-/// `thread::sleep`（最长 60s），客户端断连也要等满全程才检查——期间持续占用
-/// 账号并发槽。改为 500ms 步进分段睡眠，每段前检查 `gone`（客户端断连信号），
-/// 命中即刻返回 false 终止等待。
-/// 返回 true = 等满 delay_ms 全程且未断连（正常继续重试）。
-pub fn backoff_wait(gone: &dyn Fn() -> bool, delay_ms: u64) -> bool {
-    let mut left = delay_ms.min(60_000);
-    while left > 0 {
-        if gone() {
-            return false;
-        }
-        let step = left.min(500);
-        std::thread::sleep(std::time::Duration::from_millis(step));
-        left -= step;
-    }
-    !gone()
 }
 
 /// 首行 + 剩余行组装为行迭代器（竞速对冲路径使用：胜者 receiver 直接折叠）。
@@ -1210,10 +1143,10 @@ mod tests {
         };
         for g in [false, true] {
             let expect = match locate_client_exe(g)
-                .and_then(|exe| crate::commands::env::version_of(&exe))
+                .and_then(|exe| crate::pe_version::product_or_file_version(&exe))
             {
                 Some(v) if !v.is_empty() => ua_template(g, &v),
-                _ => ua_template(g, WB_CLI_VERSION),
+                _ => WB_UA.to_string(),
             };
             let h = build_chat_headers(&creds(g, "u", "", ""));
             assert_eq!(get_ua(&h), expect, "区域 {} UA 接线不一致", g);
@@ -1522,20 +1455,6 @@ mod tests {
         assert_eq!(out.hedge, Some("hedge-uid"));
         assert!(out.takeover);
         assert_eq!(collect(out.lines), vec!["data: fast".to_string()]);
-    }
-
-    #[test]
-    fn backoff_wait_语义契约() {
-        // 未断连：等满 delay 全程返回 true（短 delay，实测耗时按 delay 收敛）
-        let start = std::time::Instant::now();
-        assert!(backoff_wait(&|| false, 10));
-        assert!(start.elapsed() >= std::time::Duration::from_millis(10));
-        // 断连：即刻返回 false，不等满全程
-        let start = std::time::Instant::now();
-        assert!(!backoff_wait(&|| true, 5_000));
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        // delay 超 60s 上限封顶（仅验证不 panic；不实测 60s 时长）
-        assert!(backoff_wait(&|| false, 0));
     }
 
     #[test]

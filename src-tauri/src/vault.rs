@@ -114,9 +114,7 @@ pub(crate) mod dpapi {
     }
 }
 
-// mac 构建下 protect/unprotect 无消费点（Qoder 域 mac 实装时启用，见下注）
 #[cfg(not(windows))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod dpapi {
     // macOS 适配预留（2026-10-03）：Qoder 域直接消费点为 ide_store.rs 的
     // Chromium os_crypt 密钥解包（Local State encrypted_key "DPAPI" 前缀段）。
@@ -133,9 +131,7 @@ mod dpapi {
     }
 }
 
-/// OS CSPRNG 填充（Windows=BCryptGenRandom 进程首选 RNG；mac/其他平台=uuid v4
-/// 底层 getrandom CSPRNG，F-75 M0-0.4——macos_main 合并适配：main 预留的 Err 占位
-/// 由 mac 实装替换）。失败直接返回 Err。
+/// OS CSPRNG 填充（Windows BCryptGenRandom 进程首选 RNG）；失败直接返回 Err。
 /// 审查 P2-4：**不允许任何弱熵回退路径**——CSPRNG 不可用属系统级故障，
 /// 静默降级到可预测熵（时间/PID 哈希）等于密钥材料可被离线爆破，必须 fail-fast。
 /// 供 vault 主密码生成与 Qoder 加密导出（salt/nonce）共用。
@@ -161,20 +157,16 @@ pub(crate) fn csprng_fill(dest: &mut [u8]) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        // mac/其他平台：uuid v4（getrandom 熵源）逐 16 字节拼接填满（CSPRNG 恒成功，
-        // Err 通道仅为签名兼容与未来平台扩展保留）
-        let mut filled = 0usize;
-        while filled < dest.len() {
-            let bytes = uuid::Uuid::new_v4().into_bytes();
-            let n = (dest.len() - filled).min(bytes.len());
-            dest[filled..filled + n].copy_from_slice(&bytes[..n]);
-            filled += n;
-        }
-        Ok(())
+        let _ = dest;
+        // macOS 适配预留（2026-10-03）：等价替换 = SecRandomCopyBytes（Security
+        // framework）或 libc getrandom/getentropy；qoder data_io.rs 加密导出的
+        // salt/nonce 与 vault 主密码生成都经此函数，macOS 分支实装本分支即可
+        // 全链路生效（fail-fast 语义保持：RNG 不可用必须 Err，不许弱熵兜底）
+        Err("vault 仅支持 Windows（无可用 CSPRNG 封装）".into())
     }
 }
-/// 生成 32 字节随机主密码：熵源 = OS CSPRNG（经 [csprng_fill]，Windows=BCrypt /
-/// mac=uuid v4 getrandom）。
+
+/// 生成 32 字节随机主密码：熵源 = OS CSPRNG（BCryptGenRandom）。
 /// 审查 P2-4：失败直接返回 Err 终止 vault 初始化（上层报错），删除旧实现的
 /// 「RandomState + 高精度时间 + 进程 ID 经 SHA-256 压缩」弱熵兜底路径。
 fn generate_password() -> Result<Vec<u8>, String> {
@@ -183,12 +175,32 @@ fn generate_password() -> Result<Vec<u8>, String> {
     Ok(buf.to_vec())
 }
 
-/// vault 密钥文件 IO 错误映射（issue #153 修复 3，Windows 专属）：os error 448 =
+/// 读取（或首次生成）vault 主密码。密钥文件双格式自适应（issue #139）：
+/// `V2:`+64hex 文本（服务端 docker_main 格式）优先，否则按 DPAPI blob 解密；
+/// 新建文件默认 DPAPI（保持「仅本机当前用户可解」基线）
+fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
+    let conf = data_dir.join("conf");
+    let _ = std::fs::create_dir_all(&conf);
+    let key_path = conf.join("vault_key.bin");
+    if key_path.exists() {
+        let blob =
+            std::fs::read(&key_path).map_err(|e| vault_key_io_err("读取", &key_path, e))?;
+        let pwd = parse_key_file(&blob, &key_path)?;
+        // 共享模式一次性迁移：DPAPI 密钥 → V2: 文本（显式开启方生效，见 maybe_convert_to_v2）
+        maybe_convert_to_v2(&key_path, &blob, &pwd, data_dir);
+        Ok(pwd)
+    } else {
+        let pwd = generate_password()?;
+        let blob = dpapi::protect(&pwd)?;
+        std::fs::write(&key_path, &blob).map_err(|e| vault_key_io_err("写入", &key_path, e))?;
+        Ok(pwd)
+    }
+}
+
+/// vault 密钥文件 IO 错误映射（issue #153 修复 3）：os error 448 =
 /// ERROR_UNTRUSTED_MOUNT_POINT，典型场景是 conf 目录被改成了 Junction/目录联接
-/// （如用户手工迁移目录），系统拒绝跨联接访问——给出可操作提示而不是裸 OS 码。
-/// macos_main 合并适配：供 platform::secret Windows 分支复用（macOS 无 Junction 概念）
-#[cfg(windows)]
-pub(crate) fn vault_key_io_err(op: &str, path: &Path, e: std::io::Error) -> String {
+/// （如用户手工迁移目录），系统拒绝跨联接访问——给出可操作提示而不是裸 OS 码
+fn vault_key_io_err(op: &str, path: &Path, e: std::io::Error) -> String {
     if e.raw_os_error() == Some(448) {
         return format!(
             "{op} vault 密钥失败（os error 448：不受信任的挂载点）——{} 可能位于 Junction/目录联接之下，Windows 拒绝跨联接访问。请将 conf 目录恢复为真实目录（删除联接、把内容移回原位）后重启应用",
@@ -200,65 +212,33 @@ pub(crate) fn vault_key_io_err(op: &str, path: &Path, e: std::io::Error) -> Stri
 
 /// 同一错误消息只落一次日志（issue #153 修复 3）：vault 故障期 ns_get 会被
 /// 每账号每次 ensure_fresh 高频触发，相同失败原因会把 app_log 刷爆——进程内
-/// 按消息去重，仅首条落盘；不同消息（不同 key/不同故障）各自首条仍落。
-/// 去重键拼入 data_dir（审查修复）：多 data_dir 场景（便携多目录/单测并行）
-/// 各自独立去重，首个目录的失败不再吞掉其他目录的同文本日志
+/// 按消息去重，仅首条落盘；不同消息（不同 key/不同故障）各自首条仍落
 fn log_once(data_dir: &Path, msg: &str) {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let key = format!("{}|{msg}", data_dir.display());
     if seen
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key)
+        .insert(msg.to_string())
     {
         crate::fs_utils::app_log(data_dir, msg);
     }
 }
 
-/// 读取（或首次生成）受保护的主密码（per-data_dir：主密码落 `<data_dir>/conf/`）。
-/// 平台分派收口 `platform::secret`（F-75 M0-0.4）——
-/// Windows 走 `conf/vault_key.bin` 双格式自适应（issue #139：`V2:`+64hex 文本优先、
-/// DPAPI blob 回退；`AIWORK_VAULT_SHARED=1` 时一次性迁移 DPAPI→V2:，
-/// 见 parse_v2_hex_text / parse_key_file / maybe_convert_to_v2）；
-/// macOS 走 key file 主源（纯 hex，兼容读取 V2: 共享文件，共享模式开启时同样
-/// 迁移为 V2:）+ Keychain 兜底（首启无条目 → 生成随机主密码写入，用户无感）。
-/// 防御（macos_main 实测缺陷修复，全平台生效）：主密码源缺失但 vault 快照已存在时，
-/// 静默重生成新密码会与既有密文永久失配（macOS Keychain 条目丢失 → 每次 save_accounts
-/// 报 BadFileKey，凭据不可恢复且读路径静默降级为空 JWT）。此时必须显式报错，
-/// 由用户决定重置 vault 或恢复密码源，绝不静默换钥。
-/// 快照是否「实际存在」（含数据）：0 字节空快照视为不存在（审查修复 低-5：
-/// 首启 `Stronghold::new` 先建文件、随后崩溃的残留——空文件不含任何 client，
-/// 应按「首次创建」处理；若按存在判定，会被错配防护永久拒开，只能手工删文件恢复）。
-fn snapshot_has_data(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
-}
-
-fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
-    if let Some(pwd) = crate::platform::secret::load_vault_password_at(data_dir)? {
-        return Ok(pwd);
-    }
-    let snapshot = data_dir.join("conf").join("vault.stronghold");
-    if snapshot_has_data(&snapshot) {
-        return Err(format!(
-            "vault 主密码源缺失但快照已存在（{}），拒绝静默重生成密码；\
-             若快照内凭据已全部失效，可备份后删除该文件重置 vault",
-            snapshot.display()
-        ));
-    }
-    let pwd = generate_password()?;
-    crate::platform::secret::store_vault_password_at(data_dir, &pwd)?;
-    Ok(pwd)
-}
-
-/// 解析 `V2:` + 64 位 hex 文本密钥（issue #139 服务端 docker_main 共享格式）。
-/// 跨平台共用（macos_main 合并适配）：非 `V2:` 前缀返回 `Ok(None)`，由调用方
-/// 回退到平台原生格式（Windows=DPAPI blob / macOS=纯 hex 文本）；
-/// 带 `V2:` 前缀但格式非法返回 Err（长度/hex 字符校验，防多字节 char boundary panic）。
-pub(crate) fn parse_v2_hex_text(text: &str) -> Result<Option<Vec<u8>>, String> {
+/// 解析密钥文件（issue #139 双格式自适应）：
+/// - `V2:` 前缀 + 64 位 hex → 32 字节（服务端 docker_main 格式，conf 目录共享场景）；
+/// - 其余内容按 DPAPI blob 解密（桌面版原生格式）。
+/// 失败时区分两种格式分别报错，替代原先笼统的 CryptUnprotectData 提示。
+fn parse_key_file(raw: &[u8], path: &Path) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(raw);
     let Some(hex) = text.trim().strip_prefix("V2:") else {
-        return Ok(None);
+        return dpapi::unprotect(raw).map_err(|e| {
+            format!(
+                "vault 密钥解析失败（{}：既非 V2: 文本格式，也非本机可解的 DPAPI blob）: {e}",
+                path.display()
+            )
+        });
     };
     if hex.len() != 64 {
         return Err(format!(
@@ -269,114 +249,48 @@ pub(crate) fn parse_v2_hex_text(text: &str) -> Result<Option<Vec<u8>>, String> {
     // hexdigit 全量校验：len() 是字节长度，多字节 UTF-8 字符可凑足 64 字节，
     // 直接按字节切片会在 char boundary 中间 panic；先统一收敛为友好 Err。
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(
-            "vault 密钥格式异常（V2: 后应为 64 位 ASCII hex，实际含非 hex 字符）".into(),
-        );
+        return Err(format!(
+            "vault 密钥格式异常（V2: 后应为 64 位 ASCII hex，实际含非 hex 字符）"
+        ));
     }
     let mut key = [0u8; 32];
     for i in 0..32 {
         key[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
             .map_err(|e| format!("vault 密钥 hex 解码失败: {e}"))?;
     }
-    Ok(Some(key.to_vec()))
-}
-
-/// 解析密钥文件（issue #139 双格式自适应，Windows 专属——macOS 由
-/// platform::secret 组合 parse_v2_hex_text + 纯 hex 解析）：
-/// - `V2:` 前缀 + 64 位 hex → 32 字节（服务端 docker_main 格式，conf 目录共享场景）；
-/// - 其余内容按 DPAPI blob 解密（桌面版原生格式）。
-/// 失败时区分两种格式分别报错，替代原先笼统的 CryptUnprotectData 提示。
-#[cfg(windows)]
-pub(crate) fn parse_key_file(raw: &[u8], path: &Path) -> Result<Vec<u8>, String> {
-    let text = String::from_utf8_lossy(raw);
-    match parse_v2_hex_text(&text)? {
-        Some(key) => Ok(key),
-        None => dpapi::unprotect(raw).map_err(|e| {
-            format!(
-                "vault 密钥解析失败（{}：既非 V2: 文本格式，也非本机可解的 DPAPI blob）: {e}",
-                path.display()
-            )
-        }),
-    }
+    Ok(key.to_vec())
 }
 
 /// 字节 → 小写 hex（V2: 密钥文件存储格式，与服务端 docker_main 一致）
-pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 密钥文件原子写入（审查修复 中-1 / 低-3 共用）：同目录临时文件 + rename 原子替换。
-/// 直接 `fs::write` 会先 truncate 原文件，写入中断（崩溃/断电）会留下
-/// 「V2: + 残缺 hex」损坏密钥，Windows 无 Keychain 兜底 → vault 永久不可开；
-/// rename 在同一文件系统内原子生效，任意时刻中断，原文件要么完好（旧格式仍可
-/// 由平台原生路径解析）要么已是完整 V2: 文本。unix 下临时文件以 0600 创建
-/// （mac key file 权限不变量，rename 后权限随临时文件）。
-pub(crate) fn write_key_file_atomic(key_path: &Path, content: &str) -> Result<(), String> {
-    let tmp_path = key_path.with_extension("bin.v2tmp");
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| format!("创建临时密钥文件失败: {e}"))?;
-        f.write_all(content.as_bytes())
-            .map_err(|e| format!("写入临时密钥文件失败: {e}"))?;
-        // rename 前确保持久化：中断残留的临时文件不影响原文件，但 rename 后
-        // 必须保证内容完整（密钥文件是 vault 解密真值，宁可多一次 fsync）
-        f.sync_all()
-            .map_err(|e| format!("刷盘临时密钥文件失败: {e}"))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(&tmp_path, content.as_bytes())
-        .map_err(|e| format!("写入临时密钥文件失败: {e}"))?;
-    if let Err(e) = std::fs::rename(&tmp_path, key_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("原子替换密钥文件失败: {e}"));
-    }
-    Ok(())
-}
-
 /// 共享模式开关：环境变量 AIWORK_VAULT_SHARED（1/true，大小写不敏感，容忍首尾空白）
-pub(crate) fn vault_shared_mode() -> bool {
+fn vault_shared_mode() -> bool {
     std::env::var("AIWORK_VAULT_SHARED")
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
         .unwrap_or(false)
 }
 
-/// 共享模式一次性迁移（issue #139）：`AIWORK_VAULT_SHARED=1` 且文件当前为平台原生
-/// 密钥格式（Windows=DPAPI blob / macOS=纯 hex 文本）时，就地重写为 `V2:` 文本格式，
-/// 使 aiwork-server（docker_main）可读同一 conf 目录。跨平台共用（macos_main 合并
-/// 适配：mac 纯 hex→V2: 镜像 main 在 Windows 的 DPAPI→V2: 语义，复用同一实现）。
+/// 共享模式一次性迁移（issue #139）：`AIWORK_VAULT_SHARED=1` 且文件当前为 DPAPI blob 时，
+/// 就地重写为 `V2:` 文本格式，使 aiwork-server（docker_main）可读同一 conf 目录。
 /// 结果与失败均落日志；失败不阻断本次打开（下次启动重试）。
-/// 注意：转换后密钥以明文 hex 落盘（Windows 失去 DPAPI 的「仅本机当前用户可解」
-/// 保护；macOS 原生即为明文 hex，仅格式变化），由用户显式开启共享模式来接受该权衡。
-pub(crate) fn maybe_convert_to_v2(key_path: &Path, blob: &[u8], pwd: &[u8], data_dir: &Path) {
+/// 注意：转换后密钥以明文 hex 落盘（失去 DPAPI 的「仅本机当前用户可解」保护），
+/// 由用户显式开启共享模式来接受该权衡。
+fn maybe_convert_to_v2(key_path: &Path, blob: &[u8], pwd: &[u8], data_dir: &Path) {
     if !vault_shared_mode() {
         return;
     }
-    convert_to_v2_impl(key_path, blob, pwd, data_dir);
-}
-
-/// 迁移核心（共享模式判定已由调用方 [maybe_convert_to_v2] 完成）。独立函数便于
-/// 测试参数注入，避免单测触碰进程级全局环境变量（审查修复 中-2：env 并行竞争
-/// + panic 泄漏面）。pub(crate) 供 platform::secret 测试直调。
-pub(crate) fn convert_to_v2_impl(key_path: &Path, blob: &[u8], pwd: &[u8], data_dir: &Path) {
     if String::from_utf8_lossy(blob).trim().starts_with("V2:") {
         return; // 已是 V2: 文本，无需转换
     }
     let content = format!("V2:{}", bytes_to_hex(pwd));
-    match write_key_file_atomic(key_path, &content) {
-        // 审查修复（信息-7）：措辞不再硬编码「DPAPI blob」——mac 纯 hex 场景
-        // 走同一路径，按来源无关的通用措辞描述
+    match std::fs::write(key_path, content.as_bytes()) {
         Ok(()) => fs_utils::app_log(
             data_dir,
-            "vault: AIWORK_VAULT_SHARED 已开启，vault_key.bin 已迁移为 V2: 文本格式（可与 aiwork-server 共享 conf；密钥现为明文 hex，注意目录访问控制）",
+            "vault: AIWORK_VAULT_SHARED 已开启，vault_key.bin 已由 DPAPI blob 转换为 V2: 文本格式（可与 aiwork-server 共享 conf；密钥现为明文 hex，注意目录访问控制）",
         ),
         Err(e) => fs_utils::app_log(
             data_dir,
@@ -399,14 +313,8 @@ fn with_open<T>(
         let conf = data_dir.join("conf");
         let _ = std::fs::create_dir_all(&conf);
         let path = conf.join("vault.stronghold");
-        // 快照存在性必须在 Stronghold::new 之前判定（new 可能立即创建空快照文件）；
-        // 0 字节空快照（首启建文件后崩溃残留）视为不存在，按首次创建处理（审查修复 低-5）
-        let snapshot_exists = snapshot_has_data(&path);
-        if !snapshot_exists && path.exists() {
-            // 空残留文件会让 Stronghold::new 报「invalid file not a snapshot」，
-            // 先行删除（0 字节不含任何数据，无凭据丢失风险），让 new 全新创建
-            let _ = std::fs::remove_file(&path);
-        }
+        // 快照存在性必须在 Stronghold::new 之前判定（new 可能立即创建空快照文件）
+        let snapshot_exists = path.exists();
         let password = vault_password_at(data_dir)?;
         let sh = Stronghold::new(&path, password).map_err(|e| format!("打开 vault 失败: {e}"))?;
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
@@ -439,25 +347,16 @@ fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
     format!("ns:{ns}:{key}").into_bytes()
 }
 
-/// 探测 vault 当前是否可用（issue #153 修复 2）：不读写任何真实记录，验证
-/// 打开+取 client+store 读路径畅通。用于调用方区分「vault 系统性故障」与「确实无凭证」——
+/// 探测 vault 当前是否可用（issue #153 修复 2）：不读写任何记录，仅验证
+/// 打开+取 client 成功。用于调用方区分「vault 系统性故障」与「确实无凭证」——
 /// ns_get 对两者都返回 None（fail-secure），凭证消费方（如 ensure_fresh）
 /// 借此把故障期误判为 no_credential 的情况识别出来，避免触发永久禁用等
 /// 不可自愈的下游处置。
 pub fn available(data_dir: &Path) -> bool {
     with_open(data_dir, |sh| {
-        let client = sh
-            .get_client(CLIENT_PATH.to_vec())
-            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
-        // 审查修复（M）：with_open 成功一次后永久缓存句柄，此后若 store 读路径
-        // 异常，仅查 get_client 会恒 true 而 ns_get fail-secure 返 None，消费方
-        // 仍会误判 no_credential——追加一次空 key 读探测（必未命中、不触任何
-        // 真实记录），把「打开后故障」同样暴露为不可用，堵住残余缺口
-        client
-            .store()
-            .get(&ns_vault_key("__probe__", "__probe__"))
+        sh.get_client(CLIENT_PATH.to_vec())
             .map(|_| ())
-            .map_err(|e| format!("vault store 读探测失败: {e}"))
+            .map_err(|e| format!("获取 vault client 失败: {e}"))
     })
     .is_ok()
 }
@@ -524,59 +423,15 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
     }
 }
 
-/// 豆包代理抓包凭证快照读取（审查 P2 收敛配套）：优先 vault ns `doubao_captured`
-/// （handler.rs 写入点已收敛至此），未命中回退旧 kv `doubao_captured_credentials`
-/// 一次——兼容「应用升级后尚未重启、迁移未执行」场景下读取方仍能拿到快照；
-/// 再未命中回退 3.7.1 旧 vault ns `doubao`/`captured`（b1531f5 引入时的命名，
-/// 当时的迁移已把明文 kv 搬进去并删除——只回退 kv 会漏掉这批用户，审查 Medium
-/// 断代修复），命中即自愈搬迁到新 ns 并清理旧条目（搬迁失败仍返回旧值不丢凭证，
-/// 下次读取重试）。两处皆无返回 None。历史明文 kv 由 [migrate_ns_on_startup] ④
-/// 迁入 vault 后清空。
-/// 消费方：commands/doubao.rs（read_captured_uid / doubao_captured_credential /
-/// doubao_credential_auto_apply）与 tasks/doubao_chats.rs（detect_uid）共 4 处。
-pub fn doubao_captured_get(data_dir: &Path) -> Option<serde_json::Value> {
-    if let Some(v) = ns_get(data_dir, "doubao_captured", "credentials") {
-        return Some(v);
-    }
-    if let Some(v) = ns_get(data_dir, "doubao", "captured") {
-        match ns_set(data_dir, "doubao_captured", "credentials", &v) {
-            Ok(()) => {
-                ns_remove(data_dir, "doubao", "captured");
-                fs_utils::app_log(
-                    data_dir,
-                    "vault: 豆包抓包凭证已从旧 ns doubao/captured 搬迁至 doubao_captured/credentials",
-                );
-            }
-            Err(e) => log_once(
-                data_dir,
-                &format!("vault: 豆包抓包凭证旧 ns 搬迁失败（保留旧条目，下次读取重试）: {e}"),
-            ),
-        }
-        return Some(v);
-    }
-    let v: serde_json::Value = crate::store::db(data_dir).kv_get("doubao_captured_credentials");
-    if v.is_null() {
-        None
-    } else {
-        Some(v)
-    }
-}
-
 // ---------------- 公共 API ----------------
-
-/// vault 打开失败的去重日志标记：读路径调用极频繁，仅首条降级写日志，
-/// 恢复成功后复位（避免诊断盲区——本机曾因该静默降级整晚 401 无从定位）
-static VAULT_DEGRADED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
 /// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
 pub fn load_accounts(state: &AppState) -> AccountsFile {
     // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
     let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
-    // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）；
-    // 降级去重日志（macos_main 保留项）：读路径调用极频繁，仅首条落日志，
-    // 恢复成功后复位（避免诊断盲区——本机曾因该静默降级整晚 401 无从定位）
-    match with_open(&state.data_dir, |sh| {
+    // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
+    let _ = with_open(&state.data_dir, |sh| {
         let client = sh
             .get_client(CLIENT_PATH.to_vec())
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
@@ -605,21 +460,7 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
             }
         }
         Ok(())
-    }) {
-        Ok(()) => {
-            use std::sync::atomic::Ordering;
-            VAULT_DEGRADED_LOGGED.store(false, Ordering::Relaxed);
-        }
-        Err(reason) => {
-            use std::sync::atomic::Ordering;
-            if !VAULT_DEGRADED_LOGGED.swap(true, Ordering::Relaxed) {
-                fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("vault 不可用：账号凭据读取降级为空 JWT（后续同类错误不再重复记录）: {reason}"),
-                );
-            }
-        }
-    }
+    });
     file
 }
 
@@ -627,9 +468,8 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
 /// vault 写失败时**禁止明文落盘**（审查 P1）且**数据库保持原状**（issue #153 修复 1）：
 /// 原实现「wipe 占位 + 落库」会在 vault 故障（如 os error 448）时当场销毁库中既有的
 /// 明文凭据（启动迁移场景）且无处恢复；现改为不落库直接返回 Err——迁移场景明文
-/// 保留在库中待 vault 修复后下次启动重试收敛，常规场景本次更新仅存内存
-/// （含非凭据字段如刷新失败计数——故障期内这类轻量状态不落库属 #153 设计取舍：
-/// 宁丢计数不毁凭据）。注意：仅成功路径会就地清空调用方结构体中的 jwt / refresh_token 字段。
+/// 保留在库中待 vault 修复后下次启动重试收敛，常规场景本次凭据更新仅存内存。
+/// 注意：仅成功路径会就地清空调用方结构体中的 jwt / refresh_token 字段。
 pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<(), String> {
     match write_vault_secrets(state, accounts) {
         Ok(()) => {
@@ -740,8 +580,7 @@ pub fn remove_secret(state: &AppState, uid: &str) {
 /// 启动时幂等迁移：库中明文 jwt / refresh_token → vault，随后占位化。
 /// （SQLite 化 P4：原读 checkin_accounts.json，现读 accounts 表——main.rs 已调整为
 /// store 迁移先于本函数，JSON 导入的明文凭据在此收敛进 vault 并从库中抹除。）
-/// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 不落库直接返回 Err，
-/// 库中明文保留待 vault 修复后重试收敛，issue #153）。
+/// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
 pub fn migrate_on_startup(state: &AppState) {
     let raw: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let plaintext = raw
@@ -856,38 +695,27 @@ pub fn migrate_ns_on_startup(state: &AppState) {
             }
         }
     }
-    // ④ 豆包代理抓包凭证（审查 P2：kv `doubao_captured_credentials` 为明文 JSON
-    //    快照，含 session_id/sid_guard/ttwid 会话凭证，违反「凭证只进 vault」红线
-    //    → 迁入 vault ns `doubao_captured` 后清空该 kv）。幂等：kv 缺失/空直接跳过；
-    //    vault 写成功后才删 kv（失败保留，下次启动重试）；读取侧统一走
-    //    [doubao_captured_get]（vault 优先 → 旧 kv 回退一次，兼容未重启场景）。
+    // ④ 豆包抓包凭证（审查 P1-7：kv doubao_captured_credentials → vault，
+    // ns "doubao"/"captured"；vault 成功后删除明文 kv 行，读取侧 vault 优先）
     {
-        const KV_KEY: &str = "doubao_captured_credentials";
-        let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get(KV_KEY);
-        if v.is_null() {
-            // 无该行（首次升级/已迁移）：幂等退出
-        } else if v.get("session_id").and_then(|s| s.as_str()).map_or(false, |s| !s.is_empty()) {
-            match ns_set(&state.data_dir, "doubao_captured", "credentials", &v) {
-                Ok(()) => match crate::store::db(&state.data_dir).kv_delete(KV_KEY) {
-                    Ok(()) => fs_utils::app_log(
-                        &state.data_dir,
-                        "启动迁移: 豆包抓包凭证快照已收敛进 vault 并清空明文 kv",
-                    ),
-                    Err(e) => fs_utils::app_log(
-                        &state.data_dir,
-                        &format!(
-                            "启动迁移: 清空豆包抓包凭证明文 kv 失败（vault 已有加密副本，下次启动重试）: {e}"
-                        ),
-                    ),
-                },
+        let plain: serde_json::Value =
+            crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+        let has_session = plain
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map_or(false, |s| !s.is_empty());
+        if has_session {
+            match crate::vault::ns_set(&state.data_dir, "doubao", "captured", &plain) {
+                Ok(()) => {
+                    let _ =
+                        crate::store::db(&state.data_dir).kv_delete("doubao_captured_credentials");
+                    fs_utils::app_log(&state.data_dir, "启动迁移: 豆包抓包凭证已加密写入 vault");
+                }
                 Err(e) => fs_utils::app_log(
                     &state.data_dir,
-                    &format!("启动迁移: 豆包抓包凭证入 vault 失败（保留明文 kv 下次重试，禁止丢凭证）: {e}"),
+                    &format!("启动迁移: 豆包抓包凭证入 vault 失败（下次启动重试）: {e}"),
                 ),
             }
-        } else {
-            // 残留行但无凭证内容（空对象/损坏数据）：直接清理，避免永远空转
-            let _ = crate::store::db(&state.data_dir).kv_delete(KV_KEY);
         }
     }
 }
@@ -1023,38 +851,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_v2_hex文本解析与hex往返() {
+    fn parse_key_file_v2文本解析与hex往返() {
+        let dir = std::env::temp_dir().join(format!("vault_parse_v2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault_key.bin");
         let key = [0xABu8; 32];
         // 标准格式：V2: + 64 位小写 hex（与服务端 docker_main 写出格式一致）
-        let text = format!("V2:{}", bytes_to_hex(&key));
-        assert_eq!(parse_v2_hex_text(&text).expect("parse V2"), Some(key.to_vec()));
+        std::fs::write(&path, format!("V2:{}", bytes_to_hex(&key))).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(parse_key_file(&raw, &path).expect("parse V2"), key.to_vec());
         // 带首尾空白（复制粘贴常见）也能解析
-        let text = format!("  V2:{}\r\n", bytes_to_hex(&key));
-        assert_eq!(
-            parse_v2_hex_text(&text).expect("parse trimmed"),
-            Some(key.to_vec())
-        );
-        // 非 V2: 前缀 → Ok(None)（交由调用方平台原生格式回退）
-        assert_eq!(parse_v2_hex_text("deadbeef").unwrap(), None);
-        assert_eq!(parse_v2_hex_text("").unwrap(), None);
+        std::fs::write(&path, format!("  V2:{}\r\n", bytes_to_hex(&key))).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(parse_key_file(&raw, &path).expect("parse trimmed"), key.to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn parse_v2_hex长度或字符非法时报错() {
+    fn parse_key_file_v2长度或字符非法时报错() {
+        let path = Path::new("vault_key.bin");
         // 长度不对（63 位 hex）
         let short = format!("V2:{}a", "ab".repeat(31));
-        let err = parse_v2_hex_text(&short).unwrap_err();
+        let err = parse_key_file(short.as_bytes(), path).unwrap_err();
         assert!(err.contains("64 位 hex"), "实际报错: {err}");
         // 非 hex 字符（ASCII）→ 被 hexdigit 全量校验拦下
         let bad = format!("V2:{}", "z".repeat(64));
-        let err = parse_v2_hex_text(&bad).unwrap_err();
+        let err = parse_key_file(bad.as_bytes(), path).unwrap_err();
         assert!(err.contains("非 hex 字符"), "实际报错: {err}");
         // 多字节 UTF-8 且总字节长恰为 64（共享目录手工编辑污染场景）：
         // é 从奇数字节偏移 61 开始，旧代码按字节切片会在 char boundary
         // 中间 panic；须收敛为友好 Err（panic 回归用例）
         let multibyte = format!("V2:{}éa", "a".repeat(61));
         assert_eq!(multibyte.len(), 67); // 3 前缀 + 61 + 2 + 1 = 67 字节
-        let err = parse_v2_hex_text(&multibyte).unwrap_err();
+        let err = parse_key_file(multibyte.as_bytes(), path).unwrap_err();
         assert!(err.contains("非 hex 字符"), "实际报错: {err}");
     }
 
@@ -1113,124 +942,5 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
-    }
-
-    /// 密钥文件原子写入（审查修复 中-1）：首写/覆写内容正确、无临时文件残留、
-    /// unix 下保持 0600 权限不变量（mac key file 主源安全要求）
-    #[test]
-    fn write_key_file_atomic_首写覆写与无临时残留() {
-        let dir = std::env::temp_dir().join(format!("vault_atomic_write_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key_path = dir.join("vault_key.bin");
-        // 首写
-        write_key_file_atomic(&key_path, "V2:aaaa").expect("首次原子写");
-        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "V2:aaaa");
-        // 覆写已有内容（rename 替换路径）
-        write_key_file_atomic(&key_path, "V2:bbbb").expect("覆写原子写");
-        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "V2:bbbb");
-        // 无临时文件残留
-        assert!(
-            !key_path.with_extension("bin.v2tmp").exists(),
-            "临时密钥文件不应残留"
-        );
-        // unix：rename 后权限随临时文件，应为 0600
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "原子写后 key file 应保持 0600");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 迁移核心（审查修复 中-2 参数注入）：原生格式（纯 hex）→ V2: 文本，
-    /// 密钥值回读一致；已是 V2: 时幂等跳过（内容不变）
-    #[test]
-    fn convert_to_v2_impl_原生格式迁移_已是v2跳过() {
-        let dir = std::env::temp_dir().join(format!("vault_convert_v2_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key_path = dir.join("vault_key.bin");
-        let key = [0x11u8; 32];
-        // 原生纯 hex → 迁移为 V2: 文本
-        let native = bytes_to_hex(&key);
-        std::fs::write(&key_path, &native).unwrap();
-        convert_to_v2_impl(&key_path, native.as_bytes(), &key, &dir);
-        let migrated = std::fs::read_to_string(&key_path).unwrap();
-        assert!(
-            migrated.trim().starts_with("V2:"),
-            "迁移后应为 V2: 文本: {migrated}"
-        );
-        assert_eq!(
-            parse_v2_hex_text(&migrated).expect("迁移产物可解析"),
-            Some(key.to_vec()),
-            "迁移后密钥值不变"
-        );
-        // 已是 V2: → 幂等跳过，内容不变
-        convert_to_v2_impl(&key_path, migrated.as_bytes(), &key, &dir);
-        assert_eq!(
-            std::fs::read_to_string(&key_path).unwrap().trim(),
-            migrated.trim(),
-            "已是 V2: 格式时应跳过迁移"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 空快照（0 字节）视为不存在（审查修复 低-5）：按「首次创建」处理可正常
-    /// 写入且落盘非空——首启 Stronghold::new 建文件后崩溃的残留不再永久拒开
-    #[test]
-    fn with_open_空快照视为不存在_正常首建() {
-        let dir = std::env::temp_dir().join(format!("vault_empty_snap_{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("conf")).unwrap();
-        let snapshot = dir.join("conf").join("vault.stronghold");
-        // 0 字节空快照残留
-        std::fs::write(&snapshot, b"").unwrap();
-        // key file 以 V2: 共享格式提供主密码（两平台均可解析，不触碰 Keychain）
-        let pwd = [0x21u8; 32];
-        std::fs::write(
-            dir.join("conf").join("vault_key.bin"),
-            format!("V2:{}", bytes_to_hex(&pwd)),
-        )
-        .unwrap();
-        // 空快照按「首次创建」处理 → 写入成功
-        ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j1"}))
-            .expect("空快照应按首次创建处理");
-        assert!(snapshot_has_data(&snapshot), "写入后快照应非空");
-        // 回读一致
-        assert_eq!(ns_get(&dir, "test", "k1"), Some(serde_json::json!({"jwt": "j1"})));
-        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 密钥与快照错配防护（审查修复 低-6）：快照存在但密钥被替换 → 拒绝打开
-    /// （Err），且空 client 不得经 save() 覆盖原快照（快照字节不变）。
-    /// Windows 路径：纯 hex 非 DPAPI blob → 读密钥失败 Err；macOS 路径：解析出
-    /// pwd2 后 Stronghold/load_client 对 pwd1 快照失败 → 错配防护 Err。
-    /// 两平台均 Err，断言不区分错误来源。
-    #[test]
-    fn with_open_密钥与快照错配_拒绝打开且快照不被覆盖() {
-        let dir = std::env::temp_dir().join(format!("vault_mismatch_{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("conf")).unwrap();
-        let snapshot = dir.join("conf").join("vault.stronghold");
-        // 1) 用 pwd1 首建快照（V2: 共享格式主密码，两平台均可解析）
-        let pwd1 = [0x33u8; 32];
-        std::fs::write(
-            dir.join("conf").join("vault_key.bin"),
-            format!("V2:{}", bytes_to_hex(&pwd1)),
-        )
-        .unwrap();
-        ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j1"}))
-            .expect("首建快照应成功");
-        assert!(snapshot_has_data(&snapshot));
-        let before = std::fs::read(&snapshot).unwrap();
-        // 2) 篡改 key file 为另一密钥的纯 hex，并强制下次重开（缓存里还是 pwd1 句柄）
-        let pwd2 = [0xEEu8; 32];
-        std::fs::write(dir.join("conf").join("vault_key.bin"), bytes_to_hex(&pwd2)).unwrap();
-        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
-        // 3) 错配 → Err，且快照字节不变（防空 client 覆盖）
-        let r = ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j2"}));
-        assert!(r.is_err(), "密钥与快照错配时必须拒绝打开");
-        assert_eq!(std::fs::read(&snapshot).unwrap(), before, "快照不得被空 client 覆盖");
-        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

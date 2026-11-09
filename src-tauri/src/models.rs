@@ -199,6 +199,29 @@ pub struct Settings {
     /// 豆包会员额度每日巡检调度开关（issue #147，默认开）：调度器 doubao-quota 可关闭
     #[serde(default = "default_true")]
     pub doubao_quota_enabled: bool,
+    /// 豆包每日签到调度开关（默认开）：调度器 doubao-checkin 可关闭；
+    /// detail 查询未签账号 → landing/checkin 提交 → 按日落库 + 池回写
+    #[serde(default = "default_true")]
+    pub doubao_checkin_enabled: bool,
+    /// 豆包数据同步模式（对齐 Trae/Buddy/Qoder 积分同步五模式）：off/hourly/
+    /// every_hours/every_days/daily（默认 every_hours 每 2 小时）；同步动作 =
+    /// 额度巡检 run_batch（quota + detail 探针 → 池回写），页面读本地池
+    #[serde(default = "default_doubao_sync_mode")]
+    pub doubao_sync_mode: String,
+    /// 豆包数据同步 every_hours 间隔小时数（1..=24，默认 2；state 归一化 clamp）
+    #[serde(default = "default_doubao_sync_hours")]
+    pub doubao_sync_hours: String,
+    /// 豆包数据同步 daily 模式时刻 HH:MM（默认 23:50 错峰）
+    #[serde(default = "default_doubao_sync_hhmm")]
+    pub doubao_sync_hhmm: String,
+    /// 豆包每日签到调度触发时刻 HH:MM（默认 09:15，错峰 quota 09:30；环境配置页可改）
+    #[serde(default = "default_doubao_checkin_hhmm")]
+    pub doubao_checkin_hhmm: String,
+    /// 豆包 probe 自动保活（2026-11-06 方案 A，默认开）：签到时 probe 缺失/过期 →
+    /// 自动「启动代理 → 以账号打开豆包注入代理 → 等客户端首页 campaign 请求抓包
+    /// 入库 → 继续签到」，无需手动开代理+客户端签到对齐。710010702 设备指纹缺失的自愈链
+    #[serde(default = "default_true")]
+    pub doubao_probe_auto_keepalive: bool,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]
@@ -397,18 +420,11 @@ pub struct Settings {
     /// Qoder 积分数据同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
     #[serde(default = "default_credits_sync_hours")]
     pub qoder_credits_sync_hours: String,
-    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 N 小时为全部含
-    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h——间隔配置
-    /// ≤7h 才能保证过期令牌必被续上；8~24h 时兜底 tick 可能落在过期区，期间业务
-    /// 请求靠各任务 401 自愈兜底，前端配置页已明示该后果）；关闭后凭证仅在
-    /// 使用时惰性刷新
+    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 6 小时为全部含
+    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h > 6h 调度
+    /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
     #[serde(default = "default_true")]
     pub qoder_token_renew_enabled: bool,
-    /// Qoder 凭证续期间隔小时数（1~24，默认 6；环境配置页可改，state 加载时
-    /// 零值回填 + 上限钳制，调度器再兜底 clamp 防越界值直达 EveryHours）。
-    /// 注意 >7h 的后果见上（设计承诺只在 ≤7h 区间成立）
-    #[serde(default = "default_qoder_token_renew_hours")]
-    pub qoder_token_renew_interval_hours: u32,
     /// Qoder 会话流水定时合并开关（默认开）：qoder-sessions-compact 任务每 6 小时将
     /// 早于保留窗的请求级流水按 (date, uid, preview) 合并为单行（幂等，积分合计不变；
     /// 看板展示由查询层读时聚合即时呈现，无需等待合并）
@@ -500,6 +516,20 @@ fn default_wb_growth_hhmm() -> String {
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
 }
+/// 豆包每日签到调度默认 09:15（错峰额度巡检 09:30）
+fn default_doubao_checkin_hhmm() -> String {
+    "09:15".into()
+}
+/// 豆包数据同步默认每 2 小时（对齐 Trae 积分数据同步默认档）
+fn default_doubao_sync_mode() -> String {
+    "every_hours".into()
+}
+fn default_doubao_sync_hours() -> String {
+    "2".into()
+}
+fn default_doubao_sync_hhmm() -> String {
+    "23:50".into()
+}
 /// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
 fn default_buddy_ai_checkin_hhmm() -> String {
     "09:20".into()
@@ -523,10 +553,6 @@ fn default_buddy_ai_catalog_sync_hhmm() -> String {
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {
     "10:15".into()
-}
-/// Qoder 凭证续期默认间隔 6 小时（客户端 token 惰性窗 7h > 6h，过期前必被续上）
-fn default_qoder_token_renew_hours() -> u32 {
-    6
 }
 fn default_qoder_credits_sync_hhmm() -> String {
     "23:40".into()
@@ -786,10 +812,12 @@ pub struct ApiPoolFile {
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
     #[serde(default)]
     pub strategy: String,
-    /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
+    /// Buddy 池调度策略（取值同上）；空 = 加权公平轮转 fair_rotation（WB 专属
+    /// 默认，PR #187；改前「沿用 strategy」会继承 expire_first 硬排序缺陷）
     #[serde(default)]
     pub wb_strategy: String,
-    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy 语义）
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池）——
+    /// wb_strategy 已改公平轮转专属默认，不在此列
     #[serde(default)]
     pub qoder_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
@@ -924,7 +952,8 @@ pub struct ApiPoolFile {
     #[serde(default)]
     pub buddy_ai_tag_ids: Vec<String>,
     /// buddy-ai 池内调度策略（取值同 strategy；空串 = 跟随 Trae 池，与
-    /// wb_strategy / qoder_strategy 同语义）。启动（do_start）与热应用（pool_set）
+    /// qoder_strategy 同语义——wb_strategy 已改公平轮转专属默认，不在此列）。
+    /// 启动（do_start）与热应用（pool_set）
     /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
     #[serde(default)]
     pub buddy_ai_strategy: String,
@@ -1028,6 +1057,9 @@ pub struct PoolStatus {
     /// 前端显示「就绪」却不可选（可观测盲点）
     #[serde(default)]
     pub hard_credit: bool,
+    /// 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，前端显示恢复倒计时）
+    #[serde(default)]
+    pub hard_until: Option<i64>,
     pub disabled: bool,
     pub err_count: i32,
     /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled

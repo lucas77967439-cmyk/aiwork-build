@@ -3,15 +3,11 @@
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
 //   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（仅作手动安装备选；应用内更新不使用，见 pick_asset）
-//   AI Work 助手_<ver>_aarch64.dmg     ← macOS 安装镜像（Apple Silicon；人工拖拽安装）
-//   AI Work 助手_<ver>_x64.dmg         ← macOS 安装镜像（Intel；updater 按运行时 ARCH 挑选，
-//                                         _universal.dmg 命名亦兼容）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
 //                      latest.json（scripts/rename_release.mjs 生成随 Release 上传）取安装包 SHA256，
 //                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
-//                      两者皆无（存量旧 release）下载步同样 fail-closed 拒绝（H-4 修复：不再跳过校验放行）；
 //   update_download    下载资产到临时目录（emit update-download-progress）。完整性三道闸：
 //                      ① 拒绝缺失/非法的发布方 SHA256（None 不放行）；② 下载完成与发布方
 //                      SHA256 比对（不匹配即删除并报错），通过后落 .sha256 sidecar；
@@ -51,8 +47,6 @@ pub struct UpdateCheckResult {
     /// 发布方提供的安装包 SHA256（优先取发布校验清单 latest.json，回退 release 正文约定行；
     /// 存量旧 release 两者皆无时为 None——update_download 将拒绝下载，fail-closed）
     pub sha256: Option<String>,
-    /// 运行平台（F-75 M3-3.3："windows" | "macos"），前端更新引导文案分派用
-    pub platform: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -89,22 +83,10 @@ fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
     a.cmp(&b)
 }
 
-/// D1 审查修复：安装包文件名白名单——Windows 路径会被拼入 `cmd /C start` 命令行，
-/// 仅放行字母/数字（含 Unicode，中文安装包名合法）/点/下划线/连字符/空格，
-/// 拒绝一切 cmd 元字符（& | ^ % < > " ! 等非白名单字符）与控制字符，杜绝命令
-/// 注入（防御纵深：file_path 已有 temp 目录归属 + 资产名绑定 + SHA256 三道校验）。
-/// 集合与下载侧 ensure_safe_asset_name 严格一致（审查 L4：两侧漂移会造成
-/// 「能下载、装不了」的安装包滞留）。
-fn is_safe_installer_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
-}
-
-/// 读当前系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
-/// Windows：注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
-/// macOS：scutil --proxies（F-75 M2-2.1 接线 platform::proxy_ctl——原直调
-/// cfg(windows) 的 get_existing_win_proxy 是 mac 编译阻断点，本行即修复）。
+/// 读当前 Windows 系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
+/// 注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
 fn system_proxy_url() -> Option<String> {
-    let (_, server, _) = crate::platform::proxy_ctl::get_system_proxy()?;
+    let (_, server, _) = crate::commands::proxy::get_existing_win_proxy()?;
     let server = server.trim();
     if server.is_empty() {
         return None;
@@ -181,50 +163,28 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     ))
 }
 
-/// 平台安装包资产后缀（优先级序，F-75 M3-3.2 随 cfg 分派）：
-/// Windows：仅 NSIS（_x64-setup.exe）——MSI 不参与挑选（P4，#135 审查收尾）：
-/// update_run_installer 统一按 NSIS 参数（/P /UPDATE /R）启动安装器，msiexec 语义中
-/// /P 是补丁模式——旧「MSI 兜底」选出即死路，宁可返回 None 走「没有可用的安装包
-/// 资产」显式报错引导手动下载，也不静默选出必然失败的资产。
-/// macOS（双架构支持）：本机架构精确匹配 > universal > 另一架构（Rosetta 兜底）。
-/// 附带收益：Windows 版不会误选 dmg、mac 版不会误选 exe——双产品线同 Release 共存。
-#[cfg(windows)]
-fn asset_suffixes() -> &'static [&'static str] {
-    &["_x64-setup.exe"]
-}
-#[cfg(target_os = "macos")]
-fn asset_suffixes() -> &'static [&'static str] {
-    if std::env::consts::ARCH == "x86_64" {
-        &["_x64.dmg", "_universal.dmg", "_aarch64.dmg"]
-    } else {
-        &["_aarch64.dmg", "_universal.dmg", "_x64.dmg"]
-    }
-}
-
-/// 在 release 资产中挑选安装包（按 asset_suffixes 优先级 + 版本号最大）。
+/// 在 release 资产中挑选安装包：仅接受 NSIS（x64-setup.exe）。
+/// MSI 不参与挑选（P4，#135 审查收尾）：update_run_installer 统一按 NSIS 参数
+/// （/P /UPDATE /R）启动安装器，msiexec 语义中 /P 是补丁模式——旧「MSI 兜底」
+/// 选出即死路，宁可在此返回 None 走「没有可用的安装包资产」显式报错引导手动下载，
+/// 也不静默选出必然失败的资产。
 fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
-    // [(name, url, size, suffix 优先级序号)]
-    let suffixes = asset_suffixes();
-    let mut parsed: Vec<(String, String, u64, usize)> = Vec::new();
+    let mut parsed: Vec<(String, String, u64)> = Vec::new();
     for a in assets {
         let name = a.get("name")?.as_str()?.to_string();
         let url = a.get("browser_download_url")?.as_str()?.to_string();
         let size = a.get("size")?.as_u64().unwrap_or(0);
-        if let Some(prio) = suffixes.iter().position(|s| name.ends_with(s)) {
-            parsed.push((name, url, size, prio));
+        if name.ends_with("_x64-setup.exe") {
+            parsed.push((name, url, size));
         }
     }
-    // 后缀优先级升序（表内位置靠前者先选）；同类型取文件名版本号最大者
-    // （release 内一般只有一个，防御性处理）。
+    // 同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
     parsed.sort_by(|a, b| {
-        let va = version_from_asset(&a.0).unwrap_or((0, 0, 0));
-        let vb = version_from_asset(&b.0).unwrap_or((0, 0, 0));
-        a.3.cmp(&b.3).then(vb.cmp(&va))
+        version_from_asset(&b.0)
+            .unwrap_or((0, 0, 0))
+            .cmp(&version_from_asset(&a.0).unwrap_or((0, 0, 0)))
     });
-    parsed
-        .into_iter()
-        .next()
-        .map(|(name, url, size, _)| (name, url, size))
+    parsed.into_iter().next()
 }
 
 // ---------------- 发布校验清单（latest.json） ----------------
@@ -431,7 +391,6 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         size,
         release_page,
         sha256,
-        platform: crate::platform::OS.to_string(),
     })
 }
 
@@ -502,14 +461,16 @@ pub struct UpdateDownloaded {
 /// 路径传入 `cmd /C start` 拼接，且 asset_name 参与临时目录/sidecar 路径 join。
 /// Rust Command 对含空格参数自动加引号，但 `"` 可闭合引导，`&`/`^`/`%`/`!` 等
 /// 在 cmd 解析层存在注入面。白名单仅放行字母数字（Unicode 语义，含既有资产名
-/// 中文）+ 空格 `. _ -`——与安装侧 is_safe_installer_name 同一严格集合（审查 L4：
-/// 括号/# 移出，发布流资产名不含这些字符；原宽集曾致 "setup(1).exe" 能下载、
-/// 安装被拒的滞留）。其余一律拒绝。
+/// 中文）+ 空格 `. _ - ( ) #`——发布流资产名 "AI Work 助手_<ver>_x64-setup.exe"
+/// / "_x64_zh-CN.msi" 全命中，其余一律拒绝。
 fn ensure_safe_asset_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("资产文件名为空，已中止".to_string());
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')) {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '#'))
+    {
         return Err(format!("资产文件名包含非法字符，已中止: {name}"));
     }
     Ok(())
@@ -568,13 +529,10 @@ pub fn update_download(
             s
         }
         None => {
-            // H-4 fail-closed：前端未回传摘要（存量旧 release 无清单/正文约定行）时
-            // 不再「跳过校验」放行——否则 update_check 的 fail-closed 可被
-            // update_download(恶意URL, ..., None) + update_run_installer 组合绕过
-            // （webview 注入场景构成任意安装包执行链）。引导手动下载。
-            return Err(format!(
-                "发布方 SHA-256 缺失（存量旧版本 Release），已中止下载以保证安全。请手动下载安装：{RELEASES_PAGE}"
-            ));
+            return Err(
+                "发布方 SHA-256 缺失（旧版发布方式，无校验信息），已中止下载。请手动下载安装"
+                    .to_string(),
+            )
         }
     };
 
@@ -583,18 +541,15 @@ pub fn update_download(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
     // 清理历史版本残留（只删本目录下的安装包文件，保留当前目标文件）
     if let Ok(entries) = std::fs::read_dir(&dir) {
-        let target_sidecar = format!("{asset_name}.sha256");
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
-            let is_installer = p
-                .extension()
-                .map(|e| e == "exe" || e == "msi" || e == "dmg")
-                .unwrap_or(false);
-            let is_sidecar = name.as_deref().map(|n| n.ends_with(".sha256")).unwrap_or(false);
-            let is_target = name.as_deref() == Some(asset_name.as_str())
-                || name.as_deref() == Some(target_sidecar.as_str());
-            if !is_target && p.is_file() && (is_installer || is_sidecar) {
+            if name.as_deref() != Some(asset_name.as_str())
+                && p.is_file()
+                && p.extension()
+                    .map(|e| e == "exe" || e == "msi" || e == "sha256")
+                    .unwrap_or(false)
+            {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -729,250 +684,94 @@ pub fn update_run_installer(
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
+    // D1（cmd 元字符注入防御）：下方经 `cmd /C start` 拼接启动，asset_name 同时
+    // 参与 sidecar 路径拼接——白名单拒绝 cmd 元字符（受信前端直调也纵深拦截）
+    ensure_safe_asset_name(&asset_name)?;
+
     // 审查修复（H4，闸③）：安装前两道校验——
     // ① 文件名与资产名绑定：拒绝「A 文件路径 + B 资产名」的组合，防止借合法资产名
     //    通过版本校验后执行任意文件
     // ② SHA256 复验：读取下载时落盘的 .sha256 sidecar，对磁盘文件重新计算并比对，
     //    覆盖「下载后、安装前」窗口期的替换/篡改；sidecar 缺失或损坏同样拒绝
     //    （fail-closed：正常流程必有 sidecar，缺失说明文件不是本次更新流程下载的）
-    // 注：asset_name 白名单由下方绑定校验（file_name == asset_name）+
-    // is_safe_installer_name（D1）覆盖，下载侧 validate_target 已先过
-    // ensure_safe_asset_name，无需重复校验。
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .ok_or_else(|| format!("非法的安装包路径，已中止：{file_path}"))?;
     if file_name != asset_name {
-        return Err("安装包文件名与资产名不匹配，已中止".to_string());
-    }
-    // D1 审查修复：文件名白名单（拒绝 cmd 元字符，防命令注入）
-    if !is_safe_installer_name(&file_name) {
-        return Err(format!("安装包文件名含非法字符，已中止：{file_name}"));
-    }
-    // 下载-安装窗口 TOCTOU 防护（H-4）：对磁盘文件复验下载步落盘的 sidecar
-    // 校验清单——仅「通过过完整性校验」的安装包才允许进入安装
-    // （sidecar 为 sha256sum 风格「<hex>  <资产名>」行，取首个空白分隔字段即摘要 hex）
-    let sidecar = path.with_file_name(format!("{asset_name}.sha256"));
-    let expected = std::fs::read_to_string(&sidecar)
-        .ok()
-        .and_then(|s| s.split_whitespace().next().map(str::to_ascii_lowercase))
-        .filter(|s| is_sha256_hex(s));
-    let Some(expected) = expected else {
-        return Err(
-            "缺少安装包校验清单（请重新执行「检查更新→下载」），已中止安装".to_string(),
-        );
-    };
-    let actual = file_sha256(path).unwrap_or_default();
-    if actual != expected {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(&sidecar);
         return Err(format!(
-            "安装包完整性复验失败（SHA256 不匹配），已删除安装包。请重新检查更新：{RELEASES_PAGE}"
+            "安装包文件名与资产名不一致（{file_name} / {asset_name}），已中止"
         ));
     }
-
-    // F-75 M3-3.3 macOS 分支：无安装器概念——`open` 挂载 dmg 并弹 Finder 窗口，
-    // 引导用户把 .app 拖入 /Applications 完成覆盖安装；**不退出应用**（用户拖拽
-    // 完成后由前端「重启应用」按钮调 update_restart_app）。Gatekeeper 未签名
-    // 拦截的放行引导见 AboutDialog mac 安装视图。
-    #[cfg(target_os = "macos")]
-    {
-        crate::platform::cmd::sys_command("open")
-            .arg(path)
-            .spawn()
-            .map_err(|e| format!("打开安装包失败: {e}（可手动打开：{file_path}）"))?;
-        // 结果型事件：emit 失败落 stderr（issue #44 约定；与 Windows 分支同语义）
-        crate::events::emit_logged(
-            &app,
-            "update-installing",
-            serde_json::Value::String(asset_name),
-            None,
+    let sidecar = expected_dir.join(format!("{asset_name}.sha256"));
+    let expected = std::fs::read_to_string(&sidecar).map_err(|_| {
+        "安装包校验文件缺失，已中止安装。请重新走「检查更新 → 下载」流程，或手动下载安装"
+            .to_string()
+    })?;
+    let expected = expected
+        .split_whitespace()
+        .next()
+        .filter(|h| is_sha256_hex(h))
+        .ok_or("安装包校验文件损坏，已中止安装。请重新下载")?
+        .to_ascii_lowercase();
+    let actual = file_sha256(path).unwrap_or_default();
+    if actual != expected {
+        return Err(
+            "安装包完整性校验失败（SHA256 与下载时不一致），文件可能在下载后被改动，已中止安装。请重新下载"
+                .to_string(),
         );
-        return Ok(());
     }
 
-    // Windows：/P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用。
-    // issue #135（main 侧并入）：经 `cmd /c start` 中转启动——cmd 启动安装器后立即退出，
-    // 安装器随即脱离本应用的进程树，PREINSTALL 钩子 taskkill 主程序（无 /T）不会波及
-    // 安装器；取代旧 CREATE_BREAKAWAY_FROM_JOB 方案（issue #37）。CREATE_NO_WINDOW
-    // 防止 cmd 控制台窗口闪现。
-    // 审查修复（P1，整体黑盒复审）：整体 cfg 门控——mac 构建中上方 return 之后
-    // 本段不可达，未门控会触发 unreachable_code 警告（零警告红线）
-    #[cfg(not(target_os = "macos"))]
+    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用。
+    // Windows 经 `cmd /c start` 中转启动（issue #135）：cmd 启动安装器后立即退出，
+    // 安装器随即脱离本应用的进程树——安装器 PREINSTALL 钩子会 taskkill 本产品主程序，
+    // 若安装器仍是本应用的子进程，树杀（/T）会连同安装器一起强杀，安装中途静默中断
+    // 导致升级失败；脱树后 taskkill 只命中应用自身。CREATE_NO_WINDOW 防止 cmd 控制台
+    // 窗口闪现（安装包路径与存在性已在上方校验，start 找不到文件的场景已排除）。
+    #[cfg(target_os = "windows")]
     {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
-            // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
-            // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
-            // 而不是照常 emit+exit 静默失败（issue #135 加固）
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status()
-                .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
-            if !status.success() {
-                return Err(format!(
-                    "启动安装程序失败（退出码 {}），可手动运行：{file_path}",
-                    status.code().unwrap_or(-1)
-                ));
-            }
-        }
-
-        // 提示前端后退出，让安装器接管（安装钩子首轮即 /F 强杀解锁文件占用，随后
-        // Sleep 1.2s + 30×500ms 存活探测轮询，超时才再 /F 兜底；应用内自动更新时
-        // 强杀可能先于本退出链执行，被打断的系统代理还原由下次在本应用内直开
-        // Trae/豆包等客户端（未注入代理）时的 cleanup_stale_local_proxy 自愈，
-        // 见 installer-hooks.nsh PREINSTALL 注释）
-        // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
-        crate::events::emit_logged(
-            &app,
-            "update-installing",
-            serde_json::Value::String(asset_name.clone()),
-            None,
-        );
-        std::thread::sleep(Duration::from_millis(800));
-        // 审查修复（main 侧并入）：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
-        // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
-        let _ = app.exit(0);
-        Ok(())
-    }
-}
-
-/// macOS 更新安装完成后的一键重启（AboutDialog「重启应用」按钮触发）。
-/// bundle 根从 current_exe 反推（<App>.app/Contents/MacOS/<exe> → nth(3)），
-/// 不经应用名字符串查找——与 tauri.conf.json productName / 前端 APP_NAME 零耦合，改名不失效。
-/// 两道防御：① 磁盘 bundle 版本与运行版本一致 → 用户尚未完成 dmg 拖拽覆盖，
-/// 此时 `open` 只会激活现有实例、随后本进程 exit 造成「重启=应用退出」，故拒绝执行；
-/// ② `open` 退出码非零时不退出并回报错误（不再静默失效）。
-/// （LS 对已替换 bundle 的激活时序竞争待 M-1 真机验证一并确认）
-#[tauri::command]
-pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        use crate::switcher::locate::read_info_plist_value;
-        // 当前进程即从该 bundle 运行，Info.plist 必在；异常形态（非 .app 布局）直接报错
-        let bundle = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.ancestors().nth(3).map(|a| a.to_path_buf()))
-            .filter(|b| b.extension().map(|x| x == "app").unwrap_or(false))
-            .ok_or_else(|| "无法定位当前应用 bundle，请手动从启动台重新打开".to_string())?;
-        // 防御 ①：update_run_installer 已校验新包版本 > 当前版本，磁盘版本仍等于
-        // 运行版本即说明 /Applications 中的 .app 尚未被新版覆盖
-        if let Some(v) = read_info_plist_value(&bundle, "CFBundleShortVersionString") {
-            if v == env!("CARGO_PKG_VERSION") {
-                return Err(
-                    "尚未检测到新版本完成安装：请先在 dmg 窗口将应用拖入「Applications」替换旧版，再点击重启"
-                        .to_string(),
-                );
-            }
-        }
-        // `open <bundle>` 经 LaunchServices 拉起（异步提交激活请求）；取退出码校验。
-        // 审查修复（Medium）：LS 常态 <100ms，异常挂起时无超时 status() 会无限阻塞
-        // 命令线程（重启按钮永久转圈且应用无法退出）——sys_status_timeout 5s 兜底
-        // 强杀，超时报错不退出，应用保持可用可手动重启
-        let mut cmd = crate::platform::cmd::sys_command("open");
-        cmd.arg(&bundle);
-        let status = crate::platform::cmd::sys_status_timeout(&mut cmd, Duration::from_secs(5))
-            .map_err(|e| format!("拉起新版应用失败: {e}"))?;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
+        // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
+        // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
+        // 而不是照常 emit+exit 静默失败（issue #135 加固）
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
         if !status.success() {
             return Err(format!(
-                "拉起新版应用失败（open 退出码 {:?}），请手动从启动台打开新版",
-                status.code()
+                "启动安装程序失败（退出码 {}），可手动运行：{file_path}",
+                status.code().unwrap_or(-1)
             ));
         }
-        // 结果型事件：emit 失败落 stderr（issue #44 约定）
-        crate::events::emit_logged(&app, "update-restarting", serde_json::Value::Null, None);
-        std::thread::sleep(Duration::from_millis(800));
-        // app.exit(0) 走 RunEvent::Exit 清理链（停进程内代理、停 API 服务、还原系统代理）
-        // ——与 update_quit_app 同口径。std::process::exit(0) 会跳过清理：MITM 代理
-        // 运行中重启更新会使系统代理停留在 127.0.0.1:<port>，重启后全局断网且
-        // 启动路径无 cleanup_stale_local_proxy 自愈（仅直开应用命令触发）
-        app.exit(0);
-        Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
     {
-        let _ = app;
-        Err("仅 macOS 需要手动重启更新（Windows 安装器 /R 参数自动重启）".to_string())
+        std::process::Command::new(path)
+            .args(["/P", "/UPDATE", "/R"])
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
     }
-}
 
-/// macOS 手动安装引导：主动退出应用，释放 .app bundle 占用——Finder 无法替换
-/// 正在运行的 .app（提示「无法复制」），故拖拽替换前必须先退出本应用。
-/// 用 app.exit(0) 走 RunEvent::Exit 清理链（停进程内代理、停 API 服务、还原系统代理），
-/// 不用 std::process::exit 跳过清理。Windows 无此需求（NSIS /R 自动重启）。
-#[tauri::command]
-pub fn update_quit_app(app: AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        app.exit(0);
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app;
-        Err("仅 macOS 手动安装流程需要退出应用".to_string())
-    }
+    // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
+    // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
+    crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
+    // D2：800ms 延迟退出与安装器 PREINSTALL 宽限等待（installer-hooks.nsh：1.2s
+    // 静默 + 存活探测循环）耦合——正常时序本应用先自行退出，安装器宽限仅兜底
+    // 锁占用；两值需同步调整（应用退出耗时应 < 安装器兜底强杀）
+    std::thread::sleep(Duration::from_millis(800));
+    // 审查修复：走 Tauri 退出链（RunEvent::Exit）而非 std::process::exit——
+    // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
+    let _ = app.exit(0);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(windows)]
-    #[test]
-    fn pick_asset_跨平台互斥_忽略dmg并优先nsis() {
-        // M3-3.2 验收：双产品线同 Release 共存——Windows 更新器绝不误选 mac dmg，
-        // MSI/dmg 在场亦一律忽略（P4 #135：pick_asset 仅接受 NSIS；
-        // mac 侧对应分支由 cfg(target_os = "macos") 编译，真机验证）
-        let assets = serde_json::json!([
-            { "name": "AI Work 助手_3.5.4_aarch64.dmg", "browser_download_url": "u-dmg", "size": 9 },
-            { "name": "AI Work 助手_3.5.4_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1 },
-            { "name": "AI Work 助手_3.4.0_x64_zh-CN.msi", "browser_download_url": "u-msi", "size": 2 }
-        ]);
-        let list = assets.as_array().unwrap();
-        let (name, url, _) = pick_asset(list).expect("应命中 NSIS");
-        assert!(name.ends_with("_x64-setup.exe"), "不应选中 dmg/msi: {name}");
-        assert_eq!(url, "u-nsis");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn pick_asset_mac_本机架构优先_跨平台互斥() {
-        // M3-3.2 mac 侧对测（与 Windows 版互斥测试同源）：exe/dmg 互斥，
-        // 本机架构 dmg > universal > 另一架构（Rosetta 兜底）
-        let assets = serde_json::json!([
-            {"name": "AI.Work._3.3.3_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1},
-            {"name": "AI.Work._3.3.3_x64.dmg", "browser_download_url": "u-x64", "size": 1},
-            {"name": "AI.Work._3.3.3_universal.dmg", "browser_download_url": "u-univ", "size": 1},
-            {"name": "AI.Work._3.3.3_aarch64.dmg", "browser_download_url": "u-arm", "size": 1}
-        ]);
-        let (name, url, _) = pick_asset(assets.as_array().unwrap()).unwrap();
-        assert!(!name.ends_with(".exe"), "mac 更新器绝不误选 exe: {name}");
-        // dmg 令牌映射：运行时 ARCH=x86_64 对应资产命名 _x64.dmg（aarch64 同名）
-        let native = if std::env::consts::ARCH == "x86_64" { "_x64.dmg" } else { "_aarch64.dmg" };
-        assert!(name.ends_with(native), "应选本机架构 dmg: {name}");
-        if std::env::consts::ARCH == "x86_64" {
-            assert_eq!(url, "u-x64");
-        } else {
-            assert_eq!(url, "u-arm");
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn pick_asset_mac_仅universal时兜底选中() {
-        let assets = serde_json::json!([
-            {"name": "AI.Work._3.3.3_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1},
-            {"name": "AI.Work._3.3.3_universal.dmg", "browser_download_url": "u-univ", "size": 1}
-        ]);
-        let (name, url, _) = pick_asset(assets.as_array().unwrap()).unwrap();
-        assert!(name.ends_with("_universal.dmg"));
-        assert_eq!(url, "u-univ");
-    }
 
     #[test]
     fn sha256_hex_format() {
@@ -990,9 +789,7 @@ mod tests {
         assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64-setup.exe").is_ok());
         assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64_zh-CN.msi").is_ok());
         assert!(ensure_safe_asset_name("AI.Work._3.3.3_x64-setup.exe").is_ok());
-        // 括号/# 随严格集拒绝（审查 L4：与安装侧 is_safe_installer_name 同集合，
-        // 防「能下载、装不了」）
-        assert!(ensure_safe_asset_name("setup(1).exe").is_err());
+        assert!(ensure_safe_asset_name("setup(1).exe").is_ok());
         // cmd 元字符 / 引号 / 分隔符 / 控制字符一律拒绝
         for bad in [
             "x&calc.exe",
@@ -1024,7 +821,6 @@ mod tests {
     /// P4（#135 审查收尾）：pick_asset 仅接受 NSIS——MSI 兜底是死路
     /// （update_run_installer 统一按 NSIS 参数启动，msiexec /P 为补丁模式），
     /// 仅 MSI 的 release 显式报「没有可用的安装包资产」引导手动下载。
-    #[cfg(windows)] // mac 侧 asset_suffixes 只认 dmg，本测试的 exe 资产在 mac 上必 unwrap panic
     #[test]
     fn pick_asset_nsis_only() {
         let asset = |name: &str| {
@@ -1107,20 +903,5 @@ mod tests {
         let text = r#"{ "version": "3.2.9", "assets": {} }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
-    }
-
-    #[test]
-    fn safe_installer_name_白名单与cmd元字符拒绝() {
-        // D1 审查修复：常规资产名（字母数字点下划线连字符空格/中文）放行，
-        // cmd 元字符与控制字符拒绝（防 `cmd /C start` 命令注入）
-        assert!(is_safe_installer_name("AI Work 助手_3.5.4_x64-setup.exe"));
-        assert!(is_safe_installer_name("AI.Work._3.3.3_x64-setup.exe"));
-        for bad in [
-            "a&calc.exe", "a|calc.exe", "a^b.exe", "a%PATH%.exe", "a<b.exe",
-            "a>b.exe", "a\"b.exe", "a!b.exe", "a\tb.exe", "a\nb.exe", "a;b.exe",
-        ] {
-            assert!(!is_safe_installer_name(bad), "应拒绝: {bad:?}");
-        }
-        assert!(!is_safe_installer_name(""));
     }
 }

@@ -77,91 +77,8 @@ pub fn cleanup_residual_bypass(data_dir: &Path) {
     let _ = std::fs::remove_file(&marker);
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub fn cleanup_residual_bypass(_data_dir: &Path) {}
-
-// ---------------------------------------------------------------------------
-// macOS 实现（F-75 M2-2.1）：bypass 列表经 networksetup 逐服务读改写。
-// enable 仅当系统代理确实指向本软件 MITM 端口时改写（与 Windows 语义一致，
-// 用户自己的代理绝不碰）；列表整体覆盖写，先读当前列表再合并。
-// ---------------------------------------------------------------------------
-
-#[cfg(target_os = "macos")]
-fn mac_services() -> Result<Vec<String>, String> {
-    crate::platform::proxy_ctl::network_services()
-}
-
-/// 读某服务的 bypass 域列表（未设置时 networksetup 输出说明行，过滤之）。
-/// Err = 读取失败（networksetup 不可用/服务名无效等）——调用方不得把「读不到」
-/// 当作「本来为空」执行覆盖写，否则会把用户 bypass 整体清掉（审查 M1）
-#[cfg(target_os = "macos")]
-fn mac_bypass_list(svc: &str) -> Result<Vec<String>, String> {
-    crate::platform::cmd::sys_output(
-        crate::platform::cmd::sys_command("networksetup").args(["-getproxybypassdomains", svc]),
-    )
-    .map(|out| {
-        out.lines()
-            .map(str::trim)
-            .filter(|s| {
-                // 三重保险：空行 / 英文本地化说明 / 含空格的说明句——
-                // 中文 macOS 本地化说明行（如「此服务没有任何 bypass 域名」）
-                // 必含空格，bypass 域名不含空格（审查 P2，与 proxy_ctl 读路径同改）
-                !s.is_empty() && !s.contains("aren't any bypass domains") && !s.contains(' ')
-            })
-            .map(String::from)
-            .collect()
-    })
-}
-
-/// 写某服务的 bypass 域列表（空列表 → man 页 Empty 关键字清空）
-#[cfg(target_os = "macos")]
-fn mac_set_bypass(svc: &str, domains: &[String]) -> Result<(), String> {
-    let mut args: Vec<&str> = vec!["-setproxybypassdomains", svc];
-    if domains.is_empty() {
-        args.push("Empty");
-    } else {
-        args.extend(domains.iter().map(|s| s.as_str()));
-    }
-    crate::platform::cmd::sys_output(
-        crate::platform::cmd::sys_command("networksetup").args(&args),
-    )
-    .map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-pub fn cleanup_residual_bypass(data_dir: &Path) {
-    let marker = marker_path(data_dir);
-    let Ok(json) = std::fs::read_to_string(&marker) else {
-        return;
-    };
-    let Ok(added) = serde_json::from_str::<Vec<String>>(&json) else {
-        let _ = std::fs::remove_file(&marker);
-        return;
-    };
-    if added.is_empty() {
-        let _ = std::fs::remove_file(&marker);
-        return;
-    }
-    // 审查修复（P1）：枚举/清理任一步失败 → 保留 marker 下次启动重试（对齐 Windows 版：
-    // run_reg 失败即 return 保留标记），失败仍删 marker 会「失忆」致用户 bypass 永久残留
-    let Ok(services) = mac_services() else {
-        return;
-    };
-    for svc in &services {
-        // 审查 M1：读取失败的服务跳过（不当作空覆盖写），保留 marker 下次启动重试
-        let Ok(current) = mac_bypass_list(svc) else {
-            return;
-        };
-        let remaining: Vec<String> = current
-            .into_iter()
-            .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
-            .collect();
-        if mac_set_bypass(svc, &remaining).is_err() {
-            return;
-        }
-    }
-    let _ = std::fs::remove_file(&marker);
-}
 
 /// 当前生效的 MITM 代理端口（与 commands::proxy 写入的 last_proxy_port.txt 对齐）
 fn mitm_port(data_dir: &Path) -> Option<u16> {
@@ -266,97 +183,13 @@ pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
-    let Some(port) = mitm_port(data_dir) else {
-        // 本软件未启动过 MITM 代理，无需豁免
-        return Ok(false);
-    };
-    // 仅当系统代理确实指向本软件 MITM 端口时才改写（用户自己的代理不碰）
-    let ours = format!("127.0.0.1:{port}");
-    if crate::platform::proxy_ctl::get_system_proxy()
-        .map(|(_, sv, _)| sv != ours)
-        .unwrap_or(true)
-    {
-        return Ok(false);
-    }
-
-    let mut added = ADDED.lock().unwrap_or_else(|e| e.into_inner());
-    if !added.is_empty() {
-        // 已豁免（幂等）：上次 enable 后未还原
-        return Ok(true);
-    }
-    // 审查修复（P1）：逐服务聚合错误，不用 `?` 短路——部分服务写成功后若直接返回 Err，
-    // 已写入条目不进 ADDED/marker，disable/cleanup「失忆」致用户 bypass 永久残留
-    let mut collected: Vec<String> = Vec::new();
-    let mut errs: Vec<String> = Vec::new();
-    for svc in &mac_services()? {
-        // 审查 M1：读取失败的服务跳过合并写入（不当作空表覆盖），并计入错误——
-        // 该服务缺豁免条目可能影响捕获，如实上报
-        let Ok(current) = mac_bypass_list(svc) else {
-            errs.push(format!("{svc}: 读取 bypass 列表失败，已跳过"));
-            continue;
-        };
-        let mut merged = current.clone();
-        for e in OAUTH_BYPASS_ENTRIES {
-            if !current.iter().any(|x| x.eq_ignore_ascii_case(e)) {
-                merged.push((*e).to_string());
-                if !collected.iter().any(|x| x.eq_ignore_ascii_case(e)) {
-                    collected.push((*e).to_string());
-                }
-            }
-        }
-        if merged.len() != current.len() {
-            if let Err(e) = mac_set_bypass(svc, &merged) {
-                errs.push(format!("{svc}: {e}"));
-            }
-        }
-    }
-    if collected.is_empty() {
-        return Ok(false);
-    }
-    // 先落账再报错：已写入服务的条目必须可被 disable/cleanup 还原；
-    // 调用方（oauth_loopback）对 Err 仅记日志不阻断登录，登录结束 disable 按清单还原
-    *added = collected;
-    // 持久化追加清单：进程崩溃未还原时下次启动清理（缺陷13，与 Windows 同机制）
-    save_marker(data_dir, &added);
-    if errs.is_empty() {
-        Ok(true)
-    } else {
-        Err(format!("部分网络服务写入 bypass 失败: {}", errs.join("; ")))
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
-    let mut added = ADDED.lock().unwrap_or_else(|e| e.into_inner());
-    if added.is_empty() {
-        return Ok(());
-    }
-    // 还原：只移除本次追加的条目（对齐 Windows 全局清单语义）。任一服务读写失败
-    // 即整体报错且不清账（保留 ADDED + marker 供重试）——半还原状态下「失忆」
-    // 会让用户 bypass 永久残留（对齐 Windows 注册表路径的 ? 传播语义）
-    for svc in mac_services()? {
-        // 审查 M1：读取失败按 Err 上抛（保留 ADDED + marker 供重试），不得当作
-        // 空表覆盖写清空用户 bypass
-        let current = mac_bypass_list(&svc)?;
-        let remaining: Vec<String> = current
-            .into_iter()
-            .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
-            .collect();
-        mac_set_bypass(&svc, &remaining)?;
-    }
-    added.clear();
-    let _ = std::fs::remove_file(marker_path(data_dir));
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub fn enable_oauth_bypass(_data_dir: &Path) -> Result<bool, String> {
+    // 非 Windows 平台暂无 MITM 系统代理设置逻辑，无需豁免
     Ok(false)
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 pub fn disable_oauth_bypass(_data_dir: &Path) -> Result<(), String> {
     Ok(())
 }

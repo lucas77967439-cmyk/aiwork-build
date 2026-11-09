@@ -26,7 +26,7 @@ import type {
   SanitizeSwitches,
   SanitizeTier,
 } from '../../types';
-import { extractFingerprintFrom, neutralRewrite } from './fingerprintSamples';
+import { extractFingerprintFrom, isSampleTruncated, neutralRewrite, parseSampleSystem } from './fingerprintSamples';
 
 /** 时间戳 → 本地时间展示；null/0 = 从未自定义 */
 const fmtTs = (ts: number | null) =>
@@ -93,9 +93,6 @@ export default function FingerprintSanitizePanel() {
       setSavedAt(view.updated_at);
     } catch (e) {
       toast('error', `加载清洗规则失败：${e}`);
-      // 上抛（审查修复 M6）：switchTier 依赖失败信号回滚档位，否则 tier 与
-      // rules 数据错位会把旧档规则保存进新档位键（跨档位数据污染）
-      throw e;
     } finally {
       setLoading(false);
     }
@@ -119,7 +116,7 @@ export default function FingerprintSanitizePanel() {
 
   /** 开关热切换（issue #158 P1-4）：乐观更新 + 失败回滚；即时生效无保存按钮 */
   const toggleSwitch = async (pool: 'wb' | 'qoder', enabled: boolean) => {
-    const prevVal = switches?.[pool];
+    const prev = switches;
     setSwitches((s) => (s ? { ...s, [pool]: enabled } : s));
     try {
       await api.apiServer.sanitizeSwitchSet(pool, enabled);
@@ -128,16 +125,13 @@ export default function FingerprintSanitizePanel() {
         `已${enabled ? '开启' : '关闭'}${pool === 'qoder' ? ' Qoder' : ' Buddy/Trae'}池指纹清洗，下一条请求即生效`,
       );
     } catch (e) {
-      // 失败回滚仅复位本池位（函数式更新）：整体快照回滚会把快速连切时
-      // 后一发开关的乐观更新一并回滚（审查修复 Low）
-      setSwitches((s) => (s && prevVal !== undefined ? { ...s, [pool]: prevVal } : s));
+      setSwitches(prev);
       toast('error', `切换清洗开关失败：${e}`);
     }
   };
 
   useEffect(() => {
-    // load 失败会上抛（switchTier 回滚依赖），初始加载就地吞掉避免 unhandled rejection
-    void load('wb').catch(() => {});
+    void load('wb');
     void loadSamples();
     void loadSwitches();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -172,14 +166,7 @@ export default function FingerprintSanitizePanel() {
       return false;
     }
     setTier(next);
-    try {
-      await load(next);
-    } catch {
-      // 加载失败回滚档位（审查修复 M6）：load 已 toast，此处保证 tier 与
-      // rules 始终同档，防旧档规则被保存进新档位键
-      setTier(tier);
-      return false;
-    }
+    await load(next);
     return true;
   };
 
@@ -189,9 +176,21 @@ export default function FingerprintSanitizePanel() {
    * issue #129：按样本来源池归档——buddy-ai 池样本写国际档独立键并自动切档，
    * 其余池样本写 wb/Trae 共用键 */
   const applySample = async (s: FingerprintSample) => {
+    // 空 system 样本（后端取样未命中系统提示消息）无法反查触发句，直接拒绝并
+    // 给出可执行的下一步，而不是让「生成规则」按钮静默无效
+    if (!parseSampleSystem(s.sample)) {
+      toast(
+        'warn',
+        '该样本未采集到 system 文本（可能是角色形态未识别或文本被压缩为空），无法生成规则；请用「刷新」重试，若仍为空说明本次拦截不来自系统提示',
+      );
+      return;
+    }
     const from = extractFingerprintFrom(s.sample);
     if (!from) {
-      toast('warn', '样本不可解析或不含 system 文本，无法生成规则');
+      toast(
+        'warn',
+        '样本的 system 文本被截断且不含完整首句，无法给出一条能逐字命中的规则；请复制样本原文手工填写「原文指纹」',
+      );
       return;
     }
     const target: SanitizeTier = s.pool === 'buddy-ai' ? 'buddy-ai' : 'wb';
@@ -202,13 +201,17 @@ export default function FingerprintSanitizePanel() {
     }
     const to = neutralRewrite(from);
     setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from, to } }]);
+    const truncatedHint = isSampleTruncated(s.sample) ? '（样本经截断，请核对首句完整性）' : '';
     if (to) {
       toast(
         'success',
-        `已按样本预填${target === 'buddy-ai' ? '国际档' : ''}规则（from 可编辑校对），保存后生效`,
+        `已按样本预填${target === 'buddy-ai' ? '国际档' : ''}规则（from 可编辑校对），保存后生效${truncatedHint}`,
       );
     } else {
-      toast('warn', '未命中已知句式，已预填剥离规则（to 为空=整句删除），请确认后再保存');
+      toast(
+        'warn',
+        `未命中已知句式，已预填剥离规则（to 为空=整句删除），请确认后再保存${truncatedHint}`,
+      );
     }
   };
 
@@ -237,13 +240,7 @@ export default function FingerprintSanitizePanel() {
         rows.map((r) => ({ from: r.rule.from.trim(), to: r.rule.to === null ? null : r.rule.to.trim() })),
         tier,
       );
-      // load 现在上抛（审查修复 M6）：保存已成功，回读失败不应误报「保存失败」
-      try {
-        await load(tier);
-      } catch {
-        toast('warn', '规则已保存，但回读刷新失败，请手动刷新');
-        return;
-      }
+      await load(tier);
       toast('success', '清洗规则已保存，下一条请求即生效');
     } catch (e) {
       toast('error', `保存失败：${e}`);
@@ -258,13 +255,7 @@ export default function FingerprintSanitizePanel() {
     setSaving(true);
     try {
       await api.apiServer.templateMapSet([], tier);
-      // 同上（审查修复 M6）：回读失败不误报「恢复默认失败」
-      try {
-        await load(tier);
-      } catch {
-        toast('warn', '已恢复内置默认，但回读刷新失败，请手动刷新');
-        return;
-      }
+      await load(tier);
       toast('success', '已恢复内置默认规则，下一条请求即生效');
     } catch (e) {
       toast('error', `恢复默认失败：${e}`);

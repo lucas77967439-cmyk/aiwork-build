@@ -28,8 +28,8 @@ fn auth_file_path(state: &AppState) -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    // F-75 跨平台收口：Windows=%LOCALAPPDATA%，mac=~/Library/Application Support
-    crate::platform::local_data_root_lossy()
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    PathBuf::from(local)
         .join("CodeBuddyExtension")
         .join("Data")
         .join("Public")
@@ -403,10 +403,8 @@ pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex
 pub(crate) fn refresh_lock_remove(acct_id: &str) {
     let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = g.as_mut() {
-        // 审查修复（HEAD 侧 L4 与 main 侧 M20 同源等价，取 main 实现）：持表锁
-        // 期间 check-then-remove 与 refresh_lock_for 的 get_or_insert 互斥，
-        // get 的借用不计入 strong_count，判定可靠；条目不存在时不动作（HEAD 侧
-        // 对应写法的 remove 为无害 no-op），strong_count>1 时留待后续移除再回收
+        // 持表锁期间 check-then-remove 与 refresh_lock_for 的 get_or_insert 互斥，
+        // get 的借用不计入 strong_count，判定可靠
         if map
             .get(acct_id)
             .map(|arc| std::sync::Arc::strong_count(arc) == 1)
@@ -994,20 +992,22 @@ pub fn discover_local_quota_services(
     let mut seen: std::collections::HashSet<u16> = Default::default();
     let mut ports: Vec<u16> = vec![];
     // ① ~/.workbuddy/*.port（服务启动时落盘的端口声明，最多扫 16 个）
-    let wb_dir = crate::platform::home_dir().join(".workbuddy");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&wb_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "port").unwrap_or(false))
-        .collect();
-    files.sort();
-    for f in files.into_iter().take(16) {
-        if let Ok(txt) = std::fs::read_to_string(&f) {
-            if let Some(first) = txt.split_whitespace().next() {
-                if let Ok(p) = first.parse::<u16>() {
-                    ports.push(p);
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let wb_dir = PathBuf::from(home).join(".workbuddy");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&wb_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "port").unwrap_or(false))
+            .collect();
+        files.sort();
+        for f in files.into_iter().take(16) {
+            if let Ok(txt) = std::fs::read_to_string(&f) {
+                if let Some(first) = txt.split_whitespace().next() {
+                    if let Ok(p) = first.parse::<u16>() {
+                        ports.push(p);
+                    }
                 }
             }
         }

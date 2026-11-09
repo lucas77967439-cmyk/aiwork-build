@@ -99,7 +99,7 @@ pub fn tc_decrypt(b64: &str, private_mode: bool) -> Result<String, String> {
 /// + machineId（同 storage.json telemetry.machineId，DeviceInfo 构造用）
 /// + appVersion（安装目录 package.json version，DeviceInfo.ClientVersion 用）
 /// Serialize/Deserialize 供 per-uid synthetic 身份持久化（kv oauth_synthetic_device:{uid}）
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCredential {
     pub device_id: String,
     pub private_key_pem: String,
@@ -108,74 +108,6 @@ pub struct DeviceCredential {
     /// 来源客户端（恒 Trae CN，双应用合并后唯一客户端），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
-}
-
-/// Debug 脱敏（审查 2026-10-05）：private_key_pem 为 OAuth 设备签名私钥，
-/// derive(Debug) 会随 {:?} 整串进诊断日志；手写实现将其替换为占位符，
-/// 其余非敏感字段（device_id/machine_id/app_version/source_app）原样展示。
-impl std::fmt::Debug for DeviceCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceCredential")
-            .field("device_id", &self.device_id)
-            .field("private_key_pem", &"[REDACTED]")
-            .field("machine_id", &self.machine_id)
-            .field("app_version", &self.app_version)
-            .field("source_app", &self.source_app)
-            .finish()
-    }
-}
-
-/// mac 客户端版本号（DeviceInfo.ClientVersion 用）：安装 bundle Info.plist 的
-/// CFBundleShortVersionString（合并审查 #9：原实现读 Windows Programs 安装目录
-/// package.json，mac 恒缺失 → ClientVersion 恒空串）。/Applications 与
-/// ~/Applications 双根扫描；bundle 目录名候选 + CFBundleIdentifier 白名单防串台
-///（与 env.rs mac 定位链同源，M-1 侦察 ⑥：四应用 CFBundleExecutable 均为
-/// "Electron"，bundle id 才是身份信号）。未找到 → 空串降级（与 Windows 侧
-/// package.json 缺失行为一致）。
-#[cfg(target_os = "macos")]
-fn mac_app_version(app: &str) -> String {
-    use crate::switcher::locate::{bundle_exe_matches, is_bundle_dir, read_info_plist_value};
-    let (names, bundle_ids): (&[&str], &[&str]) = match app {
-        "Trae CN" | "Trae" => (&["Trae", "Trae CN"], &["cn.trae.app"]),
-        _ => return String::new(),
-    };
-    let home = std::env::var("HOME").unwrap_or_default();
-    for base in ["/Applications", &format!("{home}/Applications")] {
-        for name in names {
-            let bundle = std::path::Path::new(base).join(format!("{name}.app"));
-            if is_bundle_dir(&bundle) && bundle_exe_matches(&bundle, &[], bundle_ids) {
-                return read_info_plist_value(&bundle, "CFBundleShortVersionString")
-                    .unwrap_or_default();
-            }
-        }
-    }
-    String::new()
-}
-
-/// 客户端版本号（DeviceInfo.ClientVersion 用）：Windows=安装目录 package.json
-/// version（真实客户端上报的是 appVersion，与服务端对设备注册记录的校验相关）；
-/// mac=安装 bundle Info.plist CFBundleShortVersionString。读取失败 → 空串。
-fn app_version_for(localappdata: &std::path::Path, app: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = localappdata;
-        mac_app_version(app)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::fs::read_to_string(
-            localappdata
-                .join("Programs")
-                .join(app)
-                .join("resources")
-                .join("app")
-                .join("package.json"),
-        )
-        .ok()
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
-        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
-        .unwrap_or_default()
-    }
 }
 
 /// 宽容解析持久化的凭证 JSON（kv oauth_synthetic_device:{uid} / :pending；
@@ -221,14 +153,12 @@ pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceC
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .map_err(|e| format!("合成设备私钥 PEM 编码失败: {e}"))?;
     // deviceId 形态对齐真实客户端：15 位数字串（与 load_or_create_oauth_device
-    // 原随机逻辑同口径，仅需唯一性非密码学均匀）。fail-closed：RNG 故障直接
-    // 报错，不回落确定性输出造成跨机撞号
-    let did_hex = crate::commands::oauth::random_hex_result(30)?;
+    // 原随机逻辑同口径，仅需唯一性非密码学均匀）
     let device_id: String = (0..15)
-        .map(|i| {
-            // did_hex 由 random_hex_result 保证为 hex 字符，解析不可失败
-            let b = u8::from_str_radix(&did_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
-            (b'0' + (b % 10)) as char
+        .map(|_| {
+            let n = (crate::commands::oauth::random_hex(2).chars().next().unwrap_or('0') as u8)
+                .wrapping_rem(10);
+            (b'0' + n) as char
         })
         .collect();
     Ok(DeviceCredential {
@@ -243,16 +173,15 @@ pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceC
 /// 扫描本机 Trae 客户端（双应用合并后唯一客户端）storage.json 提取设备凭证。
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
-    // F-75 跨平台收口：storage.json 基根 Windows=%APPDATA% / mac=Application Support
-    // （Trae 桌面客户端两平台同为 Electron 布局 User/globalStorage）；
-    // 版本号读取按平台分派（app_version_for：Windows=Programs package.json / mac=bundle Info.plist）
-    let Ok(appdata) = crate::platform::app_support_root() else {
+    let Some(appdata) = std::env::var("APPDATA").ok() else {
         return Vec::new();
     };
-    let localappdata = crate::platform::local_data_root_lossy();
+    let Some(localappdata) = std::env::var("LOCALAPPDATA").ok() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for app in ["Trae CN"] {
-        let path = appdata
+        let path = std::path::PathBuf::from(&appdata)
             .join(app)
             .join("User")
             .join("globalStorage")
@@ -264,7 +193,20 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
             continue;
         };
         let Some(obj) = v.as_object() else { continue };
-        let app_version = app_version_for(&localappdata, app);
+        // DeviceInfo.ClientVersion 用：安装目录 package.json 的 version（真实客户端
+        // 上报的是 appVersion，与服务端对设备注册记录的校验相关）
+        let app_version = std::fs::read_to_string(
+            std::path::PathBuf::from(&localappdata)
+                .join("Programs")
+                .join(app)
+                .join("resources")
+                .join("app")
+                .join("package.json"),
+        )
+        .ok()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default();
         let machine_id = obj
             .get("telemetry.machineId")
             .and_then(|x| x.as_str())

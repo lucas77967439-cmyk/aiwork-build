@@ -50,7 +50,6 @@ pub fn custom_sessions_query(
     let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
     let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
 
-    let data_dir = state.data_dir.clone();
     let raw = crate::store::db(&state.data_dir).with_conn(move |c| {
         let mut stmt = c.prepare(
             "SELECT request_id, session_id, uid, date, ts, model, pt, ct, preview, key_name
@@ -73,28 +72,13 @@ pub fn custom_sessions_query(
         // 账号展示名映射（uid(key_id) → key_name）：流水行自带，同遍构建
         let mut name_of: HashMap<String, String> = HashMap::new();
         let mut rows: Vec<RawSessionRow> = Vec::new();
-        // 安全上限（3.8.5 审查 L2）：无 compact 的请求级流水表，若某日被脚本高频
-        // 调用可累积数十万行，全量读入内存做两遍归并有内存/卡顿风险——超限截断
-        // 并落运维日志（聚合统计按已读行计，个人用量远达不到此量级）
-        const MAX_SCAN_ROWS: usize = 100_000;
-        let mut truncated = false;
         for row in it.by_ref() {
-            if rows.len() >= MAX_SCAN_ROWS {
-                truncated = true;
-                break;
-            }
             let (rid, sid, uid, date, ts, model, pt, ct, preview, key_name) = row?;
             name_of
                 .entry(uid.clone())
                 .or_insert_with(|| key_name.clone());
             // credits 槽位恒 0.0（custom 无积分语义）
             rows.push((rid, sid, uid, date, ts, model, 0.0, pt, ct, preview));
-        }
-        if truncated {
-            crate::fs_utils::app_log(
-                &data_dir,
-                &format!("[custom] 会话明细查询行数超 {MAX_SCAN_ROWS}，已截断（区间 {start}~{end}）"),
-            );
         }
         Ok(aggregate_session_rows(rows, &name_of, uid_filter, model_filter))
     })?;
@@ -190,9 +174,6 @@ pub fn custom_session_detail_query(
                 } else {
                     format!("{label}·失败")
                 },
-                // 失败行结构化标记（3.8.5 审查 L6）：前端徽标据此判定，
-                // 不再依赖 mode 字符串 contains("失败") 耦合
-                failed: Some(ok == 0),
                 credits: 0.0,
                 cost_money: 0.0,
                 input_tokens: pt.max(0) as u64,

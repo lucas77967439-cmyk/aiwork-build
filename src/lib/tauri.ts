@@ -28,6 +28,8 @@ import type {
   DiscoveredAccount,
   DoubaoAccountView,
   DoubaoCapturedCredential,
+  DoubaoDashboardStats,
+  DoubaoDayDetail,
   DoubaoChatdataInfo,
   DoubaoChatdataResult,
   DoubaoExportResult,
@@ -117,6 +119,10 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   update_download: null,
   // 多账号串行网络操作：耗时随账号数线性增长，放宽到 10 分钟
   doubao_renew_run: 600_000,
+  // 签到批量：签到逐账号串行 + probe 自动保活（保活开关默认开 + per-sid 分键，
+  // 升级后首跑存量账号全员判「缺失」→ 逐账号开客户端抓包最长 75s，约 30-90s/账号；
+  // ≥7-8 账号首轮即超 600s。保活 24h 新鲜期仅首轮触发，放宽到 30 分钟覆盖 20+ 账号）
+  doubao_checkin_run: 1_800_000,
   workbuddy_env_reset: 600_000,
   workbuddy_cli_rotate_run: 600_000,
   workbuddy_usage_official_all: 600_000,
@@ -125,12 +131,6 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   refresh_remaining_credits: 600_000,
   // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
   cert_install: null,
-  // OAuth 回调交换：后端最多 5 个协议变体串行兜底探测（单请求内部超时 120s），
-  // 最坏总耗时可达 600s，默认 120s 会让前端先报超时而后端仍在交换，放宽到 11 分钟。
-  // oauth_login 内部调用同一套 oauth_parse_callback 交换逻辑（手动粘贴登录的实际链路），
-  // 两者须同放宽，否则覆盖形同虚设
-  oauth_parse_callback: 660_000,
-  oauth_login: 660_000,
 };
 
 /** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
@@ -174,15 +174,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {
-  /** F-75 M0-0.5：平台标志（os/arch），init 时拉取一次存 store.platform */
-  platform: {
-    info: () => invoke<{ os: 'windows' | 'macos'; arch: string }>('platform_info'),
-  },
   env: {
     // TraeWork 合并后唯一客户端检测（原 env_check 已删，统一走 Trae CN 通道）
     check: () => invoke<EnvStatus>('env_check_trae_cn'),
     // F-01：跨应用安装位置自动识别（trae | doubao | workbuddy | codebuddy；
-    // qoder 系客户端定位在 env.rs 的 qoder 专用通道，不走 app_locate）
+    // qoder 系不走此通道，经 settings 的 qoder_ide_path + ide_exe_candidates 定位）
     locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
@@ -350,9 +346,8 @@ export const api = {
     }) => invoke<ProxyLogListResult>('proxy_logs_list', {
       opts: {
         keyword: opts.keyword,
-        // 后端 ProxyLogQueryOpts 为 serde camelCase：此前发 snake_case 被静默忽略，UI 日期筛选失效
-        startTime: opts.startTime,
-        endTime: opts.endTime,
+        start_time: opts.startTime,
+        end_time: opts.endTime,
         offset: opts.offset,
         limit: opts.limit,
       },
@@ -366,15 +361,12 @@ export const api = {
     userId: string,
     targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
-    proxyPort?: number,
   ) =>
     invoke('switch_account', {
       userId,
       targetApp: targetApp ?? null,
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
-      // 续期捕获场景传代理端口：切换后 TRAE 以 --proxy-server 重启，客户端流量走 MITM
-      proxyPort: proxyPort ?? null,
     }),
   saveCurrentLogin: (userId: string, targetApp?: 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'WorkBuddyAI' | 'CodeBuddyAI' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
@@ -400,8 +392,14 @@ export const api = {
   // ---- 豆包账号池（Rust doubao.rs；字段名严格 snake_case）----
   doubao: {
     accountsList: () => invoke<DoubaoAccountView[]>('doubao_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountSave: (userId: string, name?: string, note?: string, groupId?: string | null) =>
+      invoke('doubao_account_save', {
+        userId,
+        name: name ?? null,
+        note: note ?? null,
+        // undefined = 保持不变（null）；null/'' = 清空为未分组（''）
+        groupId: groupId === undefined ? null : groupId || '',
+      }),
     accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
     detectUid: () => invoke<string | null>('doubao_detect_uid'),
     launch: (proxyPort?: number) => invoke('open_doubao_app', { proxyPort: proxyPort ?? null }),
@@ -447,6 +445,20 @@ export const api = {
     taskUnregister: () => invoke('doubao_renew_task_unregister'),
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
+    // ---- 每日签到（landing/checkin；结果按日落库） ----
+    /** 手动签到：userId 缺省 = 全池批量；空池返回 skipped + skipped_empty_pool:true
+     *  （奖励型任务豁免，调度器不 mark_run）。批量逐账号串行较慢且 probe 自动保活
+     *  首轮逐账号开客户端抓包，超时放宽 30 分钟 */
+    checkinRun: (userId?: string) => invoke<Record<string, unknown>>('doubao_checkin_run', { userId: userId ?? null }),
+    /** 额度看板统计（池聚合 + 今日签到 + 近 30 天趋势） */
+    dashboardStats: () => invoke<DoubaoDashboardStats>('doubao_dashboard_stats'),
+    /** 签到按日明细（额度看板「额度趋势」数据源；days 缺省 30，clamp 1~365） */
+    resultsDetail: (days?: number) =>
+      invoke<DoubaoDayDetail[]>('doubao_checkin_results_detail', { days: days ?? null }),
+    // ---- 每日签到定时任务（schtasks AIWorkAssistant_DoubaoCheckin） ----
+    checkinTaskRegister: (time: string) => invoke('doubao_checkin_task_register', { time }),
+    checkinTaskStatus: () => invoke<string>('doubao_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('doubao_checkin_task_unregister'),
     // 按需取完整会话凭证（列表接口只回掩码值；编辑弹框回填场景调用）
     getCredential: (userId: string) =>
       invoke<{ session_id: string | null; sid_guard: string | null; ttwid: string | null }>(
@@ -749,6 +761,9 @@ export const api = {
       }),
     checkinResults: (days?: number) =>
       invoke<QoderCheckinRecord[]>('qoder_checkin_results', { days: days ?? null }),
+    checkinTaskRegister: (times: string[]) => invoke('qoder_checkin_task_register', { times }),
+    checkinTaskStatus: () => invoke<string[]>('qoder_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('qoder_checkin_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>
@@ -829,7 +844,7 @@ export const api = {
     status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
     // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组；
-    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 跟随 Trae 池策略）
+    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 加权公平轮转，WB 专属默认；PR #187）
     poolSet: (
       uids: string[],
       strategy?: string,
@@ -1144,13 +1159,9 @@ export const api = {
       expectedVersion: string;
       expectedSha256?: string | null;
     }) => invoke<UpdateDownloaded>('update_download', p),
-    // 第二步：启动安装器（win：/P /UPDATE /R 自动重启；mac：open dmg 人工拖拽安装）
+    // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
     runInstaller: (p: { filePath: string; assetName: string }) =>
       invoke<void>('update_run_installer', p),
-    // mac 更新专用：人工拖拽完成后一键重启（LaunchServices 拉起新版后旧进程退出）
-    restartApp: () => invoke<void>('update_restart_app'),
-    // mac 手动安装引导：主动退出应用释放 .app 占用（Finder 无法替换运行中的应用）
-    quitApp: () => invoke<void>('update_quit_app'),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>
@@ -1252,109 +1263,101 @@ export interface ListenerHandlers {
 export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
-  // M10 修复：中途注册失败时清理已注册监听再抛出——原实现前 N-1 个监听泄漏，
-  // 且 store.init 中断后部分事件通道静默失效
   const unsubs: UnlistenFn[] = [];
+  // 审查修复（L31）：注册中途失败（某事件 listen 抛错）时，先注销已注册的
+  // 前 N-1 个监听再重抛，避免泄漏；调用方（store）拿到异常时也不会有残留监听
   try {
-    await registerAll(handlers, unsubs);
-    return unsubs;
+    if (handlers.onProxyLog) {
+      unsubs.push(
+        await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
+      );
+    }
+    if (handlers.onAccountCaptured) {
+      unsubs.push(
+        await listen<string>('account-captured', (e) =>
+          handlers.onAccountCaptured!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCheckinProgress) {
+      unsubs.push(
+        await listen<CheckinProgressEvent>('checkin-progress', (e) =>
+          handlers.onCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchProgress) {
+      unsubs.push(
+        await listen<string>('switch-progress', (e) =>
+          handlers.onSwitchProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSwitchDone) {
+      unsubs.push(
+        await listen<SwitchDoneEvent>('switch-done', (e) =>
+          handlers.onSwitchDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginProgress) {
+      unsubs.push(
+        await listen<string>('save-login-progress', (e) =>
+          handlers.onSaveLoginProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onSaveLoginDone) {
+      unsubs.push(
+        await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+          handlers.onSaveLoginDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetProgress) {
+      unsubs.push(
+        await listen<string>('device-reset-progress', (e) =>
+          handlers.onDeviceResetProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onDeviceResetDone) {
+      unsubs.push(
+        await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+          handlers.onDeviceResetDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileProgress) {
+      unsubs.push(
+        await listen<string>('profile-progress', (e) =>
+          handlers.onProfileProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onProfileDone) {
+      unsubs.push(
+        await listen<ProfileDoneEvent>('profile-done', (e) =>
+          handlers.onProfileDone!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onQoderCheckinProgress) {
+      unsubs.push(
+        await listen<string>('qoder-checkin-progress', (e) =>
+          handlers.onQoderCheckinProgress!(e.payload),
+        ),
+      );
+    }
   } catch (err) {
-    // 审查修复（L31）：单个注销失败不阻断清理，继续注销其余监听
     for (const u of unsubs) {
       try {
         u();
       } catch {
-        /* ignore */
+        /* 单个注销失败不阻断清理，继续注销其余监听 */
       }
     }
     throw err;
   }
-}
-
-async function registerAll(
-  handlers: ListenerHandlers,
-  unsubs: UnlistenFn[],
-): Promise<void> {
-  if (handlers.onProxyLog) {
-    unsubs.push(
-      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-    );
-  }
-  if (handlers.onAccountCaptured) {
-    unsubs.push(
-      await listen<string>('account-captured', (e) =>
-        handlers.onAccountCaptured!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onCheckinProgress) {
-    unsubs.push(
-      await listen<CheckinProgressEvent>('checkin-progress', (e) =>
-        handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchProgress) {
-    unsubs.push(
-      await listen<string>('switch-progress', (e) =>
-        handlers.onSwitchProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchDone) {
-    unsubs.push(
-      await listen<SwitchDoneEvent>('switch-done', (e) =>
-        handlers.onSwitchDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginProgress) {
-    unsubs.push(
-      await listen<string>('save-login-progress', (e) =>
-        handlers.onSaveLoginProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginDone) {
-    unsubs.push(
-      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-        handlers.onSaveLoginDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetProgress) {
-    unsubs.push(
-      await listen<string>('device-reset-progress', (e) =>
-        handlers.onDeviceResetProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetDone) {
-    unsubs.push(
-      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-        handlers.onDeviceResetDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileProgress) {
-    unsubs.push(
-      await listen<string>('profile-progress', (e) =>
-        handlers.onProfileProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileDone) {
-    unsubs.push(
-      await listen<ProfileDoneEvent>('profile-done', (e) =>
-        handlers.onProfileDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onQoderCheckinProgress) {
-    unsubs.push(
-      await listen<string>('qoder-checkin-progress', (e) =>
-        handlers.onQoderCheckinProgress!(e.payload),
-      ),
-    );
-  }
+  return unsubs;
 }

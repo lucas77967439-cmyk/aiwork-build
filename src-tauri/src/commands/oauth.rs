@@ -12,7 +12,6 @@ use crate::state::AppState;
 /// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换。
 /// device_id：本会话选定的凭证设备（issue #76 轮转 / issue #110 合成身份）——
 /// 登录 URL 参数、ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
-#[derive(Clone)]
 struct PendingLogin {
     state: String,
     pkce_verifier: String,
@@ -76,16 +75,14 @@ fn default_exchange_url() -> String {
     OAUTH_EXCHANGE_URL.to_string()
 }
 
-/// OAuth 域外置资源根目录解析（F-75 跨平台收口）：`AIWORK_DATA_DIR` 环境变量优先
-/// （已设置且非空 → 直接作为应用数据目录，conf/、certs/、logs/ 均在其下；
-/// 容器/自定义部署挂载点），未设置回退平台数据根 + DATA_DIR_NAME
-/// （Windows=%APPDATA%，mac=~/Library/Application Support；桌面行为不变）；
-/// 两者皆不可得返回 None。
+/// OAuth 域外置资源根目录解析：`AIWORK_DATA_DIR` 环境变量优先（已设置且非空 →
+/// 直接作为应用数据目录，conf/、certs/、logs/ 均在其下；容器/自定义部署挂载点），
+/// 未设置回退 `%APPDATA%` + DATA_DIR_NAME（Windows 桌面行为不变）；两者皆不可得
+/// 返回 None。
 // 审查修复（外置 OAuth 目录）：原 oauth_client 与 exchange_agent 两处恒读 %APPDATA%，
 // Docker 容器内 APPDATA 恒空 → 外置 oauth_client.json / 本地 CA 永远读不到且无日志；
-// 现抽本函数统一两处口径（AIWORK_DATA_DIR 优先）。macOS 兼容：回退根经
-// platform::app_support_root 跨平台解析，替代原 Windows 专用 APPDATA 直读。
-// 注意：state.rs::new 的数据目录解析独立（同样跨平台），本函数仅覆盖 OAuth 域这两处调用
+// 现抽本函数统一两处口径（AIWORK_DATA_DIR 优先），回落路径行为不变。
+// 注意：state.rs::new 仍只读 APPDATA，本函数仅覆盖 OAuth 域这两处调用
 fn oauth_data_root() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("AIWORK_DATA_DIR") {
         let dir = dir.trim();
@@ -93,18 +90,17 @@ fn oauth_data_root() -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(dir));
         }
     }
-    crate::platform::app_support_root()
+    std::env::var("APPDATA")
         .ok()
-        .map(|d| d.join(crate::state::DATA_DIR_NAME))
+        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME))
 }
 
 /// 读取外置 OAuth 客户端配置（全局一次；缺失/损坏回退默认值）
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        // 审查修复（外置 OAuth 目录，融合 F-75 跨平台收口）：目录解析走 oauth_data_root
-        // （AIWORK_DATA_DIR 优先，回退平台数据根 Windows=%APPDATA% / mac=Application
-        // Support），回落内置默认时补一条轻量日志不再静默（进程级 OnceLock 仅记一条）
+        // 审查修复（外置 OAuth 目录）：目录解析走 oauth_data_root（AIWORK_DATA_DIR 优先），
+        // 回落内置默认时补一条轻量日志不再静默（进程级 OnceLock 仅记一条）
         match oauth_data_root() {
             Some(root) => {
                 let p = root.join("conf").join("oauth_client.json");
@@ -122,7 +118,7 @@ pub fn oauth_client() -> &'static OAuthClientConfig {
             None => {
                 // 数据目录不可解析时 app.log 无处可写，走 stderr（容器日志可见）兜底
                 eprintln!(
-                    "[OAuth] 数据目录不可解析（AIWORK_DATA_DIR 未设置且平台数据根不可得），外置 OAuth 客户端配置不可用，回落内置默认"
+                    "[OAuth] 数据目录不可解析（AIWORK_DATA_DIR/APPDATA 均未设置），外置 OAuth 客户端配置不可用，回落内置默认"
                 );
                 OAuthClientConfig::default()
             }
@@ -193,9 +189,8 @@ fn exchange_agent() -> Result<ureq::Agent, String> {
     };
     // 调试代理容错（2026-09-16 实测）：设置了调试代理但尚未启动过代理（CA 未生成）
     // 时降级直连并记日志，不阻断登录闭环；只有 CA 存在但损坏才视为错误
-    // 审查修复（外置 OAuth 目录，融合 F-75 跨平台收口）：CA 目录解析改走 oauth_data_root
-    // （AIWORK_DATA_DIR 优先，回退平台数据根），与外置 oauth_client.json 同口径；
-    // 降级直连逻辑不变
+    // 审查修复（外置 OAuth 目录）：CA 目录解析改走 oauth_data_root（AIWORK_DATA_DIR
+    // 优先），与外置 oauth_client.json 同口径；降级直连逻辑不变
     let dir = oauth_data_root();
     let ca_path = dir.as_ref().map(|d| d.join("certs").join("ca.crt"));
     let ca_pem = match ca_path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
@@ -244,11 +239,10 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
 }
 
 /// 生成随机 hex 字符串（安全场景入口：OAuth state / PKCE verifier / 签名 nonce）。
-/// 熵源：OS CSPRNG（Windows=BCryptGenRandom 系统首选 RNG；mac/其他平台=uuid v4
-/// 底层 getrandom CSPRNG，F-75 M2-2.5——旧 LCG/哈希熵链以时间戳作种子输出可预测，
-/// 不适合安全场景（审查 P1-6）——安全路径已全部移除弱实现）。CSPRNG 失败返回 Err
-/// 上抛为用户可见错误：不 panic（审查修复——panic 在异步命令任务内会中止任务，
-/// 前端 invoke 永不 resolve），也不静默降级为可预测随机。
+/// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
+/// 输出可预测，不适合安全场景（审查 P1-6）——已移除。CSPRNG 失败返回 Err 上抛为
+/// 用户可见错误：不 panic（审查修复——panic 在异步命令任务内会中止任务，前端
+/// invoke 永不 resolve），也不静默降级为可预测随机。
 #[cfg(windows)]
 pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
     use windows_sys::Win32::Security::Cryptography::{
@@ -269,16 +263,11 @@ pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
     Ok(hex_encode(&bytes, len))
 }
 
-/// 非 Windows：mac/其他平台走 uuid v4（getrandom CSPRNG，永失败）——
-/// macos_main 合并适配：安全场景同样走 CSPRNG 主路径，弱哈希熵链仅保留给
-/// [random_hex] 非安全场景兜底，不用于安全令牌。
+/// 非 Windows（仅本地开发编译）：无 BCrypt 通道，直接哈希熵链（官方构建仅产
+/// Windows，build-windows.yml）。
 #[cfg(not(windows))]
 pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
-    let mut bytes = Vec::with_capacity(len.div_ceil(2) + 16);
-    while bytes.len() < len.div_ceil(2) {
-        bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-    }
-    Ok(hex_encode(&bytes, len))
+    Ok(hash_hex_fallback(len))
 }
 
 /// 非安全场景便捷封装（request-id / trace-id / 设备号等仅需唯一性）：
@@ -290,6 +279,7 @@ pub(crate) fn random_hex(len: usize) -> String {
 }
 
 /// 字节 → 定长 hex 字符串（截断到 len）
+#[cfg(windows)]
 fn hex_encode(bytes: &[u8], len: usize) -> String {
     let mut out = String::with_capacity(len);
     for b in bytes {
@@ -306,8 +296,7 @@ fn hex_encode(bytes: &[u8], len: usize) -> String {
 }
 
 /// 哈希熵链回退（sha256：时间纳秒 + pid + 计数器迭代扩展）。仅保证唯一性，
-/// 供 [random_hex] 非安全场景兜底（CSPRNG 不可用时；mac 上 uuid v4 恒成功，
-/// 本函数实际只在 Windows BCrypt 失败时触达）。
+/// 供 [random_hex] 非安全场景兜底与 [random_hex_result] 非 Windows 实现。
 fn hash_hex_fallback(len: usize) -> String {
     use sha2::{Digest, Sha256};
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -431,10 +420,6 @@ fn find_cred_by_device(
         return cred;
     }
     let map = crate::store::docs::device_map_load(&store);
-    // 反查确定性说明（审查 L3）：多 uid 共享同一 device_id（存量共享条目）时 find
-    // 命中顺序不确定，但 per-uid synthetic 设备 ID 全局唯一，至多一条能通过末端
-    // filter 校验——命中错 uid 时末端校验不通过返回 None，语义不受影响。
-    // 依赖该不变量，勿改成「首个命中即返回」
     let uid = map
         .iter()
         .find(|(_, e)| e.device_id == device_id)
@@ -577,12 +562,10 @@ fn fallback_login_device_id(state: &AppState) -> String {
     select_login_device(state).0
 }
 
-/// pending 合成身份预取（只读不删，审查 L1 修复）：设备匹配则返回凭证，交由调用方
-/// **先持久化 per-uid 身份、成功后再删 pending**——旧顺序「先删 pending 再 persist」
-/// 在 persist 失败时两头皆失（pending 已删、per-uid 缺失、device_map 已回写该设备，
-/// 三级匹配全未命中致后续刷新失配）；反转后 persist 失败时 pending 仍存活，
-/// 刷新可经第一级命中，设备身份不丢
-fn peek_pending_login_device(
+/// pending 合成身份转正：设备匹配时取出并删除暂存键，交由调用方持久化为
+/// per-uid 身份。删除失败不转正（账号 device_map 已回写该设备但凭证缺失会导致
+/// 后续刷新失配），落日志供溯源
+fn take_pending_login_device(
     state: &AppState,
     device_id: &str,
 ) -> Option<crate::icube_auth::DeviceCredential> {
@@ -593,19 +576,14 @@ fn peek_pending_login_device(
     if cred.device_id != device_id {
         return None;
     }
-    Some(cred)
-}
-
-/// pending 暂存键删除（转正收尾；失败仅落日志——残留 pending 与 per-uid 同设备
-/// 同凭证，刷新经第一级命中语义等价，且会被下次登录生成的新身份覆盖，无害）
-fn delete_pending_login_device(state: &AppState, device_id: &str) {
-    let key = format!("{SYNTHETIC_DEVICE_KEY_PREFIX}pending");
-    if crate::store::db(&state.data_dir).kv_delete(&key).is_err() {
+    if store.kv_delete(&key).is_err() {
         fs_utils::app_log(
             &state.data_dir,
-            &format!("OAuth: pending 合成身份删除失败（device_id={device_id}），残留键将被下次登录覆盖，无碍"),
+            &format!("OAuth: pending 合成身份删除失败（device_id={device_id}），账号身份未转正，后续刷新可能失配"),
         );
+        return None;
     }
+    Some(cred)
 }
 
 /// 将合成身份持久化为指定账号的设备身份（kv `{prefix}{uid}`，供刷新签 DeviceProof）
@@ -691,78 +669,39 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
     // issue #76 + #110：登录设备 = 未绑定的真实凭证（轮转分散每设备绑定上限）；
     // 全部真实凭证已绑定或无凭证时为本次登录生成 synthetic 身份（每设备 1 账号）
     let (device_id, machine_id) = select_login_device(state);
-    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）；
-    // 安全场景 CSPRNG fail-closed（审查 P3：random_hex 为 fail-open，熵源故障时
-    // 会退化为非安全值，CSRF 绑定值不可降级）
-    let trace_id = random_hex_result(32)?;
+    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
+    let trace_id = random_hex(32);
     let (pkce_verifier, code_challenge) = pkce_pair()?;
 
-    // 主机名兜底（F-75 M2-2.5）：Windows 读 COMPUTERNAME；mac 无此环境变量，
-    // 恒落 "Windows-PC"——改 scutil --get ComputerName 取值（scutil 失败回退
-    // hostname 命令，仍失败回落 macOS-Device）
-    let hostname = host_fallback();
-    fn host_fallback() -> String {
-        #[cfg(windows)]
-        {
-            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::platform::cmd::sys_command("scutil")
-                .arg("--get")
-                .arg("ComputerName")
+    // 登录设备指纹按平台取真值（审查修复：原实现 mac 硬编码 windows/Windows 与真实
+    // 设备矛盾，有触发服务端风控 20403 风险）。mac 的 x_device_type 字面量具体取值
+    // 待真机抓包最终核实，此处先按平台通用真值分派
+    #[cfg(target_os = "windows")]
+    let (hostname, x_device_type, os_version) = (
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into()),
+        "windows",
+        "Windows".to_string(),
+    );
+    #[cfg(not(target_os = "windows"))]
+    let (hostname, x_device_type, os_version) = {
+        // macOS：主机名 scutil --get ComputerName（回退 hostname 命令），系统版本读 sw_vers
+        let run = |cmd: &str, args: &[&str]| -> Option<String> {
+            std::process::Command::new(cmd)
+                .args(args)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    // main 侧改进：scutil 失败回退 hostname 命令取真实主机名
-                    crate::platform::cmd::sys_command("hostname")
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "macOS-Device".into())
-                })
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            "Unknown-Device".into()
-        }
-    }
-    // 设备类型/OS 版本按平台分派（审查 H2）：此前 mac 也硬编码 windows/Windows，
-    // 与 mac 设备凭证指纹（machine_id/hostname 均已按 mac 取值）自相矛盾，
-    // 设备指纹严格校验时有触发风控（20403）的实际风险。
-    // 注意：mac 侧取值（x_device_type=mac / "macOS <ver>"）暂为最贴近的合理值，
-    // 真实客户端上报形态待抓包核实——若不一致仅需调整本函数。
-    fn device_platform_fields() -> (String, String) {
-        #[cfg(windows)]
-        {
-            ("windows".into(), "Windows".into())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let ver = crate::platform::cmd::sys_command("sw_vers")
-                .arg("-productVersion")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty());
-            let os_version = match ver {
-                Some(v) => format!("macOS {v}"),
-                None => "macOS".into(),
-            };
-            ("mac".into(), os_version)
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            ("unknown".into(), "Unknown".into())
-        }
-    }
-    let (device_type, os_version) = device_platform_fields();
+        };
+        (
+            run("scutil", &["--get", "ComputerName"])
+                .or_else(|| run("hostname", &[]))
+                .unwrap_or_else(|| "Mac".into()),
+            "mac",
+            run("sw_vers", &["-productVersion"]).unwrap_or_else(|| "macOS".into()),
+        )
+    };
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\
@@ -779,7 +718,7 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         &x_device_id={device_id}\
         &x_machine_id={machine_id}\
         &x_device_brand={hostname}\
-        &x_device_type={device_type}\
+        &x_device_type={x_device_type}\
         &x_os_version={os_version}\
         &x_env=\
         &x_app_version={app_version}\
@@ -794,7 +733,7 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
         machine_id = machine_id,
         device_id = device_id,
         hostname = urlencoding::encode(&hostname),
-        device_type = device_type,
+        x_device_type = x_device_type,
         os_version = urlencoding::encode(&os_version),
         app_version = OAUTH_PAGE_APP_VERSION,
         code_challenge = code_challenge,
@@ -892,45 +831,46 @@ pub fn oauth_parse_callback(
     let user_name = params.get("userName").cloned().or(user_name);
     let avatar = params.get("avatar").cloned().or(avatar);
 
-    // 审查修复：入口一次性快照整份会话。此前 state/verifier/device_id 分 5 处独立
-    // lock 读取，exchange_code（分钟级网络调用）横跨两个 lock 窗口，重叠登录会话
-    // （oauth_get_login_url 会整体覆盖写入）会让回调透传的 device_id 与实际交换
-    // 设备错配 → device_map 静默污染。快照后本次回调全部读值同源，竞态消除。
-    let session = LAST_OAUTH_STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let issued_state = session.as_ref().map(|p| p.state.clone());
-    let issued_verifier = session.as_ref().map(|p| p.pkce_verifier.clone());
-    let issued_device_id = session.as_ref().map(|p| p.device_id.clone());
-    // 审查修复：无在途会话（重启后粘贴回调）的回退设备入口选定一次，供下方
-    // AuthCode 交换与尾部透传共用——此前两处独立 select_login_device 横跨
-    // exchange_code（分钟级网络调用）窗口，重叠登录会话（oauth_get_login_url
-    // 整体覆盖写入 LAST_OAUTH_STATE）会让两处选中不同设备 → 交换设备与
-    // device_map 回写/刷新交换设备错配。选择是确定性的，同状态下两次调用
-    // 结果一致，去重后仅消除窗口期漂移，行为不变。
-    // fallback 走 fallback_login_device_id（issue #110）：pending 合成身份优先
-    // 复用，其次才 select_login_device 生成新身份
-    let fallback_device = issued_device_id
-        .clone()
-        .unwrap_or_else(|| fallback_login_device_id(&state));
-
     // CSRF 校验（抓包固化：state 已不适用，native_ide 流程回调不回传 state，改用
     // loginTraceID 双向绑定——授权页把 login_trace_id 原样回传为 loginTraceID）。
     // 本进程签发过登录会话且回调携带 loginTraceID 时两者必须一致；回调不带
     // loginTraceID 或本进程未签发过（重启后粘贴回调）时保持宽容，不阻断正常登录。
     if let Some(cb_trace) = params.get("loginTraceID").or_else(|| params.get("login_trace_id")) {
-        if let Some(expected) = &issued_state {
-            if !expected.is_empty() && cb_trace != expected {
+        let issued = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.state.clone());
+        if let Some(expected) = issued {
+            if !expected.is_empty() && cb_trace != &expected {
                 return Err("OAuth loginTraceID 校验失败：回调 URL 与本机发起的登录请求不匹配（可能为伪造或重放），已拒绝".into());
             }
         }
     } else if auth_code.is_some() {
         // 新流程回调必带 loginTraceID：缺失且本机有在途会话时视为不匹配
-        if issued_state.is_some() {
+        let issued = LAST_OAUTH_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.state.clone());
+        if issued.is_some() {
             return Err("OAuth 回调缺少 loginTraceID，无法确认与本机登录请求的对应关系，已拒绝".into());
         }
     }
+
+    // 无在途会话 fallback 设备入口一次性选定：会话快照的 device_id 优先，缺失时
+    // fallback_login_device_id（pending 合成身份优先复用，其次轮转重选）。
+    // AuthCode 交换与尾部 device_id 透传必须共用同一选择——两处若横跨
+    // exchange_code（分钟级网络调用）独立选定，期间重叠登录会话整体覆盖写入
+    // LAST_OAUTH_STATE，绑定数分布变化会让两处选中不同设备 → 实际交换设备与
+    // device_map 回写 / 刷新交换设备错配。选择是确定性的，同状态下结果一致，
+    // 去重仅消除窗口期漂移，行为不变
+    let fallback_device = LAST_OAUTH_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|p| p.device_id.clone())
+        .unwrap_or_else(|| fallback_login_device_id(&state));
 
     let mut access_token = params
         .get("accessToken")
@@ -949,16 +889,19 @@ pub fn oauth_parse_callback(
             let code = auth_code
                 .or_else(|| params.get("code").cloned())
                 .ok_or_else(|| "回调 URL 中缺少 authCodeInfo/refreshToken 参数".to_string())?;
-            let verifier = issued_verifier.as_deref();
+            let verifier = LAST_OAUTH_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|p| p.pkce_verifier.clone());
             // 会话设备优先（登录 URL 签发时轮转选定）；无在途会话（重启后粘贴回调）
-            // 用入口选定的 fallback_device（与回调尾部透传同一台，见上方审查修复注释）
-            let device_id = fallback_device.clone();
+            // 用入口一次性选定的 fallback_device（与尾部透传共用，见上）
             // host：授权页回传的 API 域（main.js 逆向：交换 URL = ${host}/trae/api/v3/oauth/ExchangeToken）
             let host = params
                 .get("host")
                 .cloned()
                 .unwrap_or_else(|| "https://api.trae.com.cn".into());
-            match exchange_code(&code, verifier, &device_id, &host, &state) {
+            match exchange_code(&code, verifier.as_deref(), &fallback_device, &host, &state) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
@@ -1317,14 +1260,6 @@ fn mask_sensitive(v: &mut serde_json::Value) {
                 if is_sensitive_key(k) {
                     if let Some(s) = val.as_str() {
                         if !s.is_empty() {
-                            // 审查 L：短纯数字串不打码——Error.Code/StandardCode 实测为
-                            // 字符串形态数字（"20101"），打码后 [OAuth交换-响应] 日志
-                            // 失去最关键的错误码；真实凭证（授权码/令牌）恒为长随机串，
-                            // 长度上限 12 + 纯数字双条件确保不会误放行
-                            if s.len() <= 12 && s.chars().all(|c| c.is_ascii_digit()) {
-                                mask_sensitive(val);
-                                continue;
-                            }
                             *val = serde_json::Value::String(mask_str(s));
                             continue;
                         }
@@ -1695,17 +1630,15 @@ pub fn oauth_login(
     let callback_info = oauth_parse_callback(state.clone(), callback_url)?;
 
     // issue #76：本次登录会话设备（回调签发时轮转选定，回调解析已透传；
-    // 极端场景下缺失则走 fallback_login_device_id——pending 合成身份优先复用
-    // （与授权 URL device_id 同源），其次轮转/生成新身份，避免直接 select_login_device
-    // 覆盖 pending 导致交换设备漂移；与 oauth_parse_callback L866 回退同构）。
+    // 极端场景下缺失则重选——选择是确定性的，同状态下两次调用结果一致）。
     // 登录 URL 参数 / ExchangeToken DeviceInfo / 刷新交换 / device_map 回写全链路同源
     let login_device_id = callback_info
         .device_id
         .clone()
-        .unwrap_or_else(|| fallback_login_device_id(&state));
+        .unwrap_or_else(|| select_login_device(&state).0);
 
     // 2. 如果回调中没有 accessToken，则用 refresh_token 换取
-    // 审查修复（M12，融合 M8）：交换失败原经 .map_err(|e| e.msg).ok() 压扁，恒报
+    // 审查修复（M12）：交换失败原经 .map_err(|e| e.msg).ok() 压扁，恒报
     // 「refresh_token 交换失败」通用文案，上游信封详情丢失排查失据；现透传
     // RefreshExchangeError.msg（内含 volcano_error 解析的火山信封 code/msg 或
     // 旧形态 message/请求失败原因）
@@ -1778,15 +1711,12 @@ pub fn oauth_login(
     // 转正为 per-uid 身份，供后续刷新签 DeviceProof；同 uid 重新 OAuth 即换新设备
     //（覆盖旧键，兑现「重新 OAuth 登录轮换设备凭证」的错误转译承诺）。
     // 登录落在真实凭证上时清掉遗留的 per-uid synthetic（死状态清理）
-    if let Some(cred) = peek_pending_login_device(&state, &login_device_id) {
-        // 审查 L1：先 persist 后删 pending——persist 失败时保留 pending（刷新可经
-        // 第一级命中），不再出现「pending 已删 + per-uid 缺失」的双失状态
-        match persist_account_synthetic_device(&state, &user_id, &cred) {
-            Ok(()) => delete_pending_login_device(&state, &login_device_id),
-            Err(e) => fs_utils::app_log(
+    if let Some(cred) = take_pending_login_device(&state, &login_device_id) {
+        if let Err(e) = persist_account_synthetic_device(&state, &user_id, &cred) {
+            fs_utils::app_log(
                 &state.data_dir,
-                &format!("OAuth: 账号合成设备身份持久化失败（pending 保留，刷新可经会话身份命中）: {e}"),
-            ),
+                &format!("OAuth: 账号合成设备身份持久化失败: {e}"),
+            );
         }
     } else if icube_device_creds().iter().any(|c| c.device_id == login_device_id) {
         remove_account_synthetic_device(&state, &user_id);

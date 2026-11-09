@@ -83,7 +83,15 @@ pub(crate) fn buddy_pool_write_credits(
     if expire_secs.is_some() {
         a.credits_expire_at = expire_secs; // 秒级时间戳（WorkBuddyAccount 口径）
     }
-    if packages.is_some() {
+    // 空明细不覆盖旧值（issue #179）：上游形状变化/瞬时抖动一次就抹掉历史明细
+    // 且无任何痕迹；「包用完」上游仍返回 remain=0 条目，不经此分支。对齐 expire
+    // 仅 Some 才覆盖的口径
+    let has_pkgs = packages
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if has_pkgs {
         a.credits_packages = packages; // 分包明细（P9）
     }
     save_buddy_pool(state, &pool)?;
@@ -210,45 +218,6 @@ fn intl_domain_or(domain: Option<String>) -> String {
         // 缺省/非法一律回落官方域名（buddy-ai 池只收国际账号，不可能出现 CN 域）
         _ => INTL_DOMAIN.to_string(),
     }
-}
-
-// ── 导入/移除共用的 id 与凭证反向校验（审查 #12 / #13）──────────────────────
-
-/// 账号 id 双重校验（#12）：① `fs_utils::ensure_uid_safe` 字符白名单（字母数字
-/// -_/.，拒 `..`/裸 `.`/分隔符/超长）——id 是路径组件（switcher 快照备份/恢复目标
-/// `profiles_dir.join(uid)`、slot_exists 探针），导入是用户间分享机制，恶意
-/// pool_json 的 "a/../../x" 可经旧长度校验入池后在 profiles 目录外读写；② 生成
-/// 规则须与 `account_id_of` 同形（wb-<sha256 前 12 位十六进制小写>，对齐国内
-/// accounts_import 的 wb- 规则校验）
-fn buddy_ai_id_check(id: &str) -> Result<(), String> {
-    fs_utils::ensure_uid_safe(id)?;
-    let hex = id.strip_prefix("wb-").unwrap_or("");
-    if hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        Ok(())
-    } else {
-        Err("id 不符合 wb-<12位十六进制小写> 规则".into())
-    }
-}
-
-/// CN access_token 判定（#13 反向凭证门控）：JWT payload iss 命中
-/// copilot.tencent.com 即国内凭证。不验证签名（导入场景只辨来源不建立信任）；
-/// iss 解析失败返回 false（fail-open——国际 token 形态各异，只拦明确命中不误伤）
-fn buddy_ai_token_is_cn(token: &str) -> bool {
-    super::oauth::jwt_claims(token)
-        .and_then(|c| c.get("iss").and_then(|v| v.as_str()).map(str::to_string))
-        .map_or(false, |iss| iss.contains("copilot.tencent.com"))
-}
-
-/// 凭证 rec 的 CN 形态判定（#13，accounts_import 回灌门控）：domain 明确非国际
-/// （非空且不含 .workbuddy.ai——入池后会被 intl_domain_or 强打国际域名恒 401）
-/// 或 access_token iss 命中 CN → 拒绝回灌
-fn buddy_ai_rec_is_cn(rec: &Value) -> bool {
-    if let Some(d) = as_str(fs_utils::dig(rec, &["domain"])) {
-        if !d.trim().is_empty() && !d.contains(".workbuddy.ai") {
-            return true;
-        }
-    }
-    as_str(fs_utils::dig(rec, &["access_token"])).map_or(false, |t| buddy_ai_token_is_cn(&t))
 }
 
 // ── API 网关 buddy-ai 池取号（T2.1 同构，阶段 2 dispatch 接线）──────────────
@@ -560,11 +529,9 @@ pub fn buddy_ai_account_remove(
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
 ) -> Result<(), String> {
-    // #12：id 是快照备份/恢复与 slot 探针的路径组件，旧「仅长度」校验可被
-    // "a/../../x" 穿透 → 改 ensure_uid_safe 白名单 + wb- 生成规则双重校验
-    if let Err(e) = buddy_ai_id_check(&user_id) {
-        return Err(e);
-    }
+    // 审查 #12：字符白名单（ensure_uid_safe 统一入口）——user_id 作路径组件
+    //（vault ns / token store / 快照槽位），仅长度校验放行了 `..`、分隔符注入
+    fs_utils::ensure_uid_safe(&user_id)?;
     let _guard = state.buddy_ai_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_buddy_pool(&state);
     let before = pool.accounts.len();
@@ -764,10 +731,7 @@ const BUDDY_AI_RENEW_STREAK_KEY: &str = "buddy_ai_renew_fail_streak";
 const BUDDY_AI_RENEW_STREAK_LIMIT: i64 = 3;
 
 /// buddy-ai 凭证兜底续期任务（对齐国内 wb-renew lazy 口径）：仅刷新 AT 剩余 ≤48h
-/// 的启用账号；全部失败返 Err 交调度器 30 分钟冷却重试，部分失败按暂态容忍。
-/// 审查 #16①：needs_relogin=true 的账号（已判死待用户重登）不再纳入重试——
-/// 续期必败重试纯噪声；注：Intl 刷新失败仍有意不标 needs_relogin（见
-/// buddy_ai_refresh_impl 防误杀真实凭证的设计），此处过滤不影响该口径
+/// 的启用账号；全部失败返 Err 交调度器 30 分钟冷却重试，部分失败按暂态容忍
 pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
     let pool = load_buddy_pool(state);
     let now = chrono::Utc::now().timestamp();
@@ -786,7 +750,7 @@ pub fn buddy_ai_renew_task(state: &AppState) -> Result<Value, String> {
         .accounts
         .iter()
         .filter(|a| {
-            if a.disabled || a.needs_relogin {
+            if a.disabled {
                 return false;
             }
             let due_by_expiry = match a.access_token_expires_at {
@@ -948,11 +912,10 @@ pub fn buddy_ai_checkin_start(
     let st = state.inner().clone();
     std::thread::spawn(move || {
         let _round = _round; // 显式移动进闭包，Drop 自动复位 BUSY（含 panic 展开）
-        // 审查 #4：取运行期网关句柄传入打卡轮——到账（success 且 reward>0）增量
-        // 回写运行期 buddy_ai_pool，否则该账号被零积分过滤持续排除至下次积分同步
-        let runtime = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
         let mut events: Vec<Value> = Vec::new();
-        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, Some(runtime.inner()), &mut |ev| {
+        // 审查 #4：传入网关运行态句柄——打卡到账运行期拨进 buddy_ai_pool
+        let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, Some(rt.inner()), &mut |ev| {
             // NDJSON 契约对齐 wb-checkin：payload 为序列化 JSON 字符串
             let _ = app.emit("buddy-ai-checkin-progress", serde_json::to_string(ev).unwrap_or_default());
             events.push(ev.clone());
@@ -1000,9 +963,8 @@ pub fn buddy_ai_credits_sync_impl(
         .unwrap_or_default();
     let mut out = Vec::new();
     for a in &pool.accounts {
-        // L1/M17 修复：停用账号不参与积分/Token 同步落库——数据对其无意义，
-        // 且会污染看板统计（活跃账号数 vs 同步行数误读；对齐
-        // buddy_ai_usage_official_all_impl 的 disabled 过滤口径）
+        // 审查修复（M17）：停用账号不参与积分/Token 同步，避免污染看板统计
+        // （对齐 buddy_ai_usage_official_all_impl 的 disabled 过滤口径）
         if a.disabled {
             continue;
         }
@@ -1018,6 +980,10 @@ pub fn buddy_ai_credits_sync_impl(
         };
         let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"]))));
         let snap = crate::tasks::buddy_ai_checkin::fetch_dosage_info(&agent, base, &token, &uid);
+        // 解析诊断落日志（issue #179）：明细空/未知 Status 等异常形态留证
+        if let Some(d) = snap.as_ref().and_then(|i| i.parse_diag.as_deref()) {
+            fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 积分解析诊断 {}: {d}", a.id));
+        }
         out.push((a.id.clone(), snap));
     }
     // 短临界区回写快照三键
@@ -1033,8 +999,13 @@ pub fn buddy_ai_credits_sync_impl(
                     if info.expire_secs.is_some() {
                         a.credits_expire_at = info.expire_secs; // 秒级时间戳
                     }
-                    // P9 分包明细（get-user-resource Accounts[] 深度解析）
-                    a.credits_packages = serde_json::to_value(&info.packages).ok();
+                    // P9 分包明细（get-user-resource Accounts[] 深度解析）；空明细
+                    // 不覆盖旧值（issue #179，对齐 buddy_pool_write_credits 口径）
+                    if let Ok(p) = serde_json::to_value(&info.packages) {
+                        if p.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                            a.credits_packages = Some(p);
+                        }
+                    }
                 }
             }
         }
@@ -1134,10 +1105,9 @@ pub fn startup_auto_checkin_buddy_ai(app: &tauri::AppHandle, state: &AppState) {
             return;
         };
         let mut events: Vec<Value> = Vec::new();
-        // 审查 #4：运行期网关句柄透传——到账增量回写运行期 buddy_ai_pool
-        //（与手动打卡/调度器同口径；网关未运行时 run_checkin_round 内部自跳过）
-        let runtime = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
-        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, Some(runtime.inner()), &mut |ev| events.push(ev.clone()));
+        // 审查 #4：传入网关运行态句柄——打卡到账运行期拨进 buddy_ai_pool
+        let rt = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+        let done = crate::tasks::buddy_ai_checkin::run_checkin_round(&st, Some(rt.inner()), &mut |ev| events.push(ev.clone()));
         let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
         let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
         fs_utils::app_log(
@@ -1724,7 +1694,6 @@ pub fn buddy_ai_sessions_query(
                 model: m.to_string(),
                 // buddy-ai 官网行级明细无 mode/cost/token 字段 → 全空（前端显示 —）
                 mode: String::new(),
-                failed: None,
                 credits: r.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
                 cost_money: 0.0,
                 input_tokens: 0,
@@ -1884,9 +1853,6 @@ fn buddy_ai_official_usage_rows(
             if next_page > 30 {
                 break;
             }
-            // L5/M21 修复：页级失败降级——空数据仍上抛 Err（调用方 stale 缓存
-            // 回退依赖 Err 信号），已有部分数据则置 mid_fail 收束并透传
-            // truncated（前端提示「数据不完整」），不再全损（见上方 M21 注释）
             match call(&url, next_page) {
                 Ok(v) => {
                     page_responses.push(v);
@@ -2148,16 +2114,11 @@ pub fn buddy_ai_accounts_import(
             .unwrap_or(false)
     };
     let mut token_targets: Vec<(String, Value)> = Vec::new();
-    // 非法条目明细（#12/#13）：invalid 计数口径不变，原因附日志便于排查
-    let mut invalid_reasons: Vec<String> = Vec::new();
     for a in new_accounts {
-        // #12 id 双重校验（ensure_uid_safe 字符白名单 + wb-<12位十六进制小写> 生成
-        // 规则，与 account_id_of / buddy_ai_account_remove 同口径）：id 是快照备份/
-        // 恢复与 slot 探针的路径组件，导入是用户间分享机制，恶意 pool_json 的
-        // "a/../../x" 可经旧长度校验入池后在 profiles 目录外读写
-        if let Err(e) = buddy_ai_id_check(&a.id) {
+        // id 硬校验（审查 #12：ensure_uid_safe 字符白名单 + 64 上限，与移除侧同口径；
+        // id 作路径组件，防 `..`/分隔符注入入池）
+        if fs_utils::ensure_uid_safe(&a.id).is_err() {
             invalid += 1;
-            invalid_reasons.push(format!("{}: {e}", a.id.chars().take(24).collect::<String>()));
             continue;
         }
         if pool.accounts.iter().any(|x| x.id == a.id) {
@@ -2172,16 +2133,6 @@ pub fn buddy_ai_accounts_import(
                     if rec.get("access_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
                         || rec.get("refresh_token").and_then(Value::as_str).map(|s| !s.is_empty()).unwrap_or(false)
                     {
-                        // #13 反向凭证门控：回灌 CN domain / CN iss 凭证会被
-                        // intl_domain_or 强打国际域名恒 401，条目整体拒绝
-                        if buddy_ai_rec_is_cn(rec) {
-                            invalid += 1;
-                            invalid_reasons.push(format!(
-                                "{}: 凭证为国内版形态（CN domain / iss copilot.tencent.com）",
-                                a.id
-                            ));
-                            continue;
-                        }
                         token_targets.push((a.id.clone(), rec.clone()));
                     }
                 }
@@ -2201,14 +2152,7 @@ pub fn buddy_ai_accounts_import(
     }
     fs_utils::app_log(
         &state.data_dir,
-        &format!(
-            "buddy-ai: 导入账号池 added={added} skipped={skipped} invalid={invalid} tokens={tokens_added}{}",
-            if invalid_reasons.is_empty() {
-                String::new()
-            } else {
-                format!(" invalid明细: {}", invalid_reasons.join("; "))
-            }
-        ),
+        &format!("buddy-ai: 导入账号池 added={added} skipped={skipped} invalid={invalid} tokens={tokens_added}"),
     );
     drop(_guard);
     // 审查修复（导入热重载）：新增账号/凭证联动网关池热重载——对齐 import_creds /
@@ -2227,10 +2171,9 @@ pub fn buddy_ai_accounts_import(
 /// 「识别 + 池内匹配」：uid 已在池中 → in_pool=true；不在池中 → 前端引导 OAuth 扫码。
 #[tauri::command(async)]
 pub fn buddy_ai_local_scan(state: State<'_, AppState>) -> Result<Value, String> {
-    // 跨平台 HOME 基根（Windows=USERPROFILE / macOS=HOME，macOS 适配）
-    let home = crate::platform::home_dir();
-    if home.as_os_str().is_empty() {
-        return Err("无法解析用户主目录".into());
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
     }
     let snap_path = std::path::PathBuf::from(&home)
         .join(".workbuddy-ai")
@@ -2292,12 +2235,11 @@ pub fn buddy_ai_env_reset(state: State<'_, AppState>, items: Vec<String>) -> Res
     if items.is_empty() || items.len() > ALLOWED.len() {
         return Err("重置项为空或超限".into());
     }
-    // 跨平台 HOME 基根（Windows=USERPROFILE / macOS=HOME，macOS 适配）
-    let home = crate::platform::home_dir();
-    if home.as_os_str().is_empty() {
-        return Err("无法解析用户主目录".into());
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
     }
-    let root = home.join(".workbuddy-ai");
+    let root = std::path::PathBuf::from(&home).join(".workbuddy-ai");
     if !root.is_dir() {
         return Err(format!("目录不存在：{}", root.display()));
     }
@@ -2348,23 +2290,21 @@ pub fn buddy_ai_env_reset(state: State<'_, AppState>, items: Vec<String>) -> Res
 }
 
 /// 打开 WorkBuddy AI 国际客户端数据目录（P7 环境配置卡对齐国内
-/// workbuddy_open_auth_dir；目录为用户主目录下 .workbuddy-ai，与国内
+/// workbuddy_open_auth_dir；目录为 %USERPROFILE%\.workbuddy-ai，与国内
 /// .workbuddy 为不同安装目录）。目录不存在时降级打开其父目录（首次安装前
 /// 该目录尚未生成，父目录即用户主目录，仍有定位价值）
 #[tauri::command(async)]
 pub fn buddy_ai_open_data_dir() -> Result<(), String> {
-    // 跨平台 HOME 基根（Windows=USERPROFILE / macOS=HOME，macOS 适配）
-    let home = crate::platform::home_dir();
-    if home.as_os_str().is_empty() {
-        return Err("无法解析用户主目录".into());
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() {
+        return Err("无法解析用户主目录（USERPROFILE 为空）".into());
     }
-    let dir = home.join(".workbuddy-ai");
+    let dir = std::path::PathBuf::from(&home).join(".workbuddy-ai");
     let target = if dir.is_dir() { dir.clone() } else { dir.parent().map(|p| p.to_path_buf()).ok_or_else(|| format!("目录不存在：{}", dir.display()))? };
-    // F-75：按平台分派打开目录——Windows explorer / macOS open（Finder 置顶），
-    // 经 sys_command 收敛（对齐 workbuddy_open_auth_dir 同款）
-    let mut cmd = crate::platform::cmd::sys_command(if cfg!(windows) { "explorer" } else { "open" });
-    cmd.arg(&target);
-    cmd.spawn().map_err(|e| format!("打开数据目录失败: {e}"))?;
+    std::process::Command::new("explorer")
+        .arg(&target)
+        .spawn()
+        .map_err(|e| format!("打开数据目录失败: {e}"))?;
     Ok(())
 }
 
@@ -2559,56 +2499,5 @@ mod tests {
         let bare = json!({ "export_kind": "buddy-ai-pool", "accounts": [], "tokens": {} });
         let out = buddy_ai_export_seal(bare.clone(), None).unwrap();
         assert_eq!(out, bare);
-    }
-
-    /// JWT 造数（同国内 accounts.rs 测试）：header.payload.signature，payload 仅含
-    /// sub/iss，URL_SAFE_NO_PAD 编码
-    fn jwt_with_iss(iss: &str) -> String {
-        use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"sub":"u-1","iss":"{iss}"}}"#).as_bytes());
-        format!("aaa.{payload}.bbb")
-    }
-
-    /// 审查 #12：id 双重校验——路径注入/相对跳转/超长被 ensure_uid_safe 拒，
-    /// 旧长度校验可过的非规则形态被 wb- 规则拒，account_id_of 生成形态放行
-    #[test]
-    fn buddy_ai_id_check_rejects_illegal_ids() {
-        // 合法：account_id_of 生成形态（wb-<12位十六进制小写>）
-        assert!(buddy_ai_id_check(&account_id_of("some-token")).is_ok());
-        assert!(buddy_ai_id_check("wb-443681d83879").is_ok());
-        // 非法：路径注入 / 相对跳转 / 裸点 / 空串（ensure_uid_safe 层）
-        assert!(buddy_ai_id_check("a/../../x").is_err());
-        assert!(buddy_ai_id_check("..").is_err());
-        assert!(buddy_ai_id_check(".").is_err());
-        assert!(buddy_ai_id_check("a..b").is_err());
-        assert!(buddy_ai_id_check("").is_err());
-        // 非法：旧「仅长度」校验可过、但不符合 wb- 生成规则（规则层）
-        assert!(buddy_ai_id_check("wb-g1").is_err());
-        assert!(buddy_ai_id_check("wb-short").is_err());
-        assert!(buddy_ai_id_check("wb-443681d838799").is_err());
-        assert!(buddy_ai_id_check("wb-443681D83879").is_err());
-        assert!(buddy_ai_id_check("x-443681d83879").is_err());
-    }
-
-    /// 审查 #13：CN 凭证反向门控——JWT iss 命中 copilot.tencent.com 即拒；
-    /// 国际 iss / 非 JWT（iss 解析失败）不拒（fail-open，与国际 token 形态一致）；
-    /// rec 形态的 CN domain 同拒、国际/缺省 domain 放行
-    #[test]
-    fn buddy_ai_cn_credential_gate() {
-        let cn_jwt = jwt_with_iss("https://copilot.tencent.com");
-        assert!(buddy_ai_token_is_cn(&cn_jwt));
-        assert!(!buddy_ai_token_is_cn(&jwt_with_iss("https://sso.workbuddy.ai/realms/wb")));
-        assert!(!buddy_ai_token_is_cn("not-a-jwt"));
-        assert!(!buddy_ai_token_is_cn(""));
-        // rec 形态：CN domain / CN token 均命中
-        assert!(buddy_ai_rec_is_cn(&json!({ "domain": "copilot.tencent.com" })));
-        assert!(buddy_ai_rec_is_cn(&json!({ "access_token": cn_jwt })));
-        // rec 形态：国际 domain / 缺省 domain / 空凭证放行
-        assert!(!buddy_ai_rec_is_cn(
-            &json!({ "domain": "www.workbuddy.ai", "access_token": "" })
-        ));
-        assert!(!buddy_ai_rec_is_cn(&json!({ "access_token": "not-a-jwt" })));
-        assert!(!buddy_ai_rec_is_cn(&json!({})));
     }
 }

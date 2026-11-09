@@ -26,35 +26,20 @@ use crate::tasks::wb_common::Creds;
 
 // 路径常量（与 commands/workbuddy/common.rs::auth_file_path 同值，注释互指；
 // CodeBuddyExtension 宿主目录 + workbuddy 产品线文件名，实测确认）
-#[cfg(windows)] // mac 分支走 Application Support 基根（不含反斜杠相对段）
 const WB_AUTH_DIR_REL: &str = "CodeBuddyExtension\\Data\\Public\\auth";
 const WB_AUTH_FILE_NAME: &str = "workbuddy-desktop.info";
 
 pub(crate) fn wb_auth_dir() -> PathBuf {
-    // 审查修复（L14）：LOCALAPPDATA 缺失（如计划任务/服务上下文）时原实现退化为
-    // 随进程 CWD 漂移的相对路径——Windows 侧改从 USERPROFILE 推导绝对路径兜底，
-    // 两者皆缺失才保留相对路径作最后回退；macOS 侧走 Application Support 基根
-    #[cfg(windows)]
-    {
-        std::env::var("LOCALAPPDATA")
-            .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
-            .or_else(|_| {
-                std::env::var("USERPROFILE")
-                    .map(|p| PathBuf::from(p).join("AppData").join("Local").join(WB_AUTH_DIR_REL))
-            })
-            .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
-    }
-    // M-1 侦察 ②（2026-09-20 实测确认）：mac auth 文件与 Windows 同构，仅宿主基根
-    // 不同——~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/
-    // workbuddy-desktop.info（本机实测存在且客户端活跃回写）
-    #[cfg(target_os = "macos")]
-    {
-        crate::platform::app_support_root_lossy()
-            .join("CodeBuddyExtension")
-            .join("Data")
-            .join("Public")
-            .join("auth")
-    }
+    std::env::var("LOCALAPPDATA")
+        .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
+        // 审查修复（L14）：LOCALAPPDATA 缺失（如计划任务上下文）时原实现退化为
+        // 随进程 CWD 漂移的相对路径——改从 USERPROFILE 推导绝对路径兜底，
+        // 两者皆缺失才保留相对路径作最后回退
+        .or_else(|_| {
+            std::env::var("USERPROFILE")
+                .map(|u| PathBuf::from(u).join("AppData").join("Local").join(WB_AUTH_DIR_REL))
+        })
+        .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
 }
 
 pub(crate) fn wb_auth_file() -> PathBuf {
@@ -135,9 +120,8 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
     ] {
         if let Some(v) = v {
             if let Some(s) = v.as_str() {
-                let t = s.trim();
-                if !t.is_empty() {
-                    return Some(t.to_string());
+                if !s.is_empty() {
+                    return Some(s.to_string());
                 }
             }
         }
@@ -160,26 +144,10 @@ fn read_slot_meta_uid(slot_dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 槽位当前承载的登录身份：CodeBuddy 槽优先读槽内 vscdb/storage.json 的
-/// genie.userId（登录真源随 L3 拷入，独立于 meta.json），缺失才回退 meta.uid；
-/// WorkBuddy 槽登录真源就是 auth 文件拷贝、无独立身份信号，直接用 meta.uid。
-/// 背景（2026-10-25 实测）：存量 CodeBuddy 槽的 meta.uid 曾被 WorkBuddy uid 污染，
-/// 而槽内 vscdb 登录态完好——只看 meta.uid 会把完好存量槽误判为「身份不符/快照
-/// 不可用」，且重新保存会被槽位守卫再次拦截（误报粘滞，只能手删槽位）。真源
-/// 优先可自愈：守卫放行后 meta.json 随备份重写为当前 live 身份。
-pub(crate) fn slot_held_uid(slot_dir: &Path, is_codebuddy: bool) -> Option<String> {
-    if is_codebuddy {
-        let raw = crate::fs_utils::read_json::<serde_json::Value>(
-            &slot_dir.join("vscdb").join("storage.json"),
-        );
-        crate::fs_utils::dig(&raw, &["genie.userId"])
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| read_slot_meta_uid(slot_dir))
-    } else {
-        read_slot_meta_uid(slot_dir)
-    }
+/// 账号列表用：槽位 meta.uid（`dir/<id>/meta.json`）；缺槽/缺字段 → None。
+/// 与账号 uid 不一致 = 快照里装的是别的账号的登录态（需重新保存）。
+pub(crate) fn read_slot_uid(dir: &Path, id: &str) -> Option<String> {
+    read_slot_meta_uid(&dir.join(id))
 }
 
 /// 客户端当前 live 登录身份：CodeBuddy 系取 `globalStorage\storage.json` 的 genie.userId
@@ -249,13 +217,10 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
 
     // 槽位身份对齐守卫（2026-10-30 实测）：客户端把无效会话回退到账号 A 后，流程仍按
     // 「检测到的目标 A'」把现场写进 A' 槽位，结果 A' 槽里装的是 A 的登录态（槽 meta.uid
-    // 与槽位账号不符，下次切换必然失败）。具名槽位写入前比对槽位承载身份
-    //（slot_held_uid）与当前 live 身份，不一致就跳过；last/last.bak 是"当前现场"备份，放行。
-    // prev 用 slot_held_uid（CB 槽内 genie.userId 优先）而非 meta.uid：
-    // 存量 CB 槽 meta.uid 曾被 WorkBuddy uid 污染（槽内 vscdb 完好），按 meta.uid
-    // 判定会误拦合法备份且误报粘滞（重存仍被拦，只能手删槽位）。
+    // 与槽位账号不符，下次切换必然失败）。具名槽位写入前比对原有 meta.uid 与当前 live
+    // 身份，不一致就跳过；last/last.bak 是"当前现场"备份，放行。
     if is_named_slot(slot) {
-        if let (Some(live), Some(prev)) = (uid.as_deref(), slot_held_uid(&dest, is_codebuddy)) {
+        if let (Some(live), Some(prev)) = (uid.as_deref(), read_slot_meta_uid(&dest)) {
             if prev != live {
                 sink.step(
                     "backup",
@@ -277,8 +242,12 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
 
     // L1：auth 文件（WorkBuddy 系必选；CodeBuddy 端隔离可选——F2-4：CodeBuddy
     // 不消费共享 auth 文件、恢复侧跳过回写，文件缺失仅 Skip 不阻断）
-    match std::fs::copy(&auth_file, dest.join("auth").join(slot_auth_name(sess))) {
+    let snap_auth = dest.join("auth").join(slot_auth_name(sess));
+    match std::fs::copy(&auth_file, &snap_auth) {
         Ok(_) => {
+            // 快照权限收敛（审查 #7）：fs::copy 继承源文件权限位，明文 token 快照不得外放
+            #[cfg(unix)]
+            harden_auth_mode(&snap_auth);
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
         }
@@ -457,12 +426,8 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         "savedAt": crate::fs_utils::now_ts(),
         "savedAtMs": chrono::Utc::now().timestamp_millis(),
     });
-    // 原子写对齐 mark_slot_key：非原子 std::fs::write 中断会留半截 meta.json——
-    // 守卫 fail-open 尚可，但徽标静默消失/标记静默丢失
-    if let Err(e) = crate::fs_utils::write_text_atomic(
-        &dest.join("meta.json"),
-        &serde_json::to_string(&meta).unwrap_or_default(),
-    )
+    if let Err(e) =
+        std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
     {
         sink.step(
             "backup",
@@ -522,6 +487,9 @@ pub fn restore_authfile(
             sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
             return Err(super::thrown(sink, "auth 文件恢复失败"));
         }
+        // 回写权限收敛（审查 #7）：备份源文件权限不受本工具控制，恢复后的 live auth 同样不得外放
+        #[cfg(unix)]
+        harden_auth_mode(&auth_file);
         restored += 1;
         sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
 
@@ -721,8 +689,6 @@ fn replace_identity_key(
     }
     if scalar
         && !creds.access_token.is_empty()
-        // 审查修复：不再匹配裸键 "token"——壳模板内语义无关的私有 token 字段
-        // 会被误改写为新 access_token，违反「客户端私有字段不碰」原则
         && matches!(lk.as_str(), "accesstoken" | "access_token")
     {
         set_str(v, &creds.access_token);
@@ -942,27 +908,20 @@ pub fn synthesize_auth_snapshot(
             return None;
         }
     };
-    let synth_auth_path = dest.join("auth").join(slot_auth_name(sess));
+    // 合成 auth 快照含明文 token：原子落盘且 unix 创建即 0600——普通 fs::write 以
+    // umask 默认 0644 落盘，macOS 多用户机上其他用户在落盘窗口内可读明文凭证
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            std::fs::write(&synth_auth_path, &body)
-                .map_err(|e| e.to_string())
+            write_private_file_atomic(
+                &dest.join("auth").join(slot_auth_name(sess)),
+                body.as_bytes(),
+            )
+            .map_err(|e| e.to_string())
         })
     {
         sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
         return None;
-    }
-    // 合成 auth 文件含 accessToken/refreshToken 明文，std::fs::write 落盘权限为
-    // umask 默认（通常 0644），mac 多用户机上其他用户可读——收紧为 0600
-    //（备份/恢复走 fs::copy 会保留源权限，不受此影响）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &synth_auth_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
     }
     let meta = json!({
         "schemaVersion": 1,
@@ -973,11 +932,8 @@ pub fn synthesize_auth_snapshot(
         "savedAtMs": chrono::Utc::now().timestamp_millis(),
         "bootstrap": true,
     });
-    // 原子写对齐 backup_authfile：中断不留半截 meta.json
-    if let Err(e) = crate::fs_utils::write_text_atomic(
-        &dest.join("meta.json"),
-        &serde_json::to_string(&meta).unwrap_or_default(),
-    )
+    if let Err(e) =
+        std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
     {
         // meta 缺失不阻塞合成结果：confirm 期望 uid 回退会话暂存 bootstrap_uid
         //（与 meta 的 uid 同源），后续完整备份会重写 meta
@@ -989,6 +945,60 @@ pub fn synthesize_auth_snapshot(
         &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
     );
     Some(creds.uid.clone())
+}
+
+/// 敏感文件原子落盘（unix 创建即 0600）：同目录唯一 tmp（pid+序号后缀，防同槽位
+/// 并发合成互踩）以 mode(0o600) 创建——消除「先以 umask 0644 落盘再 set_permissions
+/// 收紧」的明文竞窗；sync_all + rename 原子替换，失败路径 best-effort 清理 tmp
+///（进程被硬杀仍可能残留 0600 明文 tmp，属可接受兜底）。用于合成 auth 快照等
+/// 含明文 token 的落盘。
+fn write_private_file_atomic(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(&format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // 失败路径 best-effort 清理：避免明文 token 残留磁盘（unix 下 tmp 本身 0600）
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// auth 文件权限收敛 0o600（unix；Windows 走 ACL 继承体系无需处理）：fs::copy 会
+/// 继承源文件权限位，客户端创建的明文 token auth 文件权限不受本工具控制——备份
+/// 快照与恢复回写后的 live 文件可能外放，故备份落盘后、恢复回写后各收口一次，
+/// 与 write_private_file_atomic 同口径。失败不阻断主流程（切换/恢复语义已完成）
+#[cfg(unix)]
+fn harden_auth_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 /// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。
@@ -1210,24 +1220,16 @@ fn confirm_switch_inner(
             );
             crate::fs_utils::dig(&raw, &["genie.userId"])
                 .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
         } else {
             None
         };
     if expect_uid.is_none() {
-        // trim + 空串过滤对齐 read_slot_meta_uid：外部编辑/半截写入的 "uid":""
-        // 若不过滤会变成 Some("")，短路 bootstrap_uid/槽名兜底 → 三信号比对恒
-        // false，表现为「每次切该账号都 30s 超时（黄标）」
         expect_uid = std::fs::read_to_string(&meta_file)
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
-            .and_then(|m| {
-                m.get("uid")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            });
+            .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
     }
     if expect_uid.is_none() {
         expect_uid = sess.bootstrap_uid.clone();
@@ -1268,7 +1270,7 @@ fn confirm_switch_inner(
             "verify",
             StepStatus::Info,
             &format!(
-                "{} 数据目录无登录快照（storage/skeleton 不存在），改以客户端实际重写信号确认（auth 重写或 vscdb 更新，静默不动不算确认）",
+                "{} 数据目录无登录快照（storage\\skeleton 不存在），改以客户端实际重写信号确认（auth 重写或 vscdb 更新，静默不动不算确认）",
                 sess.prof.app_name
             ),
         );
@@ -1485,11 +1487,7 @@ fn newest_log_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
 }
 
 /// 本次启动对应的日志文件（只认启动时间之后写过的，避免读到上一次运行的登出记录）：
-/// - WorkBuddy：`logs/<日期>/workbuddyMainThread__*.log`（目录按天取最新文件；主线程
-///   日志跨启动累积于同一文件（见 confirm_switch 早判禁用注释），启动初期尾部可能仍是
-///   上一次运行的内容——晚判（30 秒超时后）依赖该窗口内客户端启动产生的大量追加把
-///   旧记录挤出尾读窗口，极端空闲场景存在残余误判面，但归因仅影响提示文案的
-///   红/黄分级，无破坏性副作用）；
+/// - WorkBuddy：`logs/<日期>/workbuddyMainThread__*.log`（目录按天，文件按启动，不能按目录取最新）；
 /// - CodeBuddy：`logs/<YYYYMMDDTHHMMSS>/main.log` + 该会话目录下最新若干插件日志。
 fn launch_log_files(logs_root: &Path, not_before: Option<std::time::SystemTime>) -> Vec<PathBuf> {
     let fresh = |m: std::time::SystemTime| not_before.map(|b| m >= b).unwrap_or(true);
@@ -1584,11 +1582,10 @@ fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressS
     for _ in 0..3 {
         std::thread::sleep(Duration::from_secs(2));
         let raw = crate::fs_utils::read_json::<serde_json::Value>(&live_file);
-        // trim 对齐 slot_held_uid/live_login_uid 的口径：尾随空白会让两侧比对失配
         let uid = crate::fs_utils::dig(&raw, &["genie.userId"])
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         if !uid.is_empty() {
             if uid == expect_uid {
                 sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
@@ -1647,9 +1644,16 @@ mod tests {
     }
 
     /// Session 构造：auth 路径注入临时目录（不触碰真实 auth 文件），
-    /// 目录名由 test_temp_dir 计数器保证唯一，先清再建
+    /// 目录含纳秒级后缀（Windows pid 可复用，防上次运行残留互踩），先清再建
     fn session(app: TargetApp, tag: &str) -> Session {
-        let data = crate::fs_utils::test_temp_dir(&format!("sw-auth-{tag}"));
+        let data = std::env::temp_dir().join(format!(
+            "sw-auth-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&data);
         let mut args = RunArgs {
             action: Action::Switch,
@@ -1675,7 +1679,14 @@ mod tests {
     #[test]
     fn auth_file_uid_四键兼容() {
         let _guard = test_io_lock();
-        let base = crate::fs_utils::test_temp_dir("sw-authuid");
+        let base = std::env::temp_dir().join(format!(
+            "sw-authuid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
         std::fs::create_dir_all(&base).unwrap();
         let p = base.join("auth.info");
         for (content, want) in [
@@ -1789,50 +1800,6 @@ mod tests {
         assert!(
             !slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
             "skeleton 身份不符时不得写入 auth 文件"
-        );
-        let _ = std::fs::remove_dir_all(&sess.data_dir);
-    }
-
-    /// 2026-11-02 合并审查修复回归：存量 CodeBuddy 槽 meta.uid 被 WorkBuddy uid
-    /// 污染（2026-10-25 实测），槽内 vscdb 登录态完好——槽位身份守卫必须按
-    /// slot_held_uid（槽内 genie.userId 优先）而非 meta.uid 判定：守卫放行备份，
-    /// meta 随之自愈为 live 身份；账号列表也不再误标「快照不可用」。
-    #[test]
-    fn codebuddy槽身份按槽内genie判定而非被污染的meta() {
-        let _guard = test_io_lock();
-        let mut sess = session(TargetApp::CodeBuddy, "cb-genie-held");
-        let sink = QuietSink;
-        // live 现场：genie.userId = uid-cb（登录真源；storage.json 为平铺键
-        // "genie.userId"，dig 按字面键查找）；共享 auth 文件被 WorkBuddy
-        // 侧覆盖成 uid-wb（CB 系仅作 live_login_uid 兜底，真源可用时不参与判定）
-        let gs = sess.data_dir.join("fake-gs");
-        sess.prof.cb_global_storage_dir = Some(gs.clone());
-        std::fs::create_dir_all(&gs).unwrap();
-        std::fs::write(gs.join("storage.json"), r#"{"genie.userId":"uid-cb"}"#).unwrap();
-        std::fs::create_dir_all(&sess.auth_dir).unwrap();
-        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"uid-wb"}}"#).unwrap();
-
-        // 槽位：meta.uid 被污染成 uid-wb，但槽内 vscdb/storage.json 登录态完好（uid-cb）
-        let slot = "100";
-        let slot_dir = sess.prof.profiles_dir.join(slot);
-        std::fs::create_dir_all(slot_dir.join("vscdb")).unwrap();
-        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-wb"}"#).unwrap();
-        std::fs::write(
-            slot_dir.join("vscdb").join("storage.json"),
-            r#"{"genie.userId":"uid-cb"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(slot_held_uid(&slot_dir, true).as_deref(), Some("uid-cb"));
-        backup_authfile(&sess, slot, &sink).unwrap();
-        assert!(
-            slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
-            "槽内 genie 与 live 一致时应放行备份（不得按污染 meta 误拦）"
-        );
-        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
-        assert!(
-            meta.contains("uid-cb"),
-            "备份放行后 meta 应自愈为 live 身份：{meta}"
         );
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }

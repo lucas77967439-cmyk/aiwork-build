@@ -13,7 +13,6 @@ import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { maskApiKey } from '../../lib/format';
-import { withMinDelay } from '../../lib/delay';
 import type { CustomModel } from '../../types';
 
 /** 新建/编辑表单初值（新增时 id 留空由后端生成 cm- id） */
@@ -79,10 +78,6 @@ export default function CustomModelsPanel({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 熔断状态快照（P3 可观测）：cm.id → 剩余冷却秒
   const [circuits, setCircuits] = useState<Map<string, number>>(new Map());
-  // 启用/禁用进行中的条目 id（防连点：整条 upsert 写回与编辑弹框并发会互相覆盖）
-  const [togglingId, setTogglingId] = useState<string | null>(null);
-  // 删除确认进行中（防连点重复删除请求）
-  const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -212,15 +207,12 @@ export default function CustomModelsPanel({
     if (!ok) return;
     setSaving(true);
     try {
-      const next = await withMinDelay(
-        api.apiServer.customModelsSave({
-          ...form,
-          name: form.name.trim(),
-          base_url: form.base_url.trim(),
-          vendor: form.vendor.trim(),
-        }),
-        1000,
-      );
+      const next = await api.apiServer.customModelsSave({
+        ...form,
+        name: form.name.trim(),
+        base_url: form.base_url.trim(),
+        vendor: form.vendor.trim(),
+      });
       setModels(next);
       closeForm();
       toast('success', form.id ? `模型「${form.name}」已更新` : `模型「${form.name}」已添加`);
@@ -231,38 +223,27 @@ export default function CustomModelsPanel({
     }
   };
 
-  /** 启用/禁用开关（整条 upsert 保存；withMinDelay + 单飞防连点——v3 写回
-   * 携带 weight/standby 全量字段，与编辑弹框并发覆盖风险高于单字段时代） */
+  /** 启用/禁用开关（整条 upsert 保存） */
   const toggleEnabled = async (m: CustomModel) => {
-    if (togglingId != null) return;
-    setTogglingId(m.id);
     try {
-      const next = await withMinDelay(
-        api.apiServer.customModelsSave({ ...m, enabled: !m.enabled }),
-        1000,
-      );
+      const next = await api.apiServer.customModelsSave({ ...m, enabled: !m.enabled });
       setModels(next);
       toast('success', `模型「${m.name}」已${m.enabled ? '禁用' : '启用'}`);
     } catch (e) {
       toast('error', `状态更新失败：${String(e).slice(0, 120)}`);
-    } finally {
-      setTogglingId(null);
     }
   };
 
   const confirmDelete = async () => {
-    if (!deleteFor || deleting) return;
+    if (!deleteFor) return;
     const m = deleteFor;
-    setDeleting(true);
+    setDeleteFor(null);
     try {
-      await withMinDelay(api.apiServer.customModelsRemove(m.id), 1000);
+      await api.apiServer.customModelsRemove(m.id);
       setModels((prev) => prev.filter((x) => x.id !== m.id));
-      setDeleteFor(null);
       toast('success', `模型「${m.name}」已删除`);
     } catch (e) {
       toast('error', `删除失败：${String(e).slice(0, 120)}`);
-    } finally {
-      setDeleting(false);
     }
   };
 
@@ -325,8 +306,7 @@ export default function CustomModelsPanel({
       <td className="py-2">
         <div className="flex items-center gap-1">
           <button
-            className="btn-ghost !p-1.5 disabled:opacity-40"
-            disabled={togglingId != null}
+            className="btn-ghost !p-1.5"
             title={m.enabled ? '禁用（禁用后该模型名回落 Trae/Buddy/Qoder 调度）' : '启用'}
             onClick={() => void toggleEnabled(m)}
           >
@@ -611,17 +591,13 @@ export default function CustomModelsPanel({
       {/* 删除确认弹框（禁 window.confirm，红线） */}
       <Modal
         open={deleteFor != null}
-        onClose={() => { if (!deleting) setDeleteFor(null); }}
+        onClose={() => setDeleteFor(null)}
         title="删除自定义模型"
         footer={
           <>
-            <button className="btn-outline" disabled={deleting} onClick={() => setDeleteFor(null)}>取消</button>
-            <button
-              className="btn-primary !bg-rose-600 hover:!bg-rose-500 disabled:opacity-60"
-              disabled={deleting}
-              onClick={() => void confirmDelete()}
-            >
-              {deleting ? '删除中…' : '确认删除'}
+            <button className="btn-outline" onClick={() => setDeleteFor(null)}>取消</button>
+            <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={() => void confirmDelete()}>
+              确认删除
             </button>
           </>
         }

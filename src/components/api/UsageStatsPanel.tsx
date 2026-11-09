@@ -48,7 +48,7 @@ const FILTER_LABELS: Record<PoolFilter, string> = {
 };
 
 /** 同名计数器合并（模型/账号/Key 维度通用） */
-export function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCounterView[] {
+function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCounterView[] {
   const map = new Map<string, UsageCounterView>();
   for (const c of [...a, ...b]) {
     const e = map.get(c.name);
@@ -65,7 +65,7 @@ export function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): Usa
 }
 
 /** 按 Key 的 token 用量合并 */
-export function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKeyTokenView[] {
+function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKeyTokenView[] {
   const map = new Map<string, UsageKeyTokenView>();
   for (const t of [...a, ...b]) {
     const e = map.get(t.name);
@@ -80,7 +80,7 @@ export function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): 
 }
 
 /** 两条日记录合并（avg_duration 按请求数加权；TTFT 按样本数加权） */
-export function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
+function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
   const total = a.total_requests + b.total_requests;
   const ttfbSamples = (a.ttfb_samples ?? 0) + (b.ttfb_samples ?? 0);
   const avgTtfb =
@@ -99,7 +99,6 @@ export function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
     stream_requests: a.stream_requests + b.stream_requests,
     prompt_tokens: a.prompt_tokens + b.prompt_tokens,
     completion_tokens: a.completion_tokens + b.completion_tokens,
-    // 缓存读 tokens 跨桶求和（3.8.5 审查 M-B1：此前静默丢失该字段，契约漂移）
     cached_tokens: (a.cached_tokens ?? 0) + (b.cached_tokens ?? 0),
     credits: a.credits + b.credits,
     original_credits: a.original_credits + b.original_credits,
@@ -124,19 +123,19 @@ export function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
 }
 
 /** 可选数值取较大者（P95/最大值跨桶合并取保守值） */
-export function maxOpt(a?: number, b?: number): number | undefined {
+function maxOpt(a?: number, b?: number): number | undefined {
   if (a == null && b == null) return undefined;
   return Math.max(a ?? 0, b ?? 0);
 }
 
 /** 多日可选 P95 取最大值（跨天聚合取保守值） */
-export function maxOptList(values: (number | undefined)[]): number | undefined {
+function maxOptList(values: (number | undefined)[]): number | undefined {
   const vs = values.filter((v): v is number => v != null);
   return vs.length > 0 ? Math.max(...vs) : undefined;
 }
 
 /** 按模型的延迟分位合并（F-76①） */
-export function mergeModelLatency(
+function mergeModelLatency(
   a: UsageModelLatencyView[] = [],
   b: UsageModelLatencyView[] = [],
 ): UsageModelLatencyView[] {
@@ -158,7 +157,7 @@ export function mergeModelLatency(
 }
 
 /** 多桶按日合并（同日相加），按日期升序 */
-export function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
+function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
   const map = new Map<string, UsageDayView>();
   for (const bucket of buckets) {
     for (const d of bucket) {
@@ -170,13 +169,13 @@ export function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
 }
 
 /** 本地日 YYYY-MM-DD（custom 会话明细区间端点） */
-export function localDateStr(dt: Date): string {
+function localDateStr(dt: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
 }
 
 /** 当日时刻 HH:MM:SS（custom 会话明细行时间列，自然日已在会话行体现） */
-export function fmtClock(ts: number): string {
+function fmtClock(ts: number): string {
   const d = new Date(ts * 1000);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -191,37 +190,27 @@ export default function UsageStatsPanel() {
   const [customUsage, setCustomUsage] = useState<UsageDayView[]>([]);
   const [qoderUsage, setQoderUsage] = useState<UsageDayView[]>([]);
   const [loading, setLoading] = useState(false);
-  // M9 修复（审查 L30）：加载序号门控——快速切换 7/14/30 天时并发 load 的旧响应
-  // 可能晚于新响应到达，用序号门控：响应到达时仅当仍是最新一次发起才 setState，
-  // 防止旧数据覆盖新结果
+  // 审查修复（L30）：快速切换 7/14/30 天时并发 load 的旧响应可能晚于新响应到达，
+  // 用序号门控：响应到达时仅当仍是最新一次发起才 setState，防止旧数据覆盖新结果
   const loadSeqRef = useRef(0);
-
-  // 五桶统计加载失败数（审查 M：`.catch(()=>[])` 吞错把「查询失败」伪装成「暂无
-  // 数据」——对齐同文件 sessError「失败不得伪装成空数据」口径。全部失败 → 错误态；
-  // 部分失败且无数据 → 空态文案注明失败源数）
-  const [loadFailedCount, setLoadFailedCount] = useState(0);
 
   const load = async (d: number) => {
     const seq = ++loadSeqRef.current;
     setLoading(true);
-    setLoadFailedCount(0);
     try {
-      const results = await Promise.allSettled([
-        api.apiServer.usageStats(d),
-        api.apiServer.wbUsageStats(d),
-        api.apiServer.buddyAiUsageStats(d),
-        api.apiServer.customUsageStats(d),
-        api.apiServer.qoderUsageStats(d),
+      const [trae, buddy, buddyAi, custom, qoder] = await Promise.all([
+        api.apiServer.usageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.wbUsageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.buddyAiUsageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.customUsageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.qoderUsageStats(d).catch(() => [] as UsageDayView[]),
       ]);
       if (seq !== loadSeqRef.current) return;
-      const ok = (r: PromiseSettledResult<UsageDayView[]>): UsageDayView[] =>
-        r.status === 'fulfilled' ? r.value : [];
-      setLoadFailedCount(results.filter((r) => r.status === 'rejected').length);
-      setTraeUsage(ok(results[0]));
-      setBuddyUsage(ok(results[1]));
-      setBuddyAiUsage(ok(results[2]));
-      setCustomUsage(ok(results[3]));
-      setQoderUsage(ok(results[4]));
+      setTraeUsage(trae);
+      setBuddyUsage(buddy);
+      setBuddyAiUsage(buddyAi);
+      setCustomUsage(custom);
+      setQoderUsage(qoder);
     } finally {
       if (seq === loadSeqRef.current) setLoading(false);
     }
@@ -268,18 +257,18 @@ export default function UsageStatsPanel() {
     setSessLoading(true);
     try {
       const end = localDateStr(new Date());
-      // 起点用日历回退（setDate）而非毫秒减法（3.8.5 审查 L5）：跨 DST 边界时
-      // 86400000*d 不等于 d 个自然日，毫秒偏移会把起点错推一天
+      // 起点用日历回退（setDate）而非毫秒减法：跨 DST 边界时 86400000*d 不等于
+      // d 个自然日，毫秒偏移会把起点错推一天
       const startDt = new Date();
       startDt.setDate(startDt.getDate() - (d - 1));
       const start = localDateStr(startDt);
       const r = await api.apiServer.customSessionsQuery({ start, end, page: p, pageSize: 20 });
       if (seq === sessSeqRef.current) {
         setSessData(r);
-        // 后端越界页夹取后回写实际页码（审查 L4）：否则本地 state 与实际页码
-        // 分叉、分页器停留在越界页展示与数据错位，下次切天数仍以旧页发起
-        setSessPage(r.page);
         setSessError(null);
+        // 后端对越界页夹取后回写实际页码（审查 Low）：否则分页器停留在
+        // 越界页，展示与数据错位（回写触发一次收敛性重取）
+        if (r.page !== p) setSessPage(r.page);
       }
     } catch (err) {
       if (seq === sessSeqRef.current) {
@@ -476,7 +465,7 @@ export default function UsageStatsPanel() {
           label="总请求数"
           value={summary.requests}
           tone="brand"
-          hint={`近 ${days} 天 · ${filterHint}${loadFailedCount > 0 ? ` · ${loadFailedCount} 源加载失败` : ''}`}
+          hint={`近 ${days} 天 · ${filterHint}`}
         />
         <StatCard
           label="成功率"
@@ -534,16 +523,8 @@ export default function UsageStatsPanel() {
             </BarChart>
           </ResponsiveContainer>
         </div>
-      ) : loadFailedCount === 5 ? (
-        // 五桶全部失败：不得伪装成空态引导（与 custom 明细 sessError 同口径）
-        <p className="py-6 text-center text-sm text-rose-500">
-          用量统计加载失败（5 个数据源均未响应）——请检查 API 服务状态后点「刷新数据」重试
-        </p>
       ) : (
         <p className="py-6 text-center text-sm text-slate-400">
-          {loadFailedCount > 0
-            ? `${loadFailedCount} 个数据源加载失败，以下仅展示成功源（点「刷新数据」重试）· `
-            : ''}
           暂无请求数据 — 发起一次 API 调用后这里会展示按日趋势（{filterHint}）
         </p>
       )}
@@ -741,7 +722,7 @@ export default function UsageStatsPanel() {
                             <td colSpan={6} className="px-2 py-2">
                               {detailError ? (
                                 <p className="py-1 text-center text-xs text-rose-600 dark:text-rose-400">
-                                  会话明细加载失败 — 请重试（点击其他行后再点回本行可重新加载）
+                                  明细加载失败，请点击该行重试
                                 </p>
                               ) : detail === null ? (
                                 <p className="py-1 text-center text-xs text-slate-400">加载明细中…</p>
@@ -757,9 +738,7 @@ export default function UsageStatsPanel() {
                                       <span
                                         className={cn(
                                           'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
-                                          // 失败判定用结构化字段（3.8.5 审查 L6）；
-                                          // 旧后端无该字段时回退字符串耦合保持兼容
-                                          (d.failed ?? d.mode.includes('失败'))
+                                          d.mode.includes('失败')
                                             ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
                                             : d.mode === '工具轮'
                                               ? 'bg-violet-500/10 text-violet-600 dark:text-violet-400'

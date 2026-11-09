@@ -5,9 +5,9 @@
  *     当前命中组合高亮（Qoder 与 Trae/Buddy 同等参与池间调度，默认序尾部可上移；
  *     BuddyAI 国际池由后端对缺失池自动补尾参与候选序）；
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
- *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）/
- *     Qoder（qoder_strategy，空 = 跟随 Trae 池）/ BuddyAI 国际（buddy_ai_strategy，
- *     空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
+ *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 加权公平轮转，
+ *     WB 专属默认；PR #187）/ Qoder（qoder_strategy，空 = 跟随 Trae 池）/
+ *     BuddyAI 国际（buddy_ai_strategy，空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
  *     上游开关与池成员在各应用「资源调度」页维护。
  * 下方为 Trae / Buddy / Qoder / BuddyAI 国际 / 自定义 五池摘要卡；前四者详情引导至
  * 各应用「资源调度」页，自定义池详情引导至「自定义模型」Tab。
@@ -44,8 +44,26 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
+/** 未入池账号提示行（issue #186）：账号总数 > 池内账号数时展示差额，
+ *  提示存在账号未勾选入池、被分组/标签筛选拦截或无凭证/已停用——此前该状态
+ *  只在各池「资源调度」页可见，调度 503 时用户无从对应（摘要卡仅提示，明细见
+ *  各池详情页）。文案为四池通用口径：Trae 账号无无凭证/停用维度，该半句恒不触发 */
+function UnpooledRow({ total, pooled }: { total: number; pooled: number }) {
+  if (total <= pooled) return null;
+  return (
+    <Row
+      label="未入池账号"
+      value={
+        <span className="text-amber-600 dark:text-amber-400">
+          {total - pooled} 个（未勾选入池、被分组/标签筛选拦截，或无凭证/已停用）
+        </span>
+      }
+    />
+  );
+}
+
 /** 池内调度策略取值（Trae / Buddy 同一套，pool.rs PoolStrategy） */
-const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c'] as const;
+const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c', 'fair_rotation'] as const;
 
 /** 池内调度策略文案（与账号池选择下拉一致） */
 const STRATEGY_LABELS: Record<string, string> = {
@@ -54,6 +72,7 @@ const STRATEGY_LABELS: Record<string, string> = {
   random: '随机',
   weighted: '三因子加权随机',
   p2c: 'P2C 随机二选一',
+  fair_rotation: '加权公平轮转',
 };
 
 const POOL_LABELS: Record<string, string> = {
@@ -114,7 +133,7 @@ function DispatchCenterCard({
   // 账号保留剩余积分（issue #91）输入草稿：null = 未编辑（展示 policy 生效值），
   // onBlur 才落盘。审查 F14 修复：改存原始字符串——旧实现 Number('')=0 使「清空
   // 重输」直接跳 0，误失焦即静默保存 0（=关闭调度保护）；现空串/非法输入失焦时
-  // 还原策略值不落盘，合法数值才提交（保存侧 fail-closed，无失焦抢跑钳制）
+  // 还原策略值不落盘，合法整数才提交（保存侧 fail-closed，无失焦抢跑钳制）
   const [reserveDraft, setReserveDraft] = useState<string | null>(null);
   // F2：保存请求序号守卫（仅最新一次响应可写状态）
   const saveSeqRef = useRef(0);
@@ -173,11 +192,10 @@ function DispatchCenterCard({
         patch.buddy,
       );
       if (seq === saveSeqRef.current) {
-        // 审查修复（H3 / H-3 伴生修复）：保存成功后回读后端最新池配置刷新父级状态
-        // （poolSet 的 uids/group_ids 参数为页面加载时的旧快照，弹窗常驻期间他端改过
-        // 的池配置会被旧快照静默回退，原先仅做本地合并无法感知；Qoder/Buddy 页同款
-        // 修复）。回读失败时退回本地合并（仅覆盖本次修改维度），保证 UI 至少反映本次
-        // 保存结果；回读 await 后复检 seq，乱序的旧回读响应不得覆盖新保存
+        // 审查修复（H3）：保存成功后回读后端最新池配置刷新父级状态（poolSet 的
+        // uids/group_ids 参数为页面加载时的旧快照，其他端改过的池配置会被旧快照
+        // 静默回退，原先仅做本地合并无法感知）。回读失败时退回本地合并（仅覆盖
+        // 本次修改维度），保证 UI 至少反映本次保存结果
         const latest = await api.apiServer.poolList().catch(() => null);
         if (seq === saveSeqRef.current) {
           if (latest) {
@@ -563,7 +581,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ buddy: e.target.value })}
               >
-                <option value="">跟随 Trae 池</option>
+                <option value="">加权公平轮转（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -686,19 +704,17 @@ export default function ResourceSummary() {
     buddyAiAccounts,
     tags,
   );
-  // Buddy 池内策略文案：空 = 跟随 Trae 池（展示 Trae 当前生效策略）
+  // Buddy 池内策略文案：空 = 加权公平轮转（WB 专属默认，PR #187；改前为跟随 Trae 池）
   const buddyStrategyText = pool?.wb_strategy
     ? (STRATEGY_LABELS[pool.wb_strategy] ?? pool.wb_strategy)
-    : pool?.strategy
-      ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
-      : '—';
-  // Qoder 池内策略文案：空 = 跟随 Trae 池（同 Buddy 语义）
+    : '加权公平轮转（默认）';
+  // Qoder 池内策略文案：空 = 跟随 Trae 池（Qoder/BuddyAI 不改默认，维持既有语义）
   const qoderStrategyText = pool?.qoder_strategy
     ? (STRATEGY_LABELS[pool.qoder_strategy] ?? pool.qoder_strategy)
     : pool?.strategy
       ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
       : '—';
-  // BuddyAI 国际池内策略文案：空 = 跟随 Trae 池（同 Buddy/Qoder 语义）
+  // BuddyAI 国际池内策略文案：空 = 跟随 Trae 池（同 Qoder 语义）
   const buddyAiStrategyText = pool?.buddy_ai_strategy
     ? (STRATEGY_LABELS[pool.buddy_ai_strategy] ?? pool.buddy_ai_strategy)
     : pool?.strategy
@@ -737,6 +753,7 @@ export default function ResourceSummary() {
             }
           />
           <Row label="账号总数" value={metrics.traeAccountTotal} />
+          <UnpooledRow total={metrics.traeAccountTotal} pooled={metrics.traePoolCount} />
           <Row
             label="积分总余额"
             value={
@@ -778,6 +795,7 @@ export default function ResourceSummary() {
             }
           />
           <Row label="账号总数" value={metrics.buddyAccountTotal} />
+          <UnpooledRow total={metrics.buddyAccountTotal} pooled={metrics.buddyPoolCount} />
           <Row
             label="积分总余额"
             value={
@@ -817,6 +835,7 @@ export default function ResourceSummary() {
             }
           />
           <Row label="账号总数" value={metrics.qoderAccountTotal} />
+          <UnpooledRow total={metrics.qoderAccountTotal} pooled={metrics.qoderPoolCount} />
           <Row
             label="积分总余额"
             value={
@@ -856,6 +875,7 @@ export default function ResourceSummary() {
             }
           />
           <Row label="账号总数" value={metrics.buddyAiAccountTotal} />
+          <UnpooledRow total={metrics.buddyAiAccountTotal} pooled={metrics.buddyAiPoolCount} />
           <Row
             label="积分总余额"
             value={

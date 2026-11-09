@@ -162,8 +162,8 @@ export default function QoderCheckin() {
           </div>
         </div>
         <p className="mt-3 text-xs text-slate-400">
-          调度默认每天 10:15 自动执行一次（此时两项活动都已开放）；应用内 Rust 调度器驱动，
-          时刻可在环境配置修改。已领过的账号自动跳过，重复执行不会重复领取。
+          调度默认每天 10:15 自动执行一次（此时两项活动都已开放）；支持应用内定时与 Windows
+          计划任务双轨，时刻可在环境配置修改。已领过的账号自动跳过，重复执行不会重复领取。
         </p>
       </div>
 
@@ -260,9 +260,17 @@ export default function QoderCheckin() {
             {running ? (
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
-              <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
+              <Badge
+                tone={doneInfo.failed - doneInfo.empty > 0 || doneInfo.blocked > 0 ? 'amber' : 'green'}
+                title={
+                  doneInfo.blocked > 0
+                    ? '「风控拦截」恢复需用户操作：在工具内切换到该账号后打开 Qoder 客户端使用一次建立信任，再手动重试（issue #190）'
+                    : undefined
+                }
+              >
                 完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
                 {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
+                {doneInfo.blocked > 0 && `（含 ${doneInfo.blocked} 项风控拦截）`}
                 {earned > 0 && ` · 获得 ${earned} Credits`}
               </Badge>
             ) : null}
