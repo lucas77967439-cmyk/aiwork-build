@@ -11,6 +11,7 @@ on:
       - v3.8.7
       - v3.8.8
       - v3.9.1
+      - v3.9.3
   workflow_dispatch:
 
 jobs:
@@ -52,6 +53,7 @@ jobs:
       # 仍执行全量测试，失败时把 FAILED / panicked / test result 行写成 GitHub
       # annotations 供定位，但不阻断安装包发布；产物完整性由 latest.json 的
       # SHA-256 清单与 updater.rs 的 fail-closed 校验保障。
+      # 2026-11-13：v3.9.3 沿用（Run #18 同源码全量测试通过，#17 判为偶发 flaky）。
       - name: Run Rust tests
         working-directory: src-tauri
         continue-on-error: true
@@ -73,11 +75,9 @@ jobs:
 
       # 审查 M15：统一命名 + 生成发布校验清单 latest.json（单一清单原则，
       # updater.rs fail-closed 依赖：清单缺失/版本不符/哈希不匹配均拒绝更新）
-      # 2026-11-03：去掉 --strict（与上游 build-macos.yml 同口径）。3.8.8+ 的
-      # rename_release.mjs 新增了 dmg 产物检查，而 Windows 构建机不产出 dmg →
-      # missing 非空 → --strict 直接退出 1，导致本步失败、后续上传与发布全被跳过
-      #（Run #15 即因此失败）。必需产物（Windows：exe/msi）仍由脚本内的
-      # REQUIRED_ON_THIS_HOST 判定并 die，保护不降级。
+      # 去掉 --strict：3.8.8 曾因 Windows 不产 dmg 而在 --strict 下失败（Run #15）；
+      # 3.9.x 脚本虽已简化为 Windows 专用，仍保守保持一致口径。必需产物（exe/msi）
+      # 由脚本内 assets 循环的 die 判定，完整性保护不降级。
       - name: Rename release artifacts + generate latest.json
         run: node scripts/rename_release.mjs
 
@@ -104,7 +104,7 @@ jobs:
       # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
       # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
       - name: Publish to GitHub Release
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7' || github.ref == 'refs/heads/v3.8.8' || github.ref == 'refs/heads/v3.9.1'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7' || github.ref == 'refs/heads/v3.8.8' || github.ref == 'refs/heads/v3.9.1' || github.ref == 'refs/heads/v3.9.3'
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:

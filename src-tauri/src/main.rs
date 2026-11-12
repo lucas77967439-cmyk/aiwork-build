@@ -18,6 +18,7 @@ mod switcher;
 mod tasks;
 mod vault;
 mod api_server;
+mod workbuddy_atrest;
 mod workbuddy_cli;
 
 use state::AppState;
@@ -399,6 +400,7 @@ fn main() {
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
+            commands::api_server::api_logs_recent,
             commands::api_server::api_debug_toggle,
             commands::api_server::api_debug_status,
             commands::api_server::api_models_list,
@@ -498,6 +500,7 @@ fn main() {
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
+            commands::updater::update_auto_tick,
             commands::workbuddy::workbuddy_env_check,
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,

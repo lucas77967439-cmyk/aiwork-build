@@ -22,11 +22,19 @@
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+
+// 审查修复（M-6，下载 URL 单前缀锚）：download_url 经 IPC 由前端传入，被注入的
+// webview 可传攻击者 URL + 自供 sha256 绕过域校验走完三道闸（下载并安装恶意包）。
+// 下载地址仅接受官方 GitHub Releases 资产直链前缀，校验单点收口于 update_download
+// （update_check 返回的 download_url 来自 GitHub API 受信来源，天然命中前缀；
+// 自动更新路径 update_auto_tick 内部走同一函数，无需重复校验）
+const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/smart-open/TraeWorkAssistant/releases/download/";
 
 /// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
@@ -502,6 +510,43 @@ fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64
     Ok(asset_ver)
 }
 
+/// 审查修复（M-6）：下载地址信任判定——仅接受官方 GitHub Releases 资产直链前缀。
+/// 独立成函数便于单测（update_download 依赖 AppHandle/网络，难以直测）。
+fn is_trusted_download_url(url: &str) -> bool {
+    url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+}
+
+/// 审查修复（M-6 收口）：下载地址形态交叉校验——前缀闸只保证「官方 Releases 域名
+/// 直链」，未校验 tag 与资产归属：同仓库历史 release 均落受信前缀（含 2.x 产品线
+/// 安装包），可被指向旧资产降级。此处解析前缀剩余段 `<tag>/<资产文件名>`：
+/// tag 必须与目标版本一致（兼容 "v3.8.2"/"3.8.2" 两形态——GitHub tag 带 v 前缀，
+/// expected_version 是 parse_version 剥离后的裸版本）、末段文件名必须与目标资产
+/// 一致、不得有多余路径段。独立成函数便于单测（同 is_trusted_download_url）。
+fn verify_release_identity(
+    url: &str,
+    expected_version: &str,
+    asset_name: &str,
+) -> Result<(), String> {
+    let rest = url
+        .strip_prefix(RELEASE_DOWNLOAD_PREFIX)
+        .ok_or_else(|| "下载地址不受信任（仅接受官方 GitHub Releases 资产）".to_string())?;
+    let mut segs = rest.split('/');
+    let tag = segs.next().unwrap_or("");
+    let file = segs.next().unwrap_or("");
+    if tag.is_empty() || file.is_empty() || segs.next().is_some() {
+        return Err("下载地址形态非法（应为 /releases/download/<tag>/<资产文件名>）".to_string());
+    }
+    if tag != expected_version && tag != format!("v{expected_version}") {
+        return Err(format!(
+            "下载地址版本与目标版本不一致（URL tag={tag}，目标 {expected_version}），已中止"
+        ));
+    }
+    if file != asset_name {
+        return Err("下载地址资产名与目标资产不一致，已中止".to_string());
+    }
+    Ok(())
+}
+
 /// 第一步：下载安装包到临时目录（不安装）。完成后前端确认，再调 update_run_installer。
 /// async 派发：下载耗时不可控（最坏 3 通道各连+读超时），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
@@ -513,6 +558,16 @@ pub fn update_download(
     expected_sha256: Option<String>,
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
+    // 审查修复（M-6）：前置信任校验——拒绝非官方前缀的下载地址（fail-closed），
+    // 不信任的地址绝不进入下载流程
+    if !is_trusted_download_url(&download_url) {
+        return Err("下载地址不受信任（仅接受官方 GitHub Releases 资产）".to_string());
+    }
+    // 审查修复（M-6 收口）：前缀命中后交叉校验 URL 形态——tag 与目标版本一致、
+    // 末段文件名与目标资产一致，闭合「受信前缀 + 任意旧 release 资产」降级面。
+    // update_check 返回的 download_url 天然命中（tag/资产同源 GitHub API 响应），
+    // 自动更新路径 update_auto_tick 走同一函数，无需重复校验
+    verify_release_identity(&download_url, &expected_version, &asset_name)?;
 
     // 审查修复（H4，闸①）：发布方摘要是强制闸门——None（存量旧 release 无清单无正文行）
     // 与格式非法同样拒绝下载，绝不放行无校验的安装包（原实现 None 直接跳过校验，
@@ -573,7 +628,18 @@ pub fn update_download(
             Ok(received) => {
                 // 完整性校验（闸②前半）：下载完成立即与发布方 SHA256 比对，不匹配删除文件并中止
                 // （防供应链篡改；expected 已在入口强制非空，无「跳过校验」路径）
-                let actual = file_sha256(&dest).unwrap_or_default();
+                // 审查修复（L-1）：IO 失败与哈希不匹配区分归因——原 unwrap_or_default
+                // 把读取失败折叠为「SHA256 不匹配/网络劫持」误导文案；两种情况均
+                // fail-closed 删除下载文件
+                let actual = match file_sha256(&dest) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(format!(
+                            "安装包完整性校验无法执行（读取失败），已删除下载文件：{e}"
+                        ));
+                    }
+                };
                 if actual != expected {
                     let _ = std::fs::remove_file(&dest);
                     return Err(format!(
@@ -714,8 +780,20 @@ pub fn update_run_installer(
         .filter(|h| is_sha256_hex(h))
         .ok_or("安装包校验文件损坏，已中止安装。请重新下载")?
         .to_ascii_lowercase();
-    let actual = file_sha256(path).unwrap_or_default();
+    // 审查修复（L-1）：IO 失败与哈希不匹配区分归因（原 unwrap_or_default 把读取
+    // 失败折叠为「文件被改动」）；两种情况均 fail-closed 删除安装包（原实现不匹配
+    // 时篡改文件仍残留磁盘）
+    let actual = match file_sha256(path) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(format!(
+                "安装包完整性校验无法执行（读取失败），已删除安装包：{e}"
+            ));
+        }
+    };
     if actual != expected {
+        let _ = std::fs::remove_file(path);
         return Err(
             "安装包完整性校验失败（SHA256 与下载时不一致），文件可能在下载后被改动，已中止安装。请重新下载"
                 .to_string(),
@@ -767,6 +845,103 @@ pub fn update_run_installer(
     // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
     let _ = app.exit(0);
     Ok(())
+}
+
+// ---------------- F-86：全自动静默更新编排（issue #175，设置默认关） ----------------
+
+/// 防重入闸：上一轮 tick 仍在下载/安装期间时跳过本轮（前端 2h 定时 + 此闸双保险）
+static AUTO_TICK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct AutoTickGuard;
+impl Drop for AutoTickGuard {
+    fn drop(&mut self) {
+        AUTO_TICK_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 无人值守更新编排结果（前端仅用于状态展示与日志，不参与决策）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAutoTickResult {
+    /// skipped_cli / skipped_disabled / busy / busy_gateway / no_update / error / installed
+    pub action: String,
+    pub detail: String,
+}
+
+/// F-86：无人值守更新编排——check → 空闲判定 → download → run_installer。
+/// 由前端每 2 小时定时触发；设置 `auto_update_silent` 默认关。
+/// **安全红线**：三道完整性闸（发布方 SHA256 强制、下载比对、安装前复验）全部
+/// 沿用既有 update_download / update_run_installer 路径，静默路径零绕过分支；
+/// CLI 任务进程（--task-run）永不参与自动更新（避免双进程竞争安装）。
+#[tauri::command(async)]
+pub fn update_auto_tick(
+    app: AppHandle,
+    state: State<'_, crate::state::AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<UpdateAutoTickResult, String> {
+    use std::sync::atomic::Ordering;
+    let r = |action: &str, detail: String| {
+        Ok(UpdateAutoTickResult { action: action.to_string(), detail })
+    };
+    // CLI 任务进程排除（GUI 前端定时器不会在 CLI 进程运行，双保险）
+    if std::env::args().nth(1).as_deref() == Some("--task-run") {
+        return r("skipped_cli", "CLI 任务进程不参与自动更新".into());
+    }
+    // 设置开关（默认关）
+    if !state.settings().auto_update_silent {
+        return r("skipped_disabled", "静默自动更新未开启".into());
+    }
+    // 防重入
+    if AUTO_TICK_BUSY.swap(true, Ordering::SeqCst) {
+        return r("busy", "上一轮自动更新仍在进行".into());
+    }
+    let _guard = AutoTickGuard;
+    // 空闲判定：网关在途请求为 0 才安装（未运行 / 状态锁中毒均视为空闲——
+    // 安装会退出本进程，仅在途请求会被中断，故只挡 inflight > 0）
+    match runtime.lock() {
+        Ok(guard) => {
+            if let Some(rt) = guard.as_ref() {
+                if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                    return r("busy_gateway", "网关存在在途请求，已推迟到下一轮".into());
+                }
+            }
+        }
+        Err(_) => { /* 状态锁中毒：按空闲继续（安装即退出，无中断面） */ }
+    }
+    // ① 检查（网络失败归 error，不 Err——避免前端定时器持续报未捕获错误）
+    let chk = match update_check() {
+        Ok(c) => c,
+        Err(e) => return r("error", format!("检查更新失败：{e}")),
+    };
+    if !chk.has_update {
+        return r("no_update", format!("已是最新版本 {}", chk.current_version));
+    }
+    // ② 下载（三道闸前两道在此路径内）
+    let dl = match update_download(
+        app.clone(),
+        chk.download_url.clone(),
+        chk.asset_name.clone(),
+        chk.latest_version.clone(),
+        chk.sha256.clone(),
+    ) {
+        Ok(d) => d,
+        Err(e) => return r("error", format!("下载 {} 失败：{e}", chk.latest_version)),
+    };
+    // 审查修复 P3：安装前二次空闲判定——下载耗时分钟级，期间新进的在途请求
+    // 会被安装重启中断；把竞态窗口从整个下载时长压缩到判定→安装的毫秒级。
+    // 本轮放弃的安装包留在更新缓存，下一轮/手动更新直接覆盖复用
+    if let Ok(rt_guard) = runtime.lock() {
+        if let Some(rt) = rt_guard.as_ref() {
+            if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                return r("busy_gateway", "下载完成但网关出现新的在途请求，已推迟安装到下一轮".into());
+            }
+        }
+    }
+    // ③ 安装（第三道闸 + /R 装完自动重启；成功路径 emit update-installing 后进程退出）
+    match update_run_installer(app.clone(), dl.file_path, dl.asset_name) {
+        Ok(()) => r("installed", format!("已启动 {} 安装，应用将自动重启", dl.version)),
+        Err(e) => r("error", format!("安装失败：{e}")),
+    }
 }
 
 #[cfg(test)]
@@ -903,5 +1078,57 @@ mod tests {
         let text = r#"{ "version": "3.2.9", "assets": {} }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
+    }
+
+    /// M-6：下载 URL 单前缀锚——仅接受官方 GitHub Releases 资产直链
+    #[test]
+    fn download_url_prefix_gate() {
+        assert!(is_trusted_download_url(
+            "https://github.com/smart-open/TraeWorkAssistant/releases/download/v3.8.2/AI.Work._3.8.2_x64-setup.exe"
+        ));
+        // 非 https / 非官方域名 / 错仓库 / 错路径形态 / 空串一律拒绝
+        for bad in [
+            "http://github.com/smart-open/TraeWorkAssistant/releases/download/v1/x.exe",
+            "https://evil.com/smart-open/TraeWorkAssistant/releases/download/v1/x.exe",
+            "https://github.com/smart-open/OtherRepo/releases/download/v1/x.exe",
+            "https://github.com/smart-open/TraeWorkAssistant/releases/expanded_assets/v1",
+            "",
+        ] {
+            assert!(!is_trusted_download_url(bad), "须拒绝: {bad:?}");
+        }
+    }
+
+    /// M-6 收口：URL 形态交叉校验——tag 与目标版本一致、末段与目标资产一致
+    #[test]
+    fn download_url_identity_gate() {
+        let base = "https://github.com/smart-open/TraeWorkAssistant/releases/download/";
+        // 正常形态：tag 带 v 前缀 / 裸版本号两种均接受
+        for tag in ["v3.8.2", "3.8.2"] {
+            assert!(verify_release_identity(
+                &format!("{base}{tag}/AI Work 助手_3.8.2_x64-setup.exe"),
+                "3.8.2",
+                "AI Work 助手_3.8.2_x64-setup.exe",
+            )
+            .is_ok());
+        }
+        // tag 与目标版本不一致（旧 release 资产降级面）
+        assert!(verify_release_identity(
+            &format!("{base}v3.0.1/AI Work 助手_3.0.1_x64-setup.exe"),
+            "3.8.2",
+            "AI Work 助手_3.8.2_x64-setup.exe",
+        )
+        .is_err());
+        // URL 末段与目标资产不一致
+        assert!(verify_release_identity(
+            &format!("{base}v3.8.2/AI.Work._3.8.2_x64-setup.exe"),
+            "3.8.2",
+            "AI Work 助手_3.8.2_x64-setup.exe",
+        )
+        .is_err());
+        // 形态非法：缺文件名 / 多余路径段
+        assert!(verify_release_identity(&format!("{base}v3.8.2/"), "3.8.2", "x").is_err());
+        assert!(verify_release_identity(&format!("{base}v3.8.2/a/b.exe"), "3.8.2", "b.exe").is_err());
+        // 前缀不命中（独立调用时的兜底）
+        assert!(verify_release_identity("https://evil.com/x", "3.8.2", "x").is_err());
     }
 }
