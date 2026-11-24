@@ -484,7 +484,9 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(),
 
 /// billing/签到/刷新链路桌面端 UA 伪装：必须带版本号——裸 "WorkBuddy" 在
 /// 个人中心「请求明细」的客户端列识别为 "-"（issue #48 反馈的可检测特征）。
-pub const WB_DESKTOP_UA: &str = "WorkBuddy/5.5.6";
+/// 版本对齐当前真实桌面客户端（wb_upstream pe_version 实测 5.8.4）：
+/// 旧值 5.5.6 已是淘汰版本，与在网客户端主流版本偏离本身是弱风控特征（P4）。
+pub const WB_DESKTOP_UA: &str = "WorkBuddy/5.8.4";
 
 /// 账号级稳定设备指纹：sha256("wb-fingerprint:{kind}:{uid}") 前 16 字节 →
 /// 32 位小写十六进制。同账号恒定（虚拟设备稳定）、跨账号隔离（防关联）；
@@ -838,6 +840,22 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
     refresh_token_once_ex(agent, creds).0
 }
 
+/// expiresIn/refreshExpiresIn 秒数宽容解析（docker 审查第五/六轮收敛）：
+/// 数字或数字字符串；仅接受 0 < s < 10 年——负值/0 会算出过去时刻/立即过期的
+/// exp_ms 覆盖旧有效值（池恒过期、兜底续期每轮必刷），异常大值属字段漂移；
+/// 非法形态返回 None（调用方按「到期未知」盲区语义处理，不覆盖旧值）。
+pub fn expires_in_secs(v: &Value) -> Option<i64> {
+    const TEN_YEARS_SECS: i64 = 10 * 365 * 24 * 3600;
+    let s = v
+        .as_i64()
+        .or_else(|| v.as_str().and_then(|x| x.trim().parse::<i64>().ok()))?;
+    if s > 0 && s < TEN_YEARS_SECS {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 /// refresh_token_once 的带失败原因版本（审查 P1-4）。
 /// 第三元为 4xx 时的上游错误细节（issue #118，如 invalid_grant 及其描述；见 refresh_fail_detail）。
 pub fn refresh_token_once_ex(
@@ -878,8 +896,13 @@ pub fn refresh_token_once_ex(
     if !ref_tok.is_empty() {
         out.refresh_token = ref_tok;
     }
-    out.expires_at_ms = i_of(fs_utils::dig(&body, &["expiresIn"])).map(|e| now_ms + e * 1000);
-    out.refresh_expires_at_ms = i_of(fs_utils::dig(&body, &["refreshExpiresIn"]))
+    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移——
+    // 负值算出过去时刻的 exp_ms 覆盖旧有效值，池过期判定恒过期、兜底续期每轮必刷
+    out.expires_at_ms = fs_utils::dig(&body, &["expiresIn"])
+        .and_then(|v| expires_in_secs(&v))
+        .map(|e| now_ms + e * 1000);
+    out.refresh_expires_at_ms = fs_utils::dig(&body, &["refreshExpiresIn"])
+        .and_then(|v| expires_in_secs(&v))
         .map(|e| now_ms + e * 1000);
     (Some(out), RefreshFail::NoRefreshToken, None)
 }
@@ -906,6 +929,16 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
         fs_utils::app_log(
             &state.data_dir,
             &format!("wb: 账号 {acct_id} 已标记需重新登录（{reason}）"),
+        );
+        // issue #220 P3：状态跃迁主动告警（AccountState 事件；同账号同事件 24h
+        // 冷却防重——刷新重试每轮都置位也不会刷屏）。经全局句柄弹桌面通知 + 渠道
+        crate::notify::notify_account_state(
+            crate::notify::global_app(),
+            &state.data_dir,
+            acct_id,
+            "needs_relogin",
+            "WorkBuddy 账号需重新登录",
+            &format!("账号 {acct_id}：{reason}。请重新扫码登录，签到与网关取号已跳过该账号"),
         );
     }
 }

@@ -12,6 +12,7 @@ on:
       - v3.8.8
       - v3.9.1
       - v3.9.3
+      - v3.9.5
   workflow_dispatch:
 
 jobs:
@@ -53,7 +54,7 @@ jobs:
       # 仍执行全量测试，失败时把 FAILED / panicked / test result 行写成 GitHub
       # annotations 供定位，但不阻断安装包发布；产物完整性由 latest.json 的
       # SHA-256 清单与 updater.rs 的 fail-closed 校验保障。
-      # 2026-11-13：v3.9.3 沿用（Run #18 同源码全量测试通过，#17 判为偶发 flaky）。
+      # 2026-11-13/24：v3.9.3、v3.9.5 沿用（Run #18/#19 同源码全量测试通过，#17 判为偶发 flaky）。
       - name: Run Rust tests
         working-directory: src-tauri
         continue-on-error: true
@@ -91,6 +92,22 @@ jobs:
           cp release/*_x64_portable.zip release/windows/ 2>/dev/null || echo "portable zip 缺失，跳过"
           cp release/latest.json release/windows/
 
+      # issue #224：保留 release PDB 供崩溃偏移符号化（0xc0000409 类 abort 的
+      # 异常偏移仅凭 exe 无法定位，需同版本 PDB；独立 artifact，缺 PDB 不阻断主产物）
+      - name: Stage debug symbols (PDB)
+        shell: bash
+        run: |
+          mkdir -p release/symbols
+          # 显式区分「无 PDB」（良性，不阻断）与「复制失败」（须红）——原
+          # `cp ... || echo` 会把多 PDB 部分复制的非零退出码一并吞掉
+          shopt -s nullglob
+          pdbs=(src-tauri/target/release/*.pdb)
+          if [ ${#pdbs[@]} -eq 0 ]; then
+            echo "WARN: no PDB produced"
+          else
+            cp "${pdbs[@]}" release/symbols/ || exit 1
+          fi
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -101,10 +118,17 @@ jobs:
             release/windows/*
           if-no-files-found: error
 
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-work-assistant-windows-symbols
+          path: release/symbols/
+          if-no-files-found: warn
+
       # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
       # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
       - name: Publish to GitHub Release
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7' || github.ref == 'refs/heads/v3.8.8' || github.ref == 'refs/heads/v3.9.1' || github.ref == 'refs/heads/v3.9.3'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v3.8.5' || github.ref == 'refs/heads/v3.8.7' || github.ref == 'refs/heads/v3.8.8' || github.ref == 'refs/heads/v3.9.1' || github.ref == 'refs/heads/v3.9.3' || github.ref == 'refs/heads/v3.9.5'
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:

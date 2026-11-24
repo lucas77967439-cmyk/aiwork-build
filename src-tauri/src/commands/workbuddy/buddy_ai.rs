@@ -672,14 +672,12 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     };
     let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
     let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    // 宽容解析：expiresIn 可能以数字字符串返回（字段漂移时 as_i64 会静默丢失 →
-    // 池过期时间被清成 None → 兜底续期从此永不选中该账号）
-    let num_of = |v: &Value| -> Option<i64> {
-        v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-    };
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| num_of(v));
-    let refresh_expires_in: Option<i64> =
-        fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| num_of(v));
+    // 宽容解析 + 过滤（审查第五/六轮收敛）：expiresIn 可能以数字字符串返回；
+    // expires_in_secs 统一过滤 0/负值/超界漂移，非法回 None（调用方按盲区语义回填旧值）
+    let expires_in: Option<i64> =
+        fs_utils::dig(&body, &["expiresIn"]).and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
+    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"])
+        .and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
@@ -687,6 +685,11 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     // rt 轮换回写（R-2a：每次刷新轮换；响应缺失时保留旧值防丢）。
     // 审查修复（M1）：合并式写回（在旧 rec 上更新四键）——upsert 是整行 REPLACE，
     // 从零构造会抹掉打卡幂等戳 last_daily_chat 与 uid 兜底，刷新一次当日打卡即被重跑
+    // 审查修复（第四轮 Medium）：响应缺 expiresIn/refreshExpiresIn 时从 existing
+    // 回填旧到期时间（null 不覆盖）——整行 REPLACE 抹成 null 会让惰性续期按缺失
+    // 放行多续、rt 临期判定回退 None 盲区；池回写已有 .or(旧值) 同口径
+    let old_exp_ms = fs_utils::dig(&rec, &["expires_at_ms"]).and_then(|v| v.as_i64());
+    let old_rexp_ms = fs_utils::dig(&rec, &["refresh_expires_at_ms"]).and_then(|v| v.as_i64());
     let mut merged = if rec.is_object() { rec.clone() } else { serde_json::json!({}) };
     if let Some(rm) = merged.as_object_mut() {
         rm.insert("access_token".into(), json!(new_access));
@@ -698,8 +701,14 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
                 new_refresh.clone().unwrap_or_default()
             }),
         );
-        rm.insert("expires_at_ms".into(), json!(exp_ms));
-        rm.insert("refresh_expires_at_ms".into(), json!(rexp_ms));
+        rm.insert(
+            "expires_at_ms".into(),
+            json!(exp_ms.or(old_exp_ms)),
+        );
+        rm.insert(
+            "refresh_expires_at_ms".into(),
+            json!(rexp_ms.or(old_rexp_ms)),
+        );
         rm.insert("domain".into(), json!(intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"])))));
     }
     crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &acct.id, &merged)?;
@@ -1085,6 +1094,88 @@ pub(crate) fn buddy_ai_checkin_enabled(state: &AppState) -> bool {
 /// buddy-ai 池账号数（调度器 models 类任务空池静默跳过判定用）
 pub(crate) fn buddy_ai_pool_size(state: &AppState) -> usize {
     load_buddy_pool(state).accounts.len()
+}
+
+// ── OAuth 重登打卡补跑（issue #220 P2，对齐国内 wb 补签形态）────────────────
+
+/// 当日该账号打卡状态（buddy_ai_checkin_results 当日 success 行；None = 无记录。
+/// already 为非最终态不落行——已签判定以 last_daily_chat 本地幂等戳为准，此处
+/// 仅用于拦截明确已成功的重登账号，避免无谓整轮补跑）
+fn buddy_ai_today_checkin_status(state: &AppState, aid: &str) -> Option<String> {
+    let root: Value =
+        crate::store::docs::buddy_ai_checkin_results_load(&crate::store::db(&state.data_dir));
+    let today = crate::tasks::buddy_ai_checkin::today_stamp();
+    root.get("results")?
+        .as_array()?
+        .iter()
+        .filter(|r| {
+            r.get("user_id").and_then(Value::as_str) == Some(aid)
+                && r.get("date").and_then(Value::as_str) == Some(today.as_str())
+        })
+        .last()
+        .and_then(|r| r.get("status").and_then(Value::as_str).map(str::to_string))
+}
+
+/// OAuth 重登后打卡补跑：打卡开关开启且当日结果无 success 行时，后台整轮补跑
+///（轮次锁幂等互斥，撞锁静默放弃）。已完成账号靠 last_daily_chat 本地幂等戳
+/// 早返回（本地读秒级空过），重登账号走完整六步链。供 oauth.rs BuddyAi sink 调用
+pub(crate) fn spawn_oauth_checkin_catchup_buddy_ai(app: &AppHandle, state: &AppState, target_id: &str) {
+    if !buddy_ai_checkin_enabled(state) {
+        return;
+    }
+    if buddy_ai_today_checkin_status(state, target_id).as_deref() == Some("success") {
+        return;
+    }
+    let app = app.clone();
+    let st = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("buddy-ai-oauth-catchup".into())
+        .spawn(move || {
+            let Ok(_guard) = try_acquire_buddy_ai_round() else {
+                return; // 抢不到轮次锁（UI/调度轮次在跑）= 幂等跳过
+            };
+            let mut events: Vec<Value> = Vec::new();
+            // 网关运行态句柄：打卡到账运行期拨进 buddy_ai_pool（对齐启动补跑）
+            let rt = app
+                .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+            let done = crate::tasks::buddy_ai_checkin::run_checkin_round(
+                &st,
+                Some(rt.inner()),
+                &mut |ev| events.push(ev.clone()),
+            );
+            fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "buddy-ai: OAuth 重登后打卡补跑——ok={} already={} failed={}",
+                    done.get("ok").and_then(Value::as_i64).unwrap_or(0),
+                    done.get("already").and_then(Value::as_i64).unwrap_or(0),
+                    done.get("failed").and_then(Value::as_i64).unwrap_or(0),
+                ),
+            );
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            if failed > 0 {
+                let names: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                    .map(|e| {
+                        e.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect();
+                crate::commands::workbuddy::push_notify(
+                    Some(&app),
+                    &st.data_dir,
+                    "Buddy 国际版打卡",
+                    &format!("{} 个账号打卡失败：{}", failed, names.join("、")),
+                    crate::notify::NotifyEvent::TaskFail,
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        fs_utils::app_log(&state.data_dir, &format!("buddy-ai: OAuth 补跑线程创建失败: {e}"));
+    }
 }
 
 /// 启动打卡补跑（对齐 startup_auto_checkin 形态）：60s 延迟 → 抢轮次锁 →

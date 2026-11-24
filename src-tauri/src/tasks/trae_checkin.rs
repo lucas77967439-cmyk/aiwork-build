@@ -25,7 +25,7 @@ use crate::jwt;
 use crate::models::{CooldownEntry, DeviceEntry, RawAccount};
 use crate::state::AppState;
 
-use super::http_agent;
+use super::{friendly_net_err, http_agent};
 
 const SIGNIN_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim";
 const STATUS_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status";
@@ -115,7 +115,9 @@ fn http_post(
             let parsed = serde_json::from_str(&raw).ok();
             (code as i32, parsed, raw)
         }
-        Err(e) => (0, None, e.to_string()),
+        // 仅 DNS 解析失败在 agent 的 resolver 层自动重试（连接超时/拒连不经 resolver，
+        // 由调用方外层重试兜底），此处仅做用户可见文案归一化（issue #209）
+        Err(e) => (0, None, friendly_net_err(&e.to_string())),
     }
 }
 
@@ -665,6 +667,29 @@ pub fn run_round(
 
         let info = jwt::parse(&jwt);
         let uid_str = info.user_id.clone().unwrap_or_default();
+        // 审查修复（第六轮 M1）：JWT 存在但损坏（无法解析出 user id）归 BadJwt
+        // 永久类型——原实现 uid=None 时 status_check 直接失败走 classify_error
+        // (0,None)→Unknown 可重试，调度器全天约 8 轮无效重试且每轮触发失败推送；
+        // 对齐「未配置 jwt」口径（cooldown=-1 永久 + 调度器 failed_permanent 排除）
+        if info.user_id.is_none() {
+            failed += 1;
+            // 交叉审查修复：摘要键用账号配置的 user_id（与「未配置 jwt」路径同口径）
+            // ——JWT 损坏时派生 uid 为空串，多损坏账号会碰撞空键
+            let uid = acc.user_id.clone().unwrap_or_default();
+            results.push(json!({
+                "name": name, "user_id": uid, "ok": false, "code": 0,
+                "message": "jwt 无法解析（损坏或不完整），请重新抓取",
+                "action": "claim",
+            }));
+            emit(&json!({
+                "type": "account", "index": idx, "user_id": uid, "name": name,
+                "status": "fail", "message": "jwt 无法解析（损坏或不完整），请重新抓取",
+                "error_type": "BadJwt", "cooldown_until": 9_999_999_999i64,
+            }));
+            outcome.statuses.insert(uid.clone(), "fail");
+            round_names.insert(uid, name.clone());
+            continue;
+        }
 
         // JWT 过期告警（摘要 warnings；影响续期提醒，不阻塞签到）
         if let (Some(h), Some(exp)) = (info.exp_hours, info.exp_timestamp) {

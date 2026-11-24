@@ -358,7 +358,10 @@ pub(super) fn oauth_flow(
                 if !t.is_empty() {
                     token = t;
                     refresh_token = as_str(fs_utils::dig(&body, &["refreshToken"])).unwrap_or_default();
-                    expires_in_s = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
+                    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移，
+                    // 非法回 None 走 JWT exp 兜底，不用脏值算过去时刻
+                    expires_in_s = fs_utils::dig(&body, &["expiresIn"])
+                        .and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
                     break;
                 }
             }
@@ -479,6 +482,11 @@ pub(super) fn oauth_flow(
         }
         sink.upsert_token(state, &target_id, &creds)?;
     } else {
+        // 审查修复（第六轮 M2）：CN 分支同持每账号刷新锁——OAuth 重扫码 upsert 与
+        // 网关 401 自愈（持 refresh_lock_for 轮换回写）并发时，锁外直写会让旧 rt
+        // 覆盖刚落库的新 rt，账号被迫重登；upsert 内部为读改写合并，锁域罩住调用即可
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         sink.upsert_token(state, &target_id, &creds)?;
     }
     fs_utils::app_log(
@@ -500,6 +508,16 @@ pub(super) fn oauth_flow(
         if let Some(runtime_state) = runtime_state {
             crate::commands::api_server::reload_pools_if_running(&app.state::<AppState>(), &runtime_state);
         }
+    }
+
+    // issue #220 P2：扫码重登自动补签——重登多因 token 失效/上游限制，当日签到
+    // 大概率失败或未跑；开关开启且当日未成功时后台补跑（轮次锁幂等互斥，撞锁/
+    // 关闭/已成功均静默跳过）。CN=单号补签；Intl=整轮打卡（已完成账号靠
+    // last_daily_chat 本地幂等早返回，秒级空过）
+    if matches!(sink, PoolSink::BuddyAi) {
+        super::buddy_ai::spawn_oauth_checkin_catchup_buddy_ai(app, state, &target_id);
+    } else {
+        super::checkin::spawn_oauth_checkin_catchup(app, state, &target_id, &label);
     }
 
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
