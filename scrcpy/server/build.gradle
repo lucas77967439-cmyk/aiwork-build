@@ -1,0 +1,29 @@
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 31
+    defaultConfig {
+        applicationId "com.genymobile.scrcpy"
+        minSdkVersion 21
+        targetSdkVersion 31
+        versionCode 12400
+        versionName "1.24-ws0"
+        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation 'org.java-websocket:Java-WebSocket:1.4.0'
+    implementation 'org.slf4j:slf4j-api:1.7.25'
+    implementation 'uk.uuid.slf4j:slf4j-android:1.7.25-1'
+    testImplementation 'junit:junit:4.13.1'
+}
+
+apply from: "$project.rootDir/config/android-checkstyle.gradle"
