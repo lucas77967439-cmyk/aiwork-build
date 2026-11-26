@@ -1,109 +1,33 @@
-name: Build Windows EXE
-
+name: Build scrcpy-server 1.24-ws0
 on:
-  push:
-    branches:
-      - main
-      - master
-      - macos_main
-      - feat/export-accounts-json
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   build:
-    runs-on: windows-latest
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          node-version: 20
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build Tauri app (NSIS + MSI)
-        id: build
-        shell: bash
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install SDK platform 31
         run: |
-          set -o pipefail
-          npm run tauri build -- --bundles nsis,msi 2>&1 | tee build.log
-
-      # 诊断闭环：无论成败都上传 build.log 为 artifact（job logs 需 admin token，
-      # 而 artifact 可在仓库 Actions 页面直接下载）
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          if-no-files-found: warn
-
-      # 审查 M15：CI 缺测试防线——产物未经测试验证即上传。放在 tauri build 之后：
-      # generate_context! 宏依赖 frontendDist（../dist，由 beforeBuildCommand 生成）
-      # 存在；任一用例失败则阻断产物上传
-      - name: Run Rust tests
-        working-directory: src-tauri
-        run: cargo test --workspace
-
-      # portable zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
-      # 2026-10-29：改为非致命——portable zip 是可选产物（更新器只装 setup/msi，
-      # 清单生成也允许缺失时跳过），其打包失败不应阻断安装包发布。
-      - name: Package portable zip
-        continue-on-error: true
-        run: node scripts/package_portable.mjs
-
-      # 审查 M15：统一命名 + 生成发布校验清单 latest.json（单一清单原则，
-      # updater.rs fail-closed 依赖：清单缺失/版本不符/哈希不匹配均拒绝更新）
-      - name: Rename release artifacts + generate latest.json
-        run: node scripts/rename_release.mjs --strict
-
-      - name: Stage artifacts (release/windows)
-        shell: bash
+          sdkmanager "platforms;android-31" "build-tools;31.0.0"
+          yes | sdkmanager --licenses || true
+      - name: Gradle build server
+        run: cd scrcpy && chmod +x gradlew && ./gradlew :server:assembleRelease --stacktrace
+      - name: Rename apk to jar
         run: |
-          mkdir -p release/windows
-          cp release/*_x64-setup.exe release/windows/
-          cp release/*_x64_zh-CN.msi release/windows/
-          # portable zip 可选（打包步骤为非致命），缺失时跳过而不失败
-          cp release/*_x64_portable.zip release/windows/ 2>/dev/null || echo "portable zip 缺失，跳过"
-          cp release/latest.json release/windows/
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+          APK=$(find scrcpy/server/build -type f -name '*.apk' | head -1)
+          echo "APK=$APK"
+          cp "$APK" scrcpy-server.jar
+          ls -la scrcpy-server.jar
+      - uses: actions/upload-artifact@v4
         with:
-          # 审查 M15：产品已更名 AI Work 助手（mainBinaryName ai-work-assistant），
-          # artifact 名同步去除 trae-work-assistant 遗留
-          name: ai-work-assistant-windows
-          path: |
-            release/windows/*
-          if-no-files-found: error
-
-      # 产物同时发到 Release：公开仓库的 release 资产可无认证下载
-      # （artifact 下载需 admin token），便于外部脚本/CI 直接拉取
-      - name: Publish to GitHub Release
-        if: github.ref == 'refs/heads/main'
-        continue-on-error: true
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }} (${{ github.sha }})
-          draft: false
-          prerelease: true
-          files: |
-            release/windows/*
+          name: scrcpy-server-124-ws0
+          path: scrcpy-server.jar
+          retention-days: 30
