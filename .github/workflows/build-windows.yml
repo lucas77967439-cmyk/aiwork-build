@@ -13,11 +13,15 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install SDK platform 31
+      - name: Install Android SDK platform 31
         run: |
-          sdkmanager "platforms;android-31" "build-tools;31.0.0"
-          yes | sdkmanager --licenses || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMGR=$(find $ANDROID_HOME/cmdline-tools -name sdkmanager -type f | head -1)
+          echo "SDKMGR=$SDKMGR"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-31" "build-tools;31.0.0"
+      - name: Set local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > scrcpy/local.properties
       - name: Gradle build server
         run: cd scrcpy && chmod +x gradlew && ./gradlew :server:assembleRelease --stacktrace
       - name: Rename apk to jar
