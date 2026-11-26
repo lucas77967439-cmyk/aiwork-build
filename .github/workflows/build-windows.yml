@@ -38,6 +38,7 @@ jobs:
           wc -c built-jar.txt
           git config user.email "build@local"
           git config user.name "build"
+          git pull --rebase origin main || true
           git add built-jar.txt
-          git commit -m "built scrcpy-server 1.24-ws0 jar (base64)"
-          git push
+          git commit -m "built scrcpy-server 1.24-ws0 jar (base64)" || echo "nothing to commit"
+          git push origin main
