@@ -12,12 +12,10 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '11'
       - name: Install Android SDK platform 31
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           SDKMGR=$(find $ANDROID_HOME/cmdline-tools -name sdkmanager -type f | head -1)
-          echo "SDKMGR=$SDKMGR"
           yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
           "$SDKMGR" "platforms;android-31" "build-tools;31.0.0"
       - name: Set local.properties
