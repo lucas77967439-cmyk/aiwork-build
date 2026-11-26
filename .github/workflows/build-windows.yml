@@ -7,6 +7,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Setup JDK 17 (for sdkmanager)
@@ -28,14 +30,14 @@ jobs:
         run: echo "sdk.dir=$ANDROID_HOME" > scrcpy/local.properties
       - name: Gradle build server
         run: cd scrcpy && chmod +x gradlew && ./gradlew :server:assembleRelease --stacktrace
-      - name: Rename apk to jar
+      - name: Commit jar as base64 to repo
         run: |
           APK=$(find scrcpy/server/build -type f -name '*.apk' | head -1)
           echo "APK=$APK"
-          cp "$APK" scrcpy-server.jar
-          ls -la scrcpy-server.jar
-      - uses: actions/upload-artifact@v4
-        with:
-          name: scrcpy-server-124-ws0
-          path: scrcpy-server.jar
-          retention-days: 30
+          base64 -w0 "$APK" > built-jar.txt
+          wc -c built-jar.txt
+          git config user.email "build@local"
+          git config user.name "build"
+          git add built-jar.txt
+          git commit -m "built scrcpy-server 1.24-ws0 jar (base64)"
+          git push
